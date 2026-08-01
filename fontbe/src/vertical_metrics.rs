@@ -2,12 +2,12 @@
 //! and [vhea](https://learn.microsoft.com/en-us/typography/opentype/spec/vhea) tables.
 
 use fontdrasil::orchestration::{Access, AccessBuilder, Work};
-use fontir::orchestration::WorkId as FeWorkId;
+use fontir::orchestration::{Flags, WorkId as FeWorkId};
 use log::trace;
 use write_fonts::{
     OtRound, dump_table,
     tables::{vhea::Vhea, vmtx::Vmtx},
-    types::FWord,
+    types::{FWord, Version16Dot16},
 };
 
 use crate::{
@@ -36,6 +36,9 @@ impl Work<Context, AnyWorkId, Error> for VerticalMetricsWork {
             .variant(WorkId::ALL_GLYF_FRAGMENTS)
             // We need composite bboxes to be calculated:
             .variant(WorkId::Glyf)
+            // For CFF flavor builds bounds come from the CFF work instead;
+            // whichever isn't scheduled is trivially fulfilled
+            .variant(WorkId::Cff)
             .variant(WorkId::ExtraFeaTables)
             .build()
     }
@@ -70,11 +73,17 @@ impl Work<Context, AnyWorkId, Error> for VerticalMetricsWork {
             .get()
             .at(static_metadata.default_location());
 
+        // In a CFF build bounds come from the CFF work; there are no glyf fragments
+        let cff = context
+            .flags
+            .contains(Flags::CFF_OUTLINES)
+            .then(|| context.cff.get());
+
         // Collate vertical metrics
         let builder =
             glyph_order
                 .iter()
-                .fold(MetricsBuilder::default(), |mut builder, (_gid, gn)| {
+                .fold(MetricsBuilder::default(), |mut builder, (gid, gn)| {
                     let glyph = context.ir.get_glyph(gn.clone());
                     let instance = glyph.default_instance();
 
@@ -82,14 +91,27 @@ impl Work<Context, AnyWorkId, Error> for VerticalMetricsWork {
                     let advance = instance.height(&default_metrics);
                     let vertical_origin = instance.vertical_origin(&default_metrics);
 
-                    let glyph = context.glyphs.get(&WorkId::GlyfFragment(gn.clone()).into());
+                    let (y_min, y_max) = match &cff {
+                        Some(cff) => cff
+                            .glyph_bounds
+                            .get(gid.to_u16() as usize)
+                            .copied()
+                            .flatten()
+                            .map(|[_, y_min, _, y_max]| (y_min, y_max))
+                            .unzip(),
+                        None => {
+                            let glyph =
+                                context.glyphs.get(&WorkId::GlyfFragment(gn.clone()).into());
+                            let bbox = glyph.data.bbox();
+                            (
+                                bbox.map(|bbox| bbox.y_min as i32),
+                                bbox.map(|bbox| bbox.y_max as i32),
+                            )
+                        }
+                    };
 
-                    let side_bearing = vertical_origin
-                        - glyph.data.bbox().map(|bbox| bbox.y_max).unwrap_or_default();
-                    let bounds_advance = glyph
-                        .data
-                        .bbox()
-                        .map(|bbox| bbox.y_max as i32 - bbox.y_min as i32);
+                    let side_bearing = vertical_origin - y_max.unwrap_or_default() as i16;
+                    let bounds_advance = y_max.and_then(|y_max| y_min.map(|y_min| y_max - y_min));
 
                     builder.update(advance, side_bearing, bounds_advance);
                     builder
@@ -99,6 +121,7 @@ impl Work<Context, AnyWorkId, Error> for VerticalMetricsWork {
 
         // Build and send vertical metrics tables out into the world
         let mut vhea = Vhea {
+            version: Version16Dot16::VERSION_1_1,
             ascender: FWord::new(default_metrics.vhea_ascender.into_inner().ot_round()),
             descender: FWord::new(default_metrics.vhea_descender.into_inner().ot_round()),
             line_gap: FWord::new(default_metrics.vhea_line_gap.into_inner().ot_round()),

@@ -4,7 +4,7 @@ use std::env;
 
 use chrono::{DateTime, TimeZone, Utc};
 use fontdrasil::orchestration::{Access, AccessBuilder, Work};
-use fontir::orchestration::WorkId as FeWorkId;
+use fontir::orchestration::{Flags as IrFlags, WorkId as FeWorkId};
 use log::warn;
 use write_fonts::{
     tables::{
@@ -116,7 +116,12 @@ impl Work<Context, AnyWorkId, Error> for HeadWork {
     /// Generate [head](https://learn.microsoft.com/en-us/typography/opentype/spec/head)
     fn exec(&self, context: &Context) -> Result<(), Error> {
         let static_metadata = context.ir.static_metadata.get();
-        let loca_format = (*context.loca_format.get().as_ref()).into();
+        // CFF fonts have no loca table; indexToLocFormat stays 0
+        let loca_format = if context.flags.contains(IrFlags::CFF_OUTLINES) {
+            LocaFormat::Short
+        } else {
+            (*context.loca_format.get().as_ref()).into()
+        };
         let mut head = init_head(
             static_metadata.units_per_em,
             loca_format,

@@ -224,7 +224,7 @@ fn generate_font_internal(
 
     let flags = merge_compilation_flags(options, &*source);
 
-    let workload = Workload::new(source, timer, options.skip_features)?;
+    let workload = Workload::new(source, timer, options.skip_features, flags)?;
     let fe_root = FeContext::new_root(flags, options.ir_dir.clone());
     let be_root = BeContext::new_root(
         flags,
@@ -357,7 +357,7 @@ mod tests {
     use write_fonts::{
         dump_table,
         read::{
-            FontData, FontRead, FontReadWithArgs, FontRef, TableProvider,
+            FontData, FontRead, FontRef, TableProvider,
             tables::{
                 cmap::{Cmap, CmapSubtable},
                 colr::{Colr, Paint, PaintGlyph},
@@ -436,7 +436,7 @@ mod tests {
                 options.compile_debg,
                 &fe_context.read_only(),
             );
-            let workload = Workload::new(source, timer, options.skip_features).unwrap();
+            let workload = Workload::new(source, timer, options.skip_features, flags).unwrap();
 
             TestCompile {
                 temp: temp_dir,
@@ -1208,7 +1208,7 @@ mod tests {
         let result = TestCompile::compile_source("glyphs2/NotDef.glyphs");
 
         let raw_hmtx = result.be_context.hmtx.get();
-        let hmtx = Hmtx::read_with_args(FontData::new(raw_hmtx.get()), &1).unwrap();
+        let hmtx = Hmtx::read_with_args(FontData::new(raw_hmtx.get()), 1).unwrap();
         assert_eq!(
             vec![(600, 250)],
             hmtx.h_metrics()
@@ -1237,7 +1237,7 @@ mod tests {
 
         let raw_hmtx = result.be_context.hmtx.get();
         let hmtx =
-            Hmtx::read_with_args(FontData::new(raw_hmtx.get()), &hhea.number_of_h_metrics).unwrap();
+            Hmtx::read_with_args(FontData::new(raw_hmtx.get()), hhea.number_of_h_metrics).unwrap();
         assert_eq!(
             vec![(425, 175)],
             hmtx.h_metrics()
@@ -6315,5 +6315,95 @@ mod tests {
             appended,
             "the source-derived kern lookup should be appended to the kern feature"
         );
+    }
+
+    fn compile_cff(source: &str) -> TestCompile {
+        TestCompile::compile(source, |mut options| {
+            // what --flavor otf sets: CFF output, and decomposition since
+            // CFF has no composite glyphs
+            options.flags |= Flags::CFF_OUTLINES | Flags::DECOMPOSE_COMPONENTS;
+            options
+        })
+    }
+
+    #[test]
+    fn cff_flavor_produces_a_cff_font() {
+        use write_fonts::types::Version16Dot16;
+
+        let result = compile_cff("static.designspace");
+        let font = result.font();
+
+        // PostScript flavor: OTTO magic, CFF table, no TrueType outline tables
+        assert!(font.table_data(Tag::new(b"CFF ")).is_some());
+        assert!(font.table_data(Tag::new(b"glyf")).is_none());
+        assert!(font.table_data(Tag::new(b"loca")).is_none());
+        assert!(font.table_data(Tag::new(b"gvar")).is_none());
+        assert_eq!(font.maxp().unwrap().version(), Version16Dot16::VERSION_0_5);
+        assert_eq!(font.post().unwrap().version(), Version16Dot16::VERSION_3_0);
+        assert_eq!(font.head().unwrap().index_to_loc_format(), 0);
+
+        // the CFF parses, and its charset matches the glyph order
+        let cff =
+            write_fonts::read::tables::cff::Cff::read(font.table_data(Tag::new(b"CFF ")).unwrap())
+                .unwrap();
+        let cff_font =
+            write_fonts::read::ps::cff::CffFontRef::new_cff(cff.offset_data().as_bytes(), 0, None)
+                .unwrap();
+        assert_eq!(
+            cff_font.charstrings().count() as usize,
+            font.maxp().unwrap().num_glyphs() as usize
+        );
+        let charset = cff_font.charset().unwrap();
+        let names: Vec<_> = (0..cff_font.charstrings().count())
+            .map(|gid| {
+                let sid = charset.string_id(GlyphId::new(gid)).unwrap();
+                String::from_utf8(cff_font.string(sid).unwrap().to_vec()).unwrap()
+            })
+            .collect();
+        assert_eq!(names, [".notdef", "space", "bar", "plus", "element_of"]);
+    }
+
+    #[test]
+    fn cff_flavor_glyphs_have_outlines_and_widths() {
+        let result = compile_cff("static.designspace");
+        let font = result.font();
+
+        // skrifa can scale the CFF outlines, and non-empty glyphs draw
+        use skrifa::{
+            MetadataProvider,
+            instance::{LocationRef, Size},
+            outline::{DrawSettings, OutlinePen},
+        };
+
+        #[derive(Default)]
+        struct CountingPen(usize);
+        impl OutlinePen for CountingPen {
+            fn move_to(&mut self, _x: f32, _y: f32) {
+                self.0 += 1;
+            }
+            fn line_to(&mut self, _x: f32, _y: f32) {
+                self.0 += 1;
+            }
+            fn quad_to(&mut self, _x0: f32, _y0: f32, _x: f32, _y: f32) {
+                self.0 += 1;
+            }
+            fn curve_to(&mut self, _x0: f32, _y0: f32, _x1: f32, _y1: f32, _x: f32, _y: f32) {
+                self.0 += 1;
+            }
+            fn close(&mut self) {}
+        }
+
+        let outlines = font.outline_glyphs();
+        let mut pen = CountingPen::default();
+        for gid in 0..font.maxp().unwrap().num_glyphs() {
+            let glyph = outlines.get(GlyphId::new(gid as u32)).unwrap();
+            glyph
+                .draw(
+                    DrawSettings::unhinted(Size::unscaled(), LocationRef::default()),
+                    &mut pen,
+                )
+                .unwrap();
+        }
+        assert!(pen.0 > 0, "at least one CFF glyph should have an outline");
     }
 }

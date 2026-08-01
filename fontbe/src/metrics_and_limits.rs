@@ -9,7 +9,7 @@ use std::{
 };
 
 use fontdrasil::orchestration::{Access, AccessBuilder, Work};
-use fontir::orchestration::WorkId as FeWorkId;
+use fontir::orchestration::{Flags, WorkId as FeWorkId};
 use write_fonts::{
     OtRound, dump_table,
     tables::{
@@ -290,6 +290,9 @@ impl Work<Context, AnyWorkId, Error> for MetricAndLimitWork {
             .variant(WorkId::ALL_GLYF_FRAGMENTS)
             // We need composite bboxes to be calculated:
             .variant(WorkId::Glyf)
+            // For CFF flavor builds bounds come from the CFF work instead;
+            // whichever isn't scheduled is trivially fulfilled
+            .variant(WorkId::Cff)
             .variant(WorkId::ExtraFeaTables)
             .build()
     }
@@ -323,11 +326,37 @@ impl Work<Context, AnyWorkId, Error> for MetricAndLimitWork {
             .get()
             .at(static_metadata.default_location());
 
+        // In a CFF build bounds come from the CFF work; there are no glyf fragments
+        let cff = context
+            .flags
+            .contains(Flags::CFF_OUTLINES)
+            .then(|| context.cff.get());
+        let bounds_for = |gid: GlyphId16, gn: &fontdrasil::types::GlyphName| -> Option<Bbox> {
+            match &cff {
+                Some(cff) => cff
+                    .glyph_bounds
+                    .get(gid.to_u16() as usize)
+                    .copied()
+                    .flatten()
+                    .map(|[x_min, y_min, x_max, y_max]| Bbox {
+                        x_min: x_min as i16,
+                        y_min: y_min as i16,
+                        x_max: x_max as i16,
+                        y_max: y_max as i16,
+                    }),
+                None => context
+                    .glyphs
+                    .get(&WorkId::GlyfFragment(gn.clone()).into())
+                    .data
+                    .bbox(),
+            }
+        };
+
         // Collate horizontal metrics
         let builder =
             glyph_order
                 .iter()
-                .fold(MetricsBuilder::default(), |mut builder, (_gid, gn)| {
+                .fold(MetricsBuilder::default(), |mut builder, (gid, gn)| {
                     // https://github.com/googlefonts/ufo2ft/blob/2f11b0ff/Lib/ufo2ft/outlineCompiler.py#L741-L747
                     let advance: u16 = context
                         .ir
@@ -336,13 +365,9 @@ impl Work<Context, AnyWorkId, Error> for MetricAndLimitWork {
                         .width
                         .ot_round();
 
-                    let glyph = context.glyphs.get(&WorkId::GlyfFragment(gn.clone()).into());
-
-                    let side_bearing = glyph.data.bbox().map(|bbox| bbox.x_min).unwrap_or_default();
-                    let bounds_advance = glyph
-                        .data
-                        .bbox()
-                        .map(|bbox| bbox.x_max as i32 - bbox.x_min as i32);
+                    let bbox = bounds_for(gid, gn);
+                    let side_bearing = bbox.map(|bbox| bbox.x_min).unwrap_or_default();
+                    let bounds_advance = bbox.map(|bbox| bbox.x_max as i32 - bbox.x_min as i32);
 
                     builder.update(advance, side_bearing, bounds_advance);
                     builder
@@ -390,40 +415,54 @@ impl Work<Context, AnyWorkId, Error> for MetricAndLimitWork {
             .into();
         context.hmtx.set(raw_hmtx);
 
-        let mut max_builder =
-            glyph_order
+        let (maxp, font_bbox) = if cff.is_some() {
+            // CFF fonts use maxp 0.5: numGlyphs only, no glyf statistics
+            let maxp = Maxp {
+                num_glyphs: glyph_order.len().try_into().unwrap(),
+                ..Default::default()
+            };
+            let font_bbox = glyph_order
                 .iter()
-                .fold(MaxBuilder::default(), |mut builder, (gid, gn)| {
-                    let glyph = context.glyphs.get(&WorkId::GlyfFragment(gn.clone()).into());
-                    builder.update(gid, &glyph);
-                    builder
-                });
+                .filter_map(|(gid, gn)| bounds_for(gid, gn))
+                .reduce(|a, b| a.union(b));
+            (maxp, font_bbox)
+        } else {
+            let mut max_builder =
+                glyph_order
+                    .iter()
+                    .fold(MaxBuilder::default(), |mut builder, (gid, gn)| {
+                        let glyph = context.glyphs.get(&WorkId::GlyfFragment(gn.clone()).into());
+                        builder.update(gid, &glyph);
+                        builder
+                    });
 
-        // Might as well do maxp while we're here
-        let composite_limits = max_builder.update_composite_limits();
-        let maxp = Maxp {
-            num_glyphs: glyph_order.len().try_into().unwrap(),
-            // maxp computes it's version based on whether fields are set
-            // if you fail to set any of them it gets angry with you so set all of them
-            max_points: Some(max_builder.max_points),
-            max_contours: Some(max_builder.max_contours),
-            max_composite_points: Some(composite_limits.max_points),
-            max_composite_contours: Some(composite_limits.max_contours),
-            max_zones: Some(1),
-            max_twilight_points: Some(0),
-            max_storage: Some(0),
-            max_function_defs: Some(0),
-            max_instruction_defs: Some(0),
-            max_stack_elements: Some(0),
-            max_size_of_instructions: Some(0),
-            max_component_elements: Some(max_builder.max_component_elements),
-            max_component_depth: Some(composite_limits.max_depth),
+            // Might as well do maxp while we're here
+            let composite_limits = max_builder.update_composite_limits();
+            let maxp = Maxp {
+                num_glyphs: glyph_order.len().try_into().unwrap(),
+                // maxp computes it's version based on whether fields are set
+                // if you fail to set any of them it gets angry with you so set all of them
+                max_points: Some(max_builder.max_points),
+                max_contours: Some(max_builder.max_contours),
+                max_composite_points: Some(composite_limits.max_points),
+                max_composite_contours: Some(composite_limits.max_contours),
+                max_zones: Some(1),
+                max_twilight_points: Some(0),
+                max_storage: Some(0),
+                max_function_defs: Some(0),
+                max_instruction_defs: Some(0),
+                max_stack_elements: Some(0),
+                max_size_of_instructions: Some(0),
+                max_component_elements: Some(max_builder.max_component_elements),
+                max_component_depth: Some(composite_limits.max_depth),
+            };
+            (maxp, max_builder.bbox)
         };
         context.maxp.set(maxp);
 
         // Set x/y min/max in head
         let mut head = Arc::unwrap_or_clone(context.head.get());
-        let bbox = max_builder.bbox.unwrap_or_default();
+        let bbox = font_bbox.unwrap_or_default();
         head.x_min = bbox.x_min;
         head.y_min = bbox.y_min;
         head.x_max = bbox.x_max;

@@ -120,6 +120,25 @@ pub struct Args {
     /// See <https://docs.rs/env_logger/latest/env_logger/#enabling-logging> for format.
     #[arg(long)]
     pub log: Option<String>,
+
+    /// The type of outlines to compile: quadratic (glyf, a .ttf) or cubic
+    /// (CFF, a .otf).
+    ///
+    /// CFF output is currently limited to static (single-master) sources,
+    /// and implies --decompose-components since CFF has no composites.
+    // Named for fontmake's -o/--output {ttf,otf}, which clashes with our -o
+    #[arg(long, value_enum, default_value_t)]
+    pub flavor: Flavor,
+}
+
+/// Which outline format the compiled font uses.
+#[derive(Serialize, Deserialize, Debug, Default, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum Flavor {
+    /// TrueType (quadratic) outlines in a glyf table
+    #[default]
+    Ttf,
+    /// PostScript (cubic) outlines in a CFF table
+    Otf,
 }
 
 /// A wrapper around a validated regex string
@@ -154,6 +173,11 @@ impl Args {
         flags.set(Flags::DECOMPOSE_COMPONENTS, self.decompose_components);
         flags.set(Flags::KEEP_DIRECTION, self.keep_direction);
         flags.set(Flags::PRODUCTION_NAMES, !self.no_production_names);
+
+        if self.flavor == Flavor::Otf {
+            // CFF has no composite glyphs
+            flags.set(Flags::CFF_OUTLINES | Flags::DECOMPOSE_COMPONENTS, true);
+        }
 
         flags
     }
@@ -241,9 +265,12 @@ impl TryInto<Options> for Args {
             flags_to_disable,
             skip_features: self.skip_features,
             compile_debg: self.emit_lookup_debug_info,
-            output_file: self
-                .output_file
-                .or_else(|| Some(self.build_dir.join("font.ttf"))),
+            output_file: self.output_file.or_else(|| {
+                Some(self.build_dir.join(match self.flavor {
+                    Flavor::Ttf => "font.ttf",
+                    Flavor::Otf => "font.otf",
+                }))
+            }),
             timing_file,
             debug_dir,
             ir_dir,

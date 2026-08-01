@@ -12,6 +12,7 @@ use std::{
 use crossbeam_channel::{Receiver, TryRecvError};
 use fontbe::{
     avar::create_avar_work,
+    cff::create_cff_work,
     cmap::create_cmap_work,
     colr::create_colr_work,
     cpal::create_cpal_work,
@@ -44,7 +45,7 @@ use fontdrasil::{
 };
 use fontir::{
     glyph::create_glyph_order_work,
-    orchestration::{Context as FeContext, WorkId as FeWorkIdentifier},
+    orchestration::{Context as FeContext, Flags, WorkId as FeWorkIdentifier},
     source::Source,
 };
 use log::{debug, trace, warn};
@@ -67,6 +68,8 @@ pub struct Workload {
     success: HashSet<AnyWorkId>,
     error: Option<Error>,
     skip_features: bool,
+    // build a CFF (cubic outline) font instead of glyf
+    cff_outlines: bool,
     // we count the number of errors encountered but only store the first we see
     n_failures: usize,
 
@@ -126,6 +129,7 @@ impl Workload {
         source: Box<dyn Source>,
         timer: JobTimer,
         skip_features: bool,
+        flags: Flags,
     ) -> Result<Self, Error> {
         let time = timer
             .create_timer(AnyWorkId::InternalTiming("Create workload"), 0)
@@ -141,6 +145,7 @@ impl Workload {
             jobs_pending: Default::default(),
             count_pending: Default::default(),
             skip_features,
+            cff_outlines: flags.contains(Flags::CFF_OUTLINES),
             timer,
         };
 
@@ -166,18 +171,22 @@ impl Workload {
         workload.add_skippable_feature_work(FeatureFirstPassWork::create());
         workload.add_skippable_feature_work(FeatureCompilationWork::create());
         workload.add(create_gasp_work());
-        let ir_glyphs = workload
-            .jobs_pending
-            .keys()
-            .filter_map(|id| match id {
-                AnyWorkId::Fe(FeWorkIdentifier::Glyph(name)) => Some(name.clone()),
-                _ => None,
-            })
-            .collect::<Vec<_>>();
-        for glyph_name in ir_glyphs {
-            workload.add(create_glyf_work(glyph_name))
+        if workload.cff_outlines {
+            workload.add(create_cff_work());
+        } else {
+            let ir_glyphs = workload
+                .jobs_pending
+                .keys()
+                .filter_map(|id| match id {
+                    AnyWorkId::Fe(FeWorkIdentifier::Glyph(name)) => Some(name.clone()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            for glyph_name in ir_glyphs {
+                workload.add(create_glyf_work(glyph_name))
+            }
+            workload.add(create_glyf_loca_work());
         }
-        workload.add(create_glyf_loca_work());
         workload.add(create_avar_work());
         workload.add(create_stat_work());
         workload.add(create_meta_work());
@@ -185,7 +194,9 @@ impl Workload {
         workload.add(create_colr_work());
         workload.add(create_cpal_work());
         workload.add(create_fvar_work());
-        workload.add(create_gvar_work());
+        if !workload.cff_outlines {
+            workload.add(create_gvar_work());
+        }
         workload.add(create_head_work());
         workload.add_skippable_feature_work(create_gather_ir_kerning_work());
         workload.add_skippable_feature_work(create_kerns_work());
@@ -387,41 +398,59 @@ impl Workload {
         if let AnyWorkId::Fe(FeWorkIdentifier::GlyphOrder) = success {
             let preliminary_glyph_order = fe_root.preliminary_glyph_order.get();
             let final_glyph_order = fe_root.glyph_order.get();
-            for glyph_name in final_glyph_order.difference(&preliminary_glyph_order) {
-                debug!("Generating a BE job for {glyph_name}");
-                self.add(create_glyf_work(glyph_name.clone()));
+            if !self.cff_outlines {
+                for glyph_name in final_glyph_order.difference(&preliminary_glyph_order) {
+                    debug!("Generating a BE job for {glyph_name}");
+                    self.add(create_glyf_work(glyph_name.clone()));
 
-                // Glyph order is done so all IR must be done. Copy dependencies from the IR for the same name.
-                self.update_be_glyph_work(fe_root, glyph_name.clone());
-            }
+                    // Glyph order is done so all IR must be done. Copy dependencies from the IR for the same name.
+                    self.update_be_glyph_work(fe_root, glyph_name.clone());
+                }
 
-            // Now that we have a final glyph order we can resolve the Access::Unknown for glyf/loca
-            let mut glyf_loca_deps = AccessBuilder::<AnyWorkId>::new()
-                .variant(FeWorkIdentifier::StaticMetadata)
-                .variant(FeWorkIdentifier::GlyphOrder);
-            for glyph_name in final_glyph_order.names() {
-                glyf_loca_deps = glyf_loca_deps
-                    .specific_instance(BeWorkIdentifier::GlyfFragment(glyph_name.clone()));
-            }
-            let glyf_loca_job = self
-                .jobs_pending
-                .get_mut(&BeWorkIdentifier::Glyf.into())
-                .expect("Glyf has to be pending");
-            glyf_loca_job.read_access = glyf_loca_deps.build().into();
+                // Now that we have a final glyph order we can resolve the Access::Unknown for glyf/loca
+                let mut glyf_loca_deps = AccessBuilder::<AnyWorkId>::new()
+                    .variant(FeWorkIdentifier::StaticMetadata)
+                    .variant(FeWorkIdentifier::GlyphOrder);
+                for glyph_name in final_glyph_order.names() {
+                    glyf_loca_deps = glyf_loca_deps
+                        .specific_instance(BeWorkIdentifier::GlyfFragment(glyph_name.clone()));
+                }
+                let glyf_loca_job = self
+                    .jobs_pending
+                    .get_mut(&BeWorkIdentifier::Glyf.into())
+                    .expect("Glyf has to be pending");
+                glyf_loca_job.read_access = glyf_loca_deps.build().into();
 
-            // Resolve the Access::Unknown for gvar, same race as glyf/loca; see issue #1436
-            let mut gvar_deps = AccessBuilder::<AnyWorkId>::new()
-                .variant(FeWorkIdentifier::StaticMetadata)
-                .variant(FeWorkIdentifier::GlyphOrder);
-            for glyph_name in final_glyph_order.names() {
-                gvar_deps =
-                    gvar_deps.specific_instance(BeWorkIdentifier::GvarFragment(glyph_name.clone()));
+                // Resolve the Access::Unknown for gvar, same race as glyf/loca; see issue #1436
+                let mut gvar_deps = AccessBuilder::<AnyWorkId>::new()
+                    .variant(FeWorkIdentifier::StaticMetadata)
+                    .variant(FeWorkIdentifier::GlyphOrder);
+                for glyph_name in final_glyph_order.names() {
+                    gvar_deps = gvar_deps
+                        .specific_instance(BeWorkIdentifier::GvarFragment(glyph_name.clone()));
+                }
+                let gvar_job = self
+                    .jobs_pending
+                    .get_mut(&BeWorkIdentifier::Gvar.into())
+                    .expect("Gvar has to be pending");
+                gvar_job.read_access = gvar_deps.build().into();
+            } else {
+                // The CFF work reads every glyph's IR; resolve its
+                // Access::Unknown now that the glyph set is final
+                let mut cff_deps = AccessBuilder::<AnyWorkId>::new()
+                    .variant(FeWorkIdentifier::StaticMetadata)
+                    .variant(FeWorkIdentifier::GlobalMetrics)
+                    .variant(FeWorkIdentifier::GlyphOrder);
+                for glyph_name in final_glyph_order.names() {
+                    cff_deps =
+                        cff_deps.specific_instance(FeWorkIdentifier::Glyph(glyph_name.clone()));
+                }
+                let cff_job = self
+                    .jobs_pending
+                    .get_mut(&BeWorkIdentifier::Cff.into())
+                    .expect("Cff has to be pending");
+                cff_job.read_access = cff_deps.build().into();
             }
-            let gvar_job = self
-                .jobs_pending
-                .get_mut(&BeWorkIdentifier::Gvar.into())
-                .expect("Gvar has to be pending");
-            gvar_job.read_access = gvar_deps.build().into();
         }
 
         if let AnyWorkId::Fe(FeWorkIdentifier::KerningLocations) = success {

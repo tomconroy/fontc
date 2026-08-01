@@ -23,8 +23,8 @@ icu_properties = "=2.1"
 smallvec = {version = "1.15", features = ["const_new"]}
 
 # fontations etc
-write-fonts = { version = "0.49.1", features = ["serde", "read"] }
-skrifa = { version = "0.43.2", features = ["traversal"] }
+write-fonts = { version = "0.51.0", features = ["serde", "read"] }
+skrifa = { version = "0.45.1", features = ["traversal"] }
 norad = { version = "0.18.4", default-features = false }
 
 # dev dependencies
@@ -53,3 +53,11 @@ members = [
     "otl-normalizer",
     "fontc_crater",
 ]
+
+# Local fontations override while CFF writing is unreleased; drop once
+# write-fonts with ps::cff::v1 is published.
+[patch.crates-io]
+font-types = { path = "../fontations/font-types" }
+read-fonts = { path = "../fontations/read-fonts" }
+write-fonts = { path = "../fontations/write-fonts" }
+skrifa = { path = "../fontations/skrifa" }

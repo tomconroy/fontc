@@ -32,7 +32,7 @@ use serde::{Deserialize, Serialize};
 
 use write_fonts::{
     FontWrite, dump_table,
-    read::{FontRead, collections::IntSet, tables::gsub::Gsub as ReadGsub},
+    read::{FontRead, ReadArgs, collections::IntSet, tables::gsub::Gsub as ReadGsub},
     tables::{
         base::Base,
         cmap::Cmap,
@@ -83,6 +83,7 @@ pub enum WorkId {
     Features,
     FeaturesAst,
     Avar,
+    Cff,
     Cmap,
     Colr,
     Cpal,
@@ -134,6 +135,7 @@ impl Identifier for WorkId {
             WorkId::Meta => "BeMeta",
             WorkId::FeaturesAst => "BeFeaturesAst",
             WorkId::Avar => "BeAvar",
+            WorkId::Cff => "BeCff",
             WorkId::Cmap => "BeCmap",
             WorkId::Colr => "BeColr",
             WorkId::Cpal => "BeCpal",
@@ -270,7 +272,9 @@ impl From<Compilation> for ExtraFeaTables {
 // we can use fontwrite on each table, and then serialize an array of Option<Vec<u8>>
 impl Persistable for ExtraFeaTables {
     fn read(from: &mut dyn Read) -> Self {
-        fn read_table<'a, T: FontRead<'a>>(bytes: Option<&'a Vec<u8>>) -> Option<T> {
+        fn read_table<'a, T: FontRead<'a> + ReadArgs<Args = ()>>(
+            bytes: Option<&'a Vec<u8>>,
+        ) -> Option<T> {
             let bytes = bytes?.as_slice();
             Some(T::read(bytes.into()).unwrap())
         }
@@ -369,6 +373,29 @@ impl Persistable for Glyph {
         let glyph_bytes = dump_table(&self.data).unwrap();
         let to_write = (&self.name, glyph_bytes);
         bincode::serialize_into(to, &to_write).unwrap();
+    }
+}
+
+/// The compiled `CFF ` table plus the per-glyph bounds computed alongside it.
+///
+/// A CFF font has no per-glyph bbox in the outline data itself, so the works
+/// that need bounds (hmtx/hhea/head, vmtx/vhea) read them from here instead
+/// of from glyf fragments.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct CffOutput {
+    pub table: Vec<u8>,
+    /// `[x_min, y_min, x_max, y_max]` per glyph, in glyph order; `None` for
+    /// glyphs with no outline
+    pub glyph_bounds: Vec<Option<[i32; 4]>>,
+}
+
+impl Persistable for CffOutput {
+    fn read(from: &mut dyn Read) -> Self {
+        bincode::deserialize_from(from).unwrap()
+    }
+
+    fn write(&self, to: &mut dyn Write) {
+        bincode::serialize_into(to, self).unwrap();
     }
 }
 
@@ -883,6 +910,7 @@ pub struct Context {
 
     // Allow avar to be explicitly None to record a noop avar being generated
     pub avar: BeContextItem<PossiblyEmptyAvar>,
+    pub cff: BeContextItem<CffOutput>,
     pub cmap: BeContextItem<Cmap>,
     pub colr: BeContextItem<Colr>,
     pub cpal: BeContextItem<Cpal>,
@@ -932,6 +960,7 @@ impl Context {
             glyphs: self.glyphs.clone_with_acl(acl.clone()),
             gvar_fragments: self.gvar_fragments.clone_with_acl(acl.clone()),
             avar: self.avar.clone_with_acl(acl.clone()),
+            cff: self.cff.clone_with_acl(acl.clone()),
             cmap: self.cmap.clone_with_acl(acl.clone()),
             colr: self.colr.clone_with_acl(acl.clone()),
             cpal: self.cpal.clone_with_acl(acl.clone()),
@@ -991,6 +1020,7 @@ impl Context {
             glyphs: ContextMap::new(acl.clone(), persistent_storage.clone()),
             gvar_fragments: ContextMap::new(acl.clone(), persistent_storage.clone()),
             avar: ContextItem::new(WorkId::Avar.into(), acl.clone(), persistent_storage.clone()),
+            cff: ContextItem::new(WorkId::Cff.into(), acl.clone(), persistent_storage.clone()),
             cmap: ContextItem::new(WorkId::Cmap.into(), acl.clone(), persistent_storage.clone()),
             colr: ContextItem::new(WorkId::Colr.into(), acl.clone(), persistent_storage.clone()),
             cpal: ContextItem::new(WorkId::Cpal.into(), acl.clone(), persistent_storage.clone()),
