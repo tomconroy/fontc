@@ -1,7 +1,7 @@
 //! Generates a [gasp](https://learn.microsoft.com/en-us/typography/opentype/spec/gasp) table.
 
 use fontdrasil::orchestration::{Access, AccessBuilder, Work};
-use fontir::orchestration::WorkId as FeWorkId;
+use fontir::orchestration::{Flags as IrFlags, WorkId as FeWorkId};
 
 use write_fonts::tables::gasp::Gasp;
 
@@ -30,6 +30,12 @@ impl Work<Context, AnyWorkId, Error> for GaspWork {
 
     /// Generate [gasp](https://learn.microsoft.com/en-us/typography/opentype/spec/gasp) if necessary
     fn exec(&self, context: &Context) -> Result<(), Error> {
+        // gasp only advises TrueType rasterizers; ufo2ft lists it among the
+        // TTF-only tables, so a CFF font never gets one
+        // <https://github.com/googlefonts/ufo2ft/blob/main/Lib/ufo2ft/outlineCompiler.py>
+        if context.flags.contains(IrFlags::CFF_OUTLINES) {
+            return Ok(());
+        }
         let static_metadata = context.ir.static_metadata.get();
         let mut gasp_ranges = static_metadata.misc.gasp.clone();
         gasp_ranges.sort_by_key(|gr| gr.range_max_ppem);

@@ -472,7 +472,12 @@ impl Work<Context, AnyWorkId, Error> for MetricAndLimitWork {
         // Since we never set lsb to anything other than x_min it would appear we can *always* set this
         // It's set by default so the only way it gets unset is when source explicitly sets head flags
         // Ref <https://github.com/fonttools/fonttools/blob/7e374c53da9a7443d32b31138a0e5be478bcbab9/Lib/fontTools/ttLib/tables/_m_a_x_p.py#L81C9-L122>
-        head.flags |= head::Flags::LSB_AT_X_0;
+        // fontTools only does this in maxp 1.0's recalc(), which walks glyf. A
+        // CFF font has maxp 0.5 and no glyf, so recalc never runs and whatever
+        // the source asked for in head.flags stands.
+        if cff.is_none() {
+            head.flags |= head::Flags::LSB_AT_X_0;
+        }
 
         context.head.set(head);
 
