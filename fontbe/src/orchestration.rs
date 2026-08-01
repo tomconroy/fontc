@@ -87,6 +87,7 @@ pub enum WorkId {
     Features,
     FeaturesAst(FeaSourceIdx),
     Avar,
+    Cff,
     Cmap,
     Colr,
     Cpal,
@@ -146,6 +147,7 @@ impl Identifier for WorkId {
             WorkId::Meta => "BeMeta",
             WorkId::FeaturesAst(..) => "BeFeaturesAst",
             WorkId::Avar => "BeAvar",
+            WorkId::Cff => "BeCff",
             WorkId::Cmap => "BeCmap",
             WorkId::Colr => "BeColr",
             WorkId::Cpal => "BeCpal",
@@ -291,6 +293,19 @@ impl IdAware<AnyWorkId> for Glyph {
     fn id(&self) -> AnyWorkId {
         AnyWorkId::Be(WorkId::GlyfFragment(self.name.clone()))
     }
+}
+
+/// The compiled `CFF ` table plus the per-glyph bounds computed alongside it.
+///
+/// A CFF font has no per-glyph bbox in the outline data itself, so the works
+/// that need bounds (hmtx/hhea/head, vmtx/vhea) read them from here instead
+/// of from glyf fragments.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CffOutput {
+    pub table: Vec<u8>,
+    /// `[x_min, y_min, x_max, y_max]` per glyph, in glyph order; `None` for
+    /// glyphs with no outline
+    pub glyph_bounds: Vec<Option<[i32; 4]>>,
 }
 
 /// Unusually we store something other than the binary gvar per glyph.
@@ -680,6 +695,7 @@ pub struct Context {
 
     // Allow avar to be explicitly None to record a noop avar being generated
     pub avar: BeContextItem<Option<Avar>>,
+    pub cff: BeContextItem<CffOutput>,
     pub cmap: BeContextItem<Cmap>,
     pub colr: BeContextItem<Colr>,
     pub cpal: BeContextItem<Cpal>,
@@ -727,6 +743,7 @@ impl Context {
             glyphs: self.glyphs.clone_with_acl(acl.clone()),
             gvar_fragments: self.gvar_fragments.clone_with_acl(acl.clone()),
             avar: self.avar.clone_with_acl(acl.clone()),
+            cff: self.cff.clone_with_acl(acl.clone()),
             cmap: self.cmap.clone_with_acl(acl.clone()),
             colr: self.colr.clone_with_acl(acl.clone()),
             cpal: self.cpal.clone_with_acl(acl.clone()),
@@ -780,6 +797,7 @@ impl Context {
             glyphs: ContextMap::new(acl.clone()),
             gvar_fragments: ContextMap::new(acl.clone()),
             avar: ContextItem::new(WorkId::Avar.into(), acl.clone()),
+            cff: ContextItem::new(WorkId::Cff.into(), acl.clone()),
             cmap: ContextItem::new(WorkId::Cmap.into(), acl.clone()),
             colr: ContextItem::new(WorkId::Colr.into(), acl.clone()),
             cpal: ContextItem::new(WorkId::Cpal.into(), acl.clone()),

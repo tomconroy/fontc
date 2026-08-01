@@ -30,6 +30,9 @@ bitflags! {
         const ERASE_OPEN_CORNERS = 0b1000000000;
         // If set, anchors will be propagated from components to composites
         const PROPAGATE_ANCHORS = 0b10000000000;
+        // If set, glyphs are compiled to a CFF table (PostScript/cubic outlines)
+        // instead of glyf/loca
+        const CFF_OUTLINES = 0b100000000000;
     }
 }
 
