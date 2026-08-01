@@ -11,6 +11,7 @@ use write_fonts::{
 };
 
 use crate::{
+    cff::bbox_from_cff,
     error::Error,
     metrics_and_limits::MetricsBuilder,
     orchestration::{AnyWorkId, BeWork, Context, WorkId},
@@ -80,42 +81,34 @@ impl Work<Context, AnyWorkId, Error> for VerticalMetricsWork {
             .then(|| context.cff.get());
 
         // Collate vertical metrics
-        let builder =
-            glyph_order
-                .iter()
-                .fold(MetricsBuilder::default(), |mut builder, (gid, gn)| {
-                    let glyph = context.ir.get_glyph(gn.clone());
-                    let instance = glyph.default_instance();
+        let mut builder = MetricsBuilder::default();
+        for (gid, gn) in glyph_order.iter() {
+            let glyph = context.ir.get_glyph(gn.clone());
+            let instance = glyph.default_instance();
 
-                    // https://github.com/googlefonts/ufo2ft/blob/2f11b0ff/Lib/ufo2ft/outlineCompiler.py#L882-L890
-                    let advance = instance.height(&default_metrics);
-                    let vertical_origin = instance.vertical_origin(&default_metrics);
+            // https://github.com/googlefonts/ufo2ft/blob/2f11b0ff/Lib/ufo2ft/outlineCompiler.py#L882-L890
+            let advance = instance.height(&default_metrics);
+            let vertical_origin = instance.vertical_origin(&default_metrics);
 
-                    let (y_min, y_max) = match &cff {
-                        Some(cff) => cff
-                            .glyph_bounds
-                            .get(gid.to_u16() as usize)
-                            .copied()
-                            .flatten()
-                            .map(|[_, y_min, _, y_max]| (y_min, y_max))
-                            .unzip(),
-                        None => {
-                            let glyph =
-                                context.glyphs.get(&WorkId::GlyfFragment(gn.clone()).into());
-                            let bbox = glyph.data.bbox();
-                            (
-                                bbox.map(|bbox| bbox.y_min as i32),
-                                bbox.map(|bbox| bbox.y_max as i32),
-                            )
-                        }
-                    };
+            let bbox = match &cff {
+                Some(cff) => cff
+                    .glyph_bounds
+                    .get(gid.to_u16() as usize)
+                    .copied()
+                    .flatten()
+                    .map(|bounds| bbox_from_cff(gn, bounds))
+                    .transpose()?,
+                None => context
+                    .glyphs
+                    .get(&WorkId::GlyfFragment(gn.clone()).into())
+                    .data
+                    .bbox(),
+            };
+            let side_bearing = vertical_origin - bbox.map(|bbox| bbox.y_max).unwrap_or_default();
+            let bounds_advance = bbox.map(|bbox| bbox.y_max as i32 - bbox.y_min as i32);
 
-                    let side_bearing = vertical_origin - y_max.unwrap_or_default() as i16;
-                    let bounds_advance = y_max.and_then(|y_max| y_min.map(|y_min| y_max - y_min));
-
-                    builder.update(advance, side_bearing, bounds_advance);
-                    builder
-                });
+            builder.update(advance, side_bearing, bounds_advance);
+        }
 
         let metrics = builder.build();
 

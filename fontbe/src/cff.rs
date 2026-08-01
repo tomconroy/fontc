@@ -5,12 +5,16 @@
 //! decomposed by fontir ([`Flags::CFF_OUTLINES`] implies
 //! [`Flags::DECOMPOSE_COMPONENTS`] when set via the CLI).
 
-use fontdrasil::orchestration::{Access, Work};
+use fontdrasil::{
+    orchestration::{Access, Work},
+    types::GlyphName,
+};
 use fontir::ir::StaticMetadata;
-use kurbo::{BezPath, PathEl, Point, Rect, Shape};
+use kurbo::{BezPath, PathEl, Point};
 use write_fonts::{
     OtRound,
     ps::cff::v1::{CffFontBuilder, GlyphData, PrivateDictValues, TopDictValues, charstring},
+    tables::glyf::Bbox,
     types::NameId,
 };
 
@@ -42,23 +46,23 @@ fn postscript_string(value: Option<String>) -> Option<String> {
     Some(value.unwrap_or_default().replace('\u{00a9}', "Copyright"))
 }
 
-/// `path` with every point rounded to integer coordinates, the way
-/// coordinates round when written to a charstring.
-fn rounded_path(path: &BezPath) -> BezPath {
-    fn round(p: Point) -> Point {
-        let (x, y): (f64, f64) = (p.x.ot_round(), p.y.ot_round());
-        Point::new(x, y)
-    }
-    path.elements()
-        .iter()
-        .map(|el| match *el {
-            PathEl::MoveTo(p) => PathEl::MoveTo(round(p)),
-            PathEl::LineTo(p) => PathEl::LineTo(round(p)),
-            PathEl::QuadTo(p1, p2) => PathEl::QuadTo(round(p1), round(p2)),
-            PathEl::CurveTo(p1, p2, p3) => PathEl::CurveTo(round(p1), round(p2), round(p3)),
-            PathEl::ClosePath => PathEl::ClosePath,
+/// The bounds the CFF work recorded for a glyph, as a [`Bbox`].
+///
+/// CFF bounds are i32 but the metrics tables are i16, so an outline that far
+/// from the origin is an error rather than a silent wraparound.
+pub(crate) fn bbox_from_cff(glyph_name: &GlyphName, bounds: [i32; 4]) -> Result<Bbox, Error> {
+    let coord = |value: i32, what: &str| {
+        i16::try_from(value).map_err(|_| Error::OutOfBounds {
+            what: format!("{glyph_name} bbox {what}"),
+            value: value.to_string(),
         })
-        .collect()
+    };
+    Ok(Bbox {
+        x_min: coord(bounds[0], "x_min")?,
+        y_min: coord(bounds[1], "y_min")?,
+        x_max: coord(bounds[2], "x_max")?,
+        y_max: coord(bounds[3], "y_max")?,
+    })
 }
 
 /// Drop the explicit closing line segment of each closed contour.
@@ -68,16 +72,21 @@ fn rounded_path(path: &BezPath) -> BezPath {
 /// line of a closed contour is implicit. Type 2 charstrings close contours
 /// implicitly too, so an explicit closing line is pure redundancy.
 ///
-/// Expects a path whose points are already rounded, so that "lands on the
-/// contour start" means what it will mean in the emitted charstring.
+/// Whether the last segment lands on the contour start is decided on rounded
+/// coordinates, because that is what the charstring will contain; the points
+/// themselves are passed through unrounded, since the pen rounds them (and
+/// raises quadratics from the unrounded values).
 fn drop_explicit_closing_lines(path: &BezPath) -> BezPath {
+    fn round(p: Point) -> (i32, i32) {
+        (p.x.ot_round(), p.y.ot_round())
+    }
     let mut out: Vec<PathEl> = Vec::with_capacity(path.elements().len());
-    let mut contour_start = Point::ZERO;
+    let mut contour_start = (0, 0);
     for el in path.elements() {
         match el {
-            PathEl::MoveTo(p) => contour_start = *p,
+            PathEl::MoveTo(p) => contour_start = round(*p),
             PathEl::ClosePath => {
-                if matches!(out.last(), Some(PathEl::LineTo(p)) if *p == contour_start) {
+                if matches!(out.last(), Some(PathEl::LineTo(p)) if round(*p) == contour_start) {
                     out.pop();
                 }
             }
@@ -86,28 +95,6 @@ fn drop_explicit_closing_lines(path: &BezPath) -> BezPath {
         out.push(*el);
     }
     out.into_iter().collect()
-}
-
-/// Exact bounds of the rounded path, like fontTools' BoundsPen: curve-exact,
-/// and a contour consisting of a lone moveto still contributes its point.
-fn path_bounds(path: &BezPath) -> Option<Rect> {
-    if path.elements().is_empty() {
-        return None;
-    }
-    if path.segments().next().is_some() {
-        return Some(path.bounding_box());
-    }
-    match path.elements().first() {
-        Some(PathEl::MoveTo(p)) => Some(Rect::from_points(*p, *p)),
-        _ => None,
-    }
-}
-
-fn union(a: Option<Rect>, b: Option<Rect>) -> Option<Rect> {
-    match (a, b) {
-        (Some(a), Some(b)) => Some(a.union(b)),
-        (a, b) => a.or(b),
-    }
 }
 
 impl Work<Context, AnyWorkId, Error> for CffWork {
@@ -176,6 +163,12 @@ impl Work<Context, AnyWorkId, Error> for CffWork {
         let final_names =
             final_glyph_names(&glyph_order, static_metadata.postscript_names.as_ref());
 
+        // fontir synthesizes a .notdef when the source has none. Like ufo2ft's
+        // stub it draws the closing line of each box explicitly, and ufo2ft
+        // keeps those (its `explicitClosingLine` glyph lib key), so we do too.
+        let notdef: GlyphName = ".notdef".into();
+        let synthesized_notdef = !context.ir.preliminary_glyph_order.get().contains(&notdef);
+
         let mut builder = CffFontBuilder::new(postscript_name, top_dict, private);
         let mut glyph_bounds = Vec::with_capacity(glyph_order.len());
         for (glyph_name, final_name) in glyph_order.names().zip(final_names) {
@@ -184,30 +177,38 @@ impl Work<Context, AnyWorkId, Error> for CffWork {
             if !instance.components.is_empty() {
                 return Err(Error::CffGlyphHasComponents(glyph_name.clone()));
             }
+            let keep_closing_lines = synthesized_notdef && *glyph_name == notdef;
 
             let mut pen = charstring::CharstringBuilder::new();
-            let mut bounds = None;
             for contour in &instance.contours {
                 // CFF keeps the source (counter-clockwise) contour direction,
                 // so unlike glyf there is nothing to reverse here
-                let rounded = drop_explicit_closing_lines(&rounded_path(contour));
-                bounds = union(bounds, path_bounds(&rounded));
-                pen.append_path(&rounded);
+                if keep_closing_lines {
+                    pen.append_path(contour);
+                } else {
+                    pen.append_path(&drop_explicit_closing_lines(contour));
+                }
             }
-            // fontTools floors mins and ceils maxes (intRect)
-            let bounds = bounds.map(|r| {
-                [
-                    r.x0.floor() as i32,
-                    r.y0.floor() as i32,
-                    r.x1.ceil() as i32,
-                    r.y1.ceil() as i32,
-                ]
-            });
+            let charstring = pen.build(None, true)?;
+            // ufo2ft measures the charstring it just built, rounds each side
+            // (roundTolerance 0.5 never reaches the floor/ceil fallback), and
+            // treats an all-zero box as no box at all
+            let bounds = charstring
+                .bounds
+                .map(|r| {
+                    [
+                        r.x0.ot_round(),
+                        r.y0.ot_round(),
+                        r.x1.ot_round(),
+                        r.y1.ot_round(),
+                    ]
+                })
+                .filter(|bounds| *bounds != [0; 4]);
             glyph_bounds.push(bounds);
             builder.add_glyph(GlyphData {
                 name: final_name,
                 advance_width: instance.width,
-                charstring: pen.build(None, true),
+                charstring: charstring.bytes,
                 bounds,
             });
         }

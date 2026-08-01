@@ -24,6 +24,7 @@ use write_fonts::{
 };
 
 use crate::{
+    cff::bbox_from_cff,
     error::Error,
     orchestration::{AnyWorkId, BeWork, Context, Glyph, WorkId},
 };
@@ -331,47 +332,41 @@ impl Work<Context, AnyWorkId, Error> for MetricAndLimitWork {
             .flags
             .contains(Flags::CFF_OUTLINES)
             .then(|| context.cff.get());
-        let bounds_for = |gid: GlyphId16, gn: &fontdrasil::types::GlyphName| -> Option<Bbox> {
-            match &cff {
-                Some(cff) => cff
-                    .glyph_bounds
-                    .get(gid.to_u16() as usize)
-                    .copied()
-                    .flatten()
-                    .map(|[x_min, y_min, x_max, y_max]| Bbox {
-                        x_min: x_min as i16,
-                        y_min: y_min as i16,
-                        x_max: x_max as i16,
-                        y_max: y_max as i16,
-                    }),
-                None => context
-                    .glyphs
-                    .get(&WorkId::GlyfFragment(gn.clone()).into())
-                    .data
-                    .bbox(),
-            }
-        };
+        let bounds_for =
+            |gid: GlyphId16, gn: &fontdrasil::types::GlyphName| -> Result<Option<Bbox>, Error> {
+                match &cff {
+                    Some(cff) => cff
+                        .glyph_bounds
+                        .get(gid.to_u16() as usize)
+                        .copied()
+                        .flatten()
+                        .map(|bounds| bbox_from_cff(gn, bounds))
+                        .transpose(),
+                    None => Ok(context
+                        .glyphs
+                        .get(&WorkId::GlyfFragment(gn.clone()).into())
+                        .data
+                        .bbox()),
+                }
+            };
 
         // Collate horizontal metrics
-        let builder =
-            glyph_order
-                .iter()
-                .fold(MetricsBuilder::default(), |mut builder, (gid, gn)| {
-                    // https://github.com/googlefonts/ufo2ft/blob/2f11b0ff/Lib/ufo2ft/outlineCompiler.py#L741-L747
-                    let advance: u16 = context
-                        .ir
-                        .get_glyph(gn.clone())
-                        .default_instance()
-                        .width
-                        .ot_round();
+        let mut builder = MetricsBuilder::default();
+        for (gid, gn) in glyph_order.iter() {
+            // https://github.com/googlefonts/ufo2ft/blob/2f11b0ff/Lib/ufo2ft/outlineCompiler.py#L741-L747
+            let advance: u16 = context
+                .ir
+                .get_glyph(gn.clone())
+                .default_instance()
+                .width
+                .ot_round();
 
-                    let bbox = bounds_for(gid, gn);
-                    let side_bearing = bbox.map(|bbox| bbox.x_min).unwrap_or_default();
-                    let bounds_advance = bbox.map(|bbox| bbox.x_max as i32 - bbox.x_min as i32);
+            let bbox = bounds_for(gid, gn)?;
+            let side_bearing = bbox.map(|bbox| bbox.x_min).unwrap_or_default();
+            let bounds_advance = bbox.map(|bbox| bbox.x_max as i32 - bbox.x_min as i32);
 
-                    builder.update(advance, side_bearing, bounds_advance);
-                    builder
-                });
+            builder.update(advance, side_bearing, bounds_advance);
+        }
 
         let metrics = builder.build();
 
@@ -421,10 +416,12 @@ impl Work<Context, AnyWorkId, Error> for MetricAndLimitWork {
                 num_glyphs: glyph_order.len().try_into().unwrap(),
                 ..Default::default()
             };
-            let font_bbox = glyph_order
-                .iter()
-                .filter_map(|(gid, gn)| bounds_for(gid, gn))
-                .reduce(|a, b| a.union(b));
+            let mut font_bbox: Option<Bbox> = None;
+            for (gid, gn) in glyph_order.iter() {
+                if let Some(bbox) = bounds_for(gid, gn)? {
+                    font_bbox = Some(font_bbox.map_or(bbox, |acc: Bbox| acc.union(bbox)));
+                }
+            }
             (maxp, font_bbox)
         } else {
             let mut max_builder =

@@ -61,6 +61,8 @@ pub enum Error {
     CffGlyphHasComponents(GlyphName),
     #[error("Unable to build the CFF table: {0}")]
     CffBuildError(#[from] write_fonts::ps::cff::v1::CffBuildError),
+    #[error("COLR is not yet supported with CFF outlines (--flavor otf)")]
+    ColrNotSupportedForCff,
     #[error("Unable to compute deltas for {0}: {1}")]
     GlyphDeltaError(GlyphName, DeltaError),
     #[error("Unable to compute deltas for MVAR {0}: {1}")]

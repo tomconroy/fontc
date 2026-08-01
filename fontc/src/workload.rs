@@ -440,7 +440,9 @@ impl Workload {
                 let mut cff_deps = AccessBuilder::<AnyWorkId>::new()
                     .variant(FeWorkIdentifier::StaticMetadata)
                     .variant(FeWorkIdentifier::GlobalMetrics)
-                    .variant(FeWorkIdentifier::GlyphOrder);
+                    .variant(FeWorkIdentifier::GlyphOrder)
+                    // to tell a synthesized .notdef from one the source drew
+                    .variant(FeWorkIdentifier::PreliminaryGlyphOrder);
                 for glyph_name in final_glyph_order.names() {
                     cff_deps =
                         cff_deps.specific_instance(FeWorkIdentifier::Glyph(glyph_name.clone()));

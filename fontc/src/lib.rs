@@ -6361,6 +6361,18 @@ mod tests {
             })
             .collect();
         assert_eq!(names, [".notdef", "space", "bar", "plus", "element_of"]);
+
+        // This source has no .notdef of its own, so fontir synthesizes one;
+        // like ufo2ft's stub it draws each box's closing line explicitly, and
+        // these are the bytes fontmake emits for it (four hlineto/vlineto
+        // arguments per box, not three).
+        assert_eq!(
+            cff_font.charstrings().get(0).unwrap(),
+            [
+                0xbd, 0xfb, 0x5c, 0x15, 0xf8, 0x24, 0xfa, 0x7c, 0xfc, 0x24, 0xfe, 0x7c, 0x06, 0xbd,
+                0xbd, 0x15, 0xfa, 0x18, 0xf7, 0xc0, 0xfe, 0x18, 0xfb, 0xc0, 0x07, 0x0e,
+            ]
+        );
     }
 
     #[test]
