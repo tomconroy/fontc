@@ -357,6 +357,11 @@ def build_fontmake(
         cmd.append("--keep-overlaps")
     if instance is not None:
         cmd += ["-i", instance.fontmake_arg()]
+        # a 'TTFAutohint options' custom parameter makes fontmake run
+        # ttfautohint on static builds; fontc never will (a post-process,
+        # out of scope like overlap removal), so compare unhinted statics.
+        # Scoped to instance mode to leave static-source runs untouched.
+        cmd.append("--no-autohint")
     cmd.append(str(source))
 
     build(cmd, build_dir)
