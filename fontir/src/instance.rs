@@ -47,17 +47,19 @@
 use std::{
     borrow::Cow,
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
+    str::FromStr,
 };
 
 use fontdrasil::{
-    coords::NormalizedLocation,
+    coords::{NormalizedLocation, UserCoord, UserLocation},
     types::{Axes, GlyphName},
     variations::{DeltaError, VariationModel},
 };
 use kurbo::Point;
 use ordered_float::OrderedFloat;
+use serde::{Deserialize, Serialize};
 use smol_str::SmolStr;
-use write_fonts::types::Tag;
+use write_fonts::types::{InvalidTag, Tag};
 
 use crate::{
     error::{BadGlyph, Error},
@@ -66,6 +68,92 @@ use crate::{
         KernPair, KernSide, KerningInstance, PostscriptSettings, StaticMetadata,
     },
 };
+
+/// Which instance of a variable source to build, as the user asked for it.
+///
+/// Deliberately un-resolved: telling the two forms apart needs no knowledge of
+/// the source, and everything that *does* — which axes exist, what they range
+/// over, what the named instances are called — only becomes knowable once the
+/// frontend has produced [`StaticMetadata`]. So parsing gets this far and no
+/// further; the pin resolves it.
+///
+/// This lives in fontir rather than beside the CLI so that
+/// [`Context::instance`](crate::orchestration::Context) can carry it without
+/// fontir knowing anything about the compiler's arguments.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub enum InstanceSpec {
+    /// An explicit position, in **user** space, on some subset of the axes.
+    ///
+    /// Axes the user didn't mention take their default.
+    Location(UserLocation),
+    /// The style name of one of the source's named instances.
+    Named(String),
+}
+
+/// What was wrong with an `--instance` argument, on its face.
+///
+/// Only syntax: a spec that parses can still name an axis the source doesn't
+/// have, or a position outside that axis's range, and those are the pin's to
+/// report.
+#[derive(Debug, thiserror::Error)]
+pub enum InstanceSpecError {
+    #[error("an instance must be a style name or an axis position, not empty")]
+    Empty,
+    #[error("'{0}' is not 'axis=position'")]
+    NotAnAxisPosition(String),
+    #[error("'{raw}' is not an axis tag: {cause}")]
+    InvalidTag { raw: String, cause: InvalidTag },
+    #[error("'{value}' is not a position on axis '{tag}'")]
+    InvalidPosition { tag: Tag, value: String },
+    #[error("axis '{0}' is given more than once")]
+    DuplicateAxis(Tag),
+}
+
+impl FromStr for InstanceSpec {
+    type Err = InstanceSpecError;
+
+    /// `wght=700,wdth=87.5` is a location; anything else is a style name.
+    ///
+    /// An `=` is what makes it a location: no style name has one, and a
+    /// location cannot lack one. That is the whole discrimination — a name is
+    /// otherwise unconstrained, so we cannot be pickier without rejecting
+    /// legitimate names.
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let s = s.trim();
+        if s.is_empty() {
+            return Err(InstanceSpecError::Empty);
+        }
+        if !s.contains('=') {
+            return Ok(InstanceSpec::Named(s.to_string()));
+        }
+
+        let mut coords: Vec<(Tag, UserCoord)> = Vec::new();
+        for term in s.split(',') {
+            let term = term.trim();
+            let Some((raw_tag, raw_pos)) = term.split_once('=') else {
+                return Err(InstanceSpecError::NotAnAxisPosition(term.to_string()));
+            };
+            let (raw_tag, raw_pos) = (raw_tag.trim(), raw_pos.trim());
+            let tag = Tag::from_str(raw_tag).map_err(|cause| InstanceSpecError::InvalidTag {
+                raw: raw_tag.to_string(),
+                cause,
+            })?;
+            let pos = raw_pos
+                .parse::<f64>()
+                .ok()
+                .filter(|pos| pos.is_finite())
+                .ok_or_else(|| InstanceSpecError::InvalidPosition {
+                    tag,
+                    value: raw_pos.to_string(),
+                })?;
+            if coords.iter().any(|(seen, _)| *seen == tag) {
+                return Err(InstanceSpecError::DuplicateAxis(tag));
+            }
+            coords.push((tag, UserCoord::new(pos)));
+        }
+        Ok(InstanceSpec::Location(coords.into()))
+    }
+}
 
 /// The model to interpolate `glyph` with.
 ///
@@ -728,6 +816,46 @@ mod tests {
             HashMap::from([(regular(), regular_inst), (bold(), bold_inst)]),
         )
         .unwrap()
+    }
+
+    fn parse(spec: &str) -> Result<InstanceSpec, InstanceSpecError> {
+        spec.parse()
+    }
+
+    #[test]
+    fn parse_a_location() {
+        assert_eq!(
+            parse("wght=700,wdth=87.5").unwrap(),
+            InstanceSpec::Location(
+                vec![
+                    (WGHT, UserCoord::new(700.0)),
+                    (Tag::new(b"wdth"), UserCoord::new(87.5)),
+                ]
+                .into()
+            )
+        );
+    }
+
+    #[test]
+    fn parse_a_style_name() {
+        assert_eq!(
+            parse("Bold Condensed").unwrap(),
+            InstanceSpec::Named("Bold Condensed".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_rejects_what_it_cannot_read() {
+        for (spec, wanted) in [
+            ("", "not empty"),
+            ("weight=700", "not an axis tag"),
+            ("wght=heavy", "not a position"),
+            ("wght=700,wdth", "not 'axis=position'"),
+            ("wght=1,wght=2", "more than once"),
+        ] {
+            let e = parse(spec).unwrap_err().to_string();
+            assert!(e.contains(wanted), "'{spec}' gave '{e}', wanted '{wanted}'");
+        }
     }
 
     #[test]

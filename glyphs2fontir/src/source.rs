@@ -2199,7 +2199,7 @@ mod tests {
 
     fn context_for(glyphs_file: &Path) -> (impl Source + use<>, Context) {
         let source = GlyphsIrSource::new(glyphs_file).unwrap();
-        (source, Context::new_root(Flags::default(), None))
+        (source, Context::new_root(Flags::default(), None, None))
     }
 
     #[test]
@@ -4441,7 +4441,7 @@ mode = skip;
 }"#,
         )
         .unwrap();
-        let context = Context::new_root(Flags::default(), None);
+        let context = Context::new_root(Flags::default(), None, None);
         let task_context = context.copy_for_work(
             Access::None,
             AccessBuilder::new()
@@ -4482,7 +4482,7 @@ mode = skip;
     fn feature_writers_error_from_glyphs_source(source: &str) -> Error {
         let _ = env_logger::builder().is_test(true).try_init();
         let source = GlyphsIrSource::new_from_memory(source).unwrap();
-        let context = Context::new_root(Flags::default(), None);
+        let context = Context::new_root(Flags::default(), None, None);
         let task_context = context.copy_for_work(
             Access::None,
             AccessBuilder::new()
@@ -4525,7 +4525,7 @@ ignoreMarks = 0;
     fn feature_writers_from_glyphs_source(source: &str) -> Option<Vec<FeatureWriterSpec>> {
         let _ = env_logger::builder().is_test(true).try_init();
         let source = GlyphsIrSource::new_from_memory(source).unwrap();
-        let context = Context::new_root(Flags::default(), None);
+        let context = Context::new_root(Flags::default(), None, None);
         let task_context = context.copy_for_work(
             Access::None,
             AccessBuilder::new()

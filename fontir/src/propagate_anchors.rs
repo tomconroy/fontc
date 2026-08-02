@@ -642,7 +642,7 @@ mod tests {
         )
         .unwrap();
         let flags = Flags::default();
-        let ctx = Context::new_root(flags, None) // ir_dir=None => no IR writing
+        let ctx = Context::new_root(flags, None, None) // ir_dir=None => no IR writing
             .copy_for_work(Access::All, Access::All);
         ctx.static_metadata.set(meta);
 

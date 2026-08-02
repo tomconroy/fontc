@@ -4,7 +4,7 @@ use std::path::PathBuf;
 
 use clap::{ArgAction, Parser};
 use fontc::{DisableFlags, Input, Options};
-use fontir::orchestration::Flags;
+use fontir::{instance::InstanceSpec, orchestration::Flags};
 
 use regex::Regex;
 use serde::{Deserialize, Deserializer, Serialize};
@@ -129,6 +129,18 @@ pub struct Args {
     // Named for fontmake's -o/--output {ttf,otf}, which clashes with our -o
     #[arg(long, value_enum, default_value_t)]
     pub flavor: Flavor,
+
+    /// Build a single static instance instead of a variable font.
+    ///
+    /// Accepts either the style name of one of the source's named instances
+    /// ("Bold"), or an explicit user-space location ("wght=700,wdth=87.5").
+    /// Axes you don't mention take their default.
+    ///
+    /// One instance per invocation. Requires a variable source.
+    // Named for fontmake's -i/--interpolate, which takes a style-name regex;
+    // we take one instance, not a pattern.
+    #[arg(long, value_name = "INSTANCE")]
+    pub instance: Option<InstanceSpec>,
 }
 
 /// Which outline format the compiled font uses.
@@ -274,6 +286,7 @@ impl TryInto<Options> for Args {
             timing_file,
             debug_dir,
             ir_dir,
+            instance: self.instance,
         })
     }
 }
@@ -281,9 +294,140 @@ impl TryInto<Options> for Args {
 #[cfg(test)]
 mod tests {
     use clap::Parser;
-    use fontir::orchestration::Flags;
+    use fontdrasil::coords::{UserCoord, UserLocation};
+    use fontir::{instance::InstanceSpec, orchestration::Flags};
+    use write_fonts::types::Tag;
 
     use crate::args::Args;
+
+    fn parse(args: &[&str]) -> Args {
+        let mut argv = vec!["program", "dont.care.designspace"];
+        argv.extend_from_slice(args);
+        Args::parse_from(argv)
+    }
+
+    fn try_parse(args: &[&str]) -> Result<Args, clap::Error> {
+        let mut argv = vec!["program", "dont.care.designspace"];
+        argv.extend_from_slice(args);
+        Args::try_parse_from(argv)
+    }
+
+    #[test]
+    fn instance_defaults_to_none() {
+        assert_eq!(parse(&[]).instance, None);
+    }
+
+    #[test]
+    fn instance_by_style_name() {
+        assert_eq!(
+            parse(&["--instance", "Bold Condensed"]).instance,
+            Some(InstanceSpec::Named("Bold Condensed".to_string()))
+        );
+    }
+
+    #[test]
+    fn instance_by_user_location() {
+        let expected: UserLocation = vec![
+            (Tag::new(b"wght"), UserCoord::new(700.0)),
+            (Tag::new(b"wdth"), UserCoord::new(87.5)),
+        ]
+        .into();
+        assert_eq!(
+            parse(&["--instance", "wght=700,wdth=87.5"]).instance,
+            Some(InstanceSpec::Location(expected))
+        );
+    }
+
+    #[test]
+    fn instance_tolerates_whitespace_and_short_tags() {
+        let expected: UserLocation = vec![(Tag::new(b"XX  "), UserCoord::new(-1.0))].into();
+        assert_eq!(
+            parse(&["--instance", " XX = -1 "]).instance,
+            Some(InstanceSpec::Location(expected))
+        );
+    }
+
+    /// The value is user space, so it may be negative or fractional; a *name*
+    /// is anything without an '='.
+    #[test]
+    fn instance_name_can_look_like_almost_anything() {
+        assert_eq!(
+            parse(&["--instance", "12 Point"]).instance,
+            Some(InstanceSpec::Named("12 Point".to_string()))
+        );
+    }
+
+    fn instance_error(spec: &str) -> String {
+        try_parse(&["--instance", spec])
+            .expect_err("'{spec}' should not parse")
+            .to_string()
+    }
+
+    #[test]
+    fn instance_rejects_empty() {
+        assert!(
+            instance_error("").contains("must be a style name or an axis position"),
+            "{}",
+            instance_error("")
+        );
+    }
+
+    #[test]
+    fn instance_rejects_a_long_tag() {
+        assert!(
+            instance_error("weight=700").contains("'weight' is not an axis tag"),
+            "{}",
+            instance_error("weight=700")
+        );
+    }
+
+    #[test]
+    fn instance_rejects_a_missing_tag() {
+        assert!(
+            instance_error("=700").contains("'' is not an axis tag"),
+            "{}",
+            instance_error("=700")
+        );
+    }
+
+    #[test]
+    fn instance_rejects_a_non_numeric_position() {
+        assert!(
+            instance_error("wght=heavy").contains("'heavy' is not a position on axis 'wght'"),
+            "{}",
+            instance_error("wght=heavy")
+        );
+        assert!(
+            instance_error("wght=").contains("'' is not a position on axis 'wght'"),
+            "{}",
+            instance_error("wght=")
+        );
+        assert!(
+            instance_error("wght=inf").contains("is not a position"),
+            "{}",
+            instance_error("wght=inf")
+        );
+    }
+
+    #[test]
+    fn instance_rejects_a_term_that_is_not_a_position() {
+        // one term has an '=' so the whole thing is a location, and then
+        // 'wdth' on its own is not a position
+        assert!(
+            instance_error("wght=700,wdth").contains("'wdth' is not 'axis=position'"),
+            "{}",
+            instance_error("wght=700,wdth")
+        );
+    }
+
+    #[test]
+    fn instance_rejects_a_repeated_axis() {
+        assert!(
+            instance_error("wght=700,wght=800").contains("axis 'wght' is given more than once"),
+            "{}",
+            instance_error("wght=700,wght=800")
+        );
+    }
 
     // It's awkward to get the Flags::default values into #[arg] so test for consistency
     #[test]

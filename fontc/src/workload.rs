@@ -45,6 +45,7 @@ use fontdrasil::{
 };
 use fontir::{
     glyph::create_glyph_order_work,
+    instance::InstanceSpec,
     orchestration::{Context as FeContext, Flags, WorkId as FeWorkIdentifier},
     source::Source,
 };
@@ -57,9 +58,25 @@ use rayon::Scope;
 
 use crate::{
     Error,
+    instance::{self, Pin},
     timing::{JobTime, JobTimer},
     work::{AnyAccess, AnyContext, AnyWork},
 };
+
+/// How far through pinning the IR at one instance we are.
+///
+/// The pin is not a job: see the [`crate::instance`] module docs for why it
+/// cannot be, and why it takes two turns.
+enum PinState {
+    /// No `--instance`. Nothing is ever gated and nothing ever runs.
+    NotRequested,
+    /// Nothing is pinned. Glyph order and the whole backend wait.
+    Requested(InstanceSpec),
+    /// Everything but kerning is pinned. The backend waits.
+    Glyphs(Pin),
+    /// Pinned. Nothing is gated.
+    Done,
+}
 
 /// A set of interdependent jobs to execute.
 pub struct Workload {
@@ -70,6 +87,8 @@ pub struct Workload {
     skip_features: bool,
     // build a CFF (cubic outline) font instead of glyf
     cff_outlines: bool,
+    // compile one static instance, and how far along that is
+    pin: PinState,
     // we count the number of errors encountered but only store the first we see
     n_failures: usize,
 
@@ -130,6 +149,7 @@ impl Workload {
         timer: JobTimer,
         skip_features: bool,
         flags: Flags,
+        instance: Option<InstanceSpec>,
     ) -> Result<Self, Error> {
         let time = timer
             .create_timer(AnyWorkId::InternalTiming("Create workload"), 0)
@@ -146,6 +166,10 @@ impl Workload {
             count_pending: Default::default(),
             skip_features,
             cff_outlines: flags.contains(Flags::CFF_OUTLINES),
+            pin: match instance {
+                Some(instance) => PinState::Requested(instance),
+                None => PinState::NotRequested,
+            },
             timer,
         };
 
@@ -533,7 +557,61 @@ impl Workload {
         id != the_pending_job
     }
 
+    /// Is this job waiting on the pin rather than on its own dependencies?
+    ///
+    /// Glyph order waits because fontmake interpolates before it filters, and
+    /// the two orders are not the same font. The backend waits because it is
+    /// entitled to assume the IR it reads is final.
+    fn gated_by_pin(&self, job: &Job) -> bool {
+        match self.pin {
+            PinState::NotRequested | PinState::Done => false,
+            PinState::Requested(..) => matches!(
+                job.id,
+                AnyWorkId::Be(..) | AnyWorkId::Fe(FeWorkIdentifier::GlyphOrder)
+            ),
+            PinState::Glyphs(..) => matches!(job.id, AnyWorkId::Be(..)),
+        }
+    }
+
+    /// Take the next step of the pin, if there is one and it is time.
+    ///
+    /// Called only when the scheduler has nothing left to run, which is
+    /// precisely the proof that everything the step needs has been produced:
+    /// before glyph order for the first step, and after every `KernInstance`
+    /// for the second. Returns whether it did anything.
+    fn advance_pin(&mut self, fe_root: &FeContext) -> Result<bool, Error> {
+        match std::mem::replace(&mut self.pin, PinState::Done) {
+            PinState::Requested(spec) => {
+                let time = self
+                    .timer
+                    .create_timer(AnyWorkId::InternalTiming("pin"), 0)
+                    .run();
+                let pin = instance::pin_frontend(fe_root, &spec)?;
+                self.pin = PinState::Glyphs(pin);
+                self.timer.add(time.complete());
+                Ok(true)
+            }
+            PinState::Glyphs(pin) => {
+                let time = self
+                    .timer
+                    .create_timer(AnyWorkId::InternalTiming("pin kerning"), 0)
+                    .run();
+                instance::pin_kerning(fe_root, &pin)?;
+                self.pin = PinState::Done;
+                self.timer.add(time.complete());
+                Ok(true)
+            }
+            done => {
+                self.pin = done;
+                Ok(false)
+            }
+        }
+    }
+
     fn can_run(&self, job: &Job) -> bool {
+        if self.gated_by_pin(job) {
+            return false;
+        }
         match &job.read_access {
             AnyAccess::Fe(access) => match access {
                 Access::None => true,
@@ -639,6 +717,11 @@ impl Workload {
                 // Spawn anything that is currently executable (has no unfulfilled dependencies)
                 self.update_launchable(&mut launchable);
                 if launchable.is_empty() && !self.jobs_pending.values().any(|j| j.running) {
+                    // Nothing runnable and nothing running: either everything
+                    // left is waiting on the pin, or we really are stuck.
+                    if self.advance_pin(fe_root)? {
+                        continue;
+                    }
                     if log::log_enabled!(log::Level::Warn) {
                         warn!(
                             "{}/{} jobs have succeeded, nothing is running, and nothing is launchable",
@@ -917,6 +1000,13 @@ impl Workload {
         let mut launchable = Vec::new();
         while !self.jobs_pending.is_empty() {
             self.update_launchable(&mut launchable);
+            if launchable.is_empty()
+                && self
+                    .advance_pin(fe_root)
+                    .unwrap_or_else(|e| panic!("Unable to pin an instance: {e}"))
+            {
+                continue;
+            }
             if launchable.is_empty() {
                 log::error!("Completed:");
                 let mut success: Vec<_> = self.success.iter().collect();
