@@ -349,6 +349,23 @@ impl Work<Context, AnyWorkId, Error> for MetricAndLimitWork {
                         .bbox()),
                 }
             };
+        // The bounds hhea and head are built from. For glyf these are the same
+        // integers, but fontTools recalculates a CFF font's hhea and head from
+        // the charstrings when it writes them out, and it grows the bounds
+        // *outward* to integers rather than rounding them.
+        let outer_bounds_for =
+            |gid: GlyphId16, gn: &fontdrasil::types::GlyphName| -> Result<Option<Bbox>, Error> {
+                match &cff {
+                    Some(cff) => cff
+                        .glyph_outer_bounds
+                        .get(gid.to_u16() as usize)
+                        .copied()
+                        .flatten()
+                        .map(|bounds| bbox_from_cff(gn, bounds))
+                        .transpose(),
+                    None => bounds_for(gid, gn),
+                }
+            };
 
         // Collate horizontal metrics
         let mut builder = MetricsBuilder::default();
@@ -361,9 +378,14 @@ impl Work<Context, AnyWorkId, Error> for MetricAndLimitWork {
                 .width
                 .ot_round();
 
-            let bbox = bounds_for(gid, gn)?;
-            let side_bearing = bbox.map(|bbox| bbox.x_min).unwrap_or_default();
-            let bounds_advance = bbox.map(|bbox| bbox.x_max as i32 - bbox.x_min as i32);
+            // the side bearing is the rounded box's, but the width it spans —
+            // and so the extent and the right side bearing — is the outer
+            // box's, exactly as fontTools' `hhea.recalc` computes it
+            let side_bearing = bounds_for(gid, gn)?
+                .map(|bbox| bbox.x_min)
+                .unwrap_or_default();
+            let bounds_advance =
+                outer_bounds_for(gid, gn)?.map(|bbox| bbox.x_max as i32 - bbox.x_min as i32);
 
             builder.update(advance, side_bearing, bounds_advance);
         }
@@ -416,9 +438,11 @@ impl Work<Context, AnyWorkId, Error> for MetricAndLimitWork {
                 num_glyphs: glyph_order.len().try_into().unwrap(),
                 ..Default::default()
             };
+            // head's box is a copy of the CFF FontBBox, which fontTools
+            // recalculates as the enclosing integer box of the union
             let mut font_bbox: Option<Bbox> = None;
             for (gid, gn) in glyph_order.iter() {
-                if let Some(bbox) = bounds_for(gid, gn)? {
+                if let Some(bbox) = outer_bounds_for(gid, gn)? {
                     font_bbox = Some(font_bbox.map_or(bbox, |acc: Bbox| acc.union(bbox)));
                 }
             }

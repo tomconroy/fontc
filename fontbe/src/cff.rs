@@ -12,6 +12,7 @@ use fontdrasil::{
 use fontir::ir::{PostscriptSettings, StaticMetadata};
 use kurbo::{BezPath, PathEl, Point};
 use ordered_float::OrderedFloat;
+use unicode_normalization::UnicodeNormalization;
 use write_fonts::{
     OtRound,
     ps::cff::v1::{CffFontBuilder, GlyphData, PrivateDictValues, TopDictValues, charstring},
@@ -32,19 +33,92 @@ pub fn create_cff_work() -> Box<BeWork> {
     Box::new(CffWork {})
 }
 
-/// The first entry in the name table with the given id, if any.
+/// The US-English entry in the name table with the given id, if any.
+///
+/// A localized font has several records per id — Gasoek One's family name is
+/// there in both Korean and English — and the CFF, which has no notion of
+/// language, gets the English one. ufo2ft reads the UFO's own (unlocalized)
+/// font info for these, which is what the English record was built from.
 fn name(static_metadata: &StaticMetadata, id: NameId) -> Option<String> {
+    const US_ENGLISH: u16 = 0x409;
     static_metadata
         .names
         .iter()
-        .find(|(key, _)| key.name_id == id)
+        .find(|(key, _)| key.name_id == id && key.lang_id == US_ENGLISH)
         .map(|(_, value)| value.clone())
 }
 
-/// ufo2ft coerces missing notice/copyright to "" and replaces the copyright
-/// sign; we don't (yet) apply its full PostScript string normalization.
+/// The characters ufo2ft's `normalizeStringForPostscript` deletes outright.
+const POSTSCRIPT_STRING_EXCEPTIONS: &str = "[](){}<>/%";
+
+/// Whether a character may stand in a PostScript string as-is, which ufo2ft
+/// takes to be `chr(33)..=chr(126)`. Note that this excludes the space, so
+/// spaces take the decompose-and-fall-back path below (where they survive,
+/// being ASCII) rather than the fast path.
+fn is_postscript_char(c: char) -> bool {
+    matches!(c, '\u{21}'..='\u{7e}')
+}
+
+/// Port of ufo2ft's `normalizeStringForPostscript` (with `allowSpaces`, which
+/// is what the CFF Notice/Copyright path uses).
+///
+/// Deletes `[](){}<>/%`, keeps printable ASCII as-is, and puts everything else
+/// through NFKD: if the decomposition is entirely printable ASCII it is
+/// substituted (so `™` → `TM`, `ﬁ` → `fi`), and otherwise the decomposition is
+/// ASCII-encoded with one `?` per character that doesn't fit — so `é`, which
+/// decomposes to `e` plus a combining acute, becomes `e?`, not `e`.
+fn normalize_string_for_postscript(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        if POSTSCRIPT_STRING_EXCEPTIONS.contains(c) {
+            continue;
+        }
+        if is_postscript_char(c) {
+            out.push(c);
+            continue;
+        }
+        let decomposed: String = c.nfkd().collect();
+        if decomposed.chars().all(is_postscript_char) {
+            out.push_str(&decomposed);
+        } else {
+            out.extend(
+                decomposed
+                    .chars()
+                    .map(|c| if c.is_ascii() { c } else { '?' }),
+            );
+        }
+    }
+    out
+}
+
+/// The Notice/Copyright string ufo2ft would store for a name table value.
+///
+/// ufo2ft coerces a missing value to "", replaces the copyright sign, and only
+/// then normalizes for PostScript — so a `©` becomes `Copyright`, not `?`.
 fn postscript_string(value: Option<String>) -> Option<String> {
-    Some(value.unwrap_or_default().replace('\u{00a9}', "Copyright"))
+    Some(normalize_string_for_postscript(
+        &value.unwrap_or_default().replace('\u{00a9}', "Copyright"),
+    ))
+}
+
+/// The smallest integer box enclosing a charstring's exact bounds.
+///
+/// fontTools recalculates head, hhea and vhea from the compiled charstrings
+/// when it writes a CFF font, and it grows the bounds outward rather than
+/// rounding them: `intRect` for the FontBBox head copies, and
+/// `ceil(max) - floor(min)` for the bounds width hhea/vhea extend the side
+/// bearings by. A glyph whose curve overshoots its on-curve points by a
+/// fraction of a unit therefore counts as a whole unit wider than the rounded
+/// box in [`CffOutput::glyph_bounds`] says.
+fn outer_bounds(charstring: &charstring::Charstring) -> Option<[i32; 4]> {
+    charstring.bounds.map(|r| {
+        [
+            r.x0.floor() as i32,
+            r.y0.floor() as i32,
+            r.x1.ceil() as i32,
+            r.y1.ceil() as i32,
+        ]
+    })
 }
 
 /// The bounds the CFF work recorded for a glyph, as a [`Bbox`].
@@ -233,7 +307,23 @@ impl Work<Context, AnyWorkId, Error> for CffWork {
             )),
             notice: postscript_string(name(&static_metadata, NameId::TRADEMARK)),
             copyright: postscript_string(name(&static_metadata, NameId::COPYRIGHT_NOTICE)),
-            full_name: name(&static_metadata, NameId::FULL_NAME),
+            // ufo2ft reads postscriptFullName, whose fallback is
+            // "{preferred family} {preferred subfamily}" — *not* the name
+            // table's full font name, which for Geo is "Geo Medium" where the
+            // source states a postscriptFullName of "Geo-Regular"
+            full_name: static_metadata
+                .misc
+                .postscript
+                .full_name
+                .clone()
+                .or_else(|| {
+                    let subfamily = name(&static_metadata, NameId::TYPOGRAPHIC_SUBFAMILY_NAME)
+                        .or_else(|| name(&static_metadata, NameId::SUBFAMILY_NAME));
+                    match (family_name.as_ref(), subfamily) {
+                        (Some(family), Some(subfamily)) => Some(format!("{family} {subfamily}")),
+                        _ => None,
+                    }
+                }),
             family_name,
             // like ufo2ft: postscriptWeightName, or no Weight entry at all
             weight: static_metadata.misc.postscript.weight_name.clone(),
@@ -268,6 +358,7 @@ impl Work<Context, AnyWorkId, Error> for CffWork {
 
         let mut builder = CffFontBuilder::new(postscript_name, top_dict, private);
         let mut glyph_bounds = Vec::with_capacity(glyph_order.len());
+        let mut glyph_outer_bounds = Vec::with_capacity(glyph_order.len());
         for (glyph_name, final_name) in glyph_order.names().zip(final_names) {
             let glyph = context.ir.get_glyph(glyph_name.clone());
             let instance = glyph.default_instance();
@@ -289,24 +380,27 @@ impl Work<Context, AnyWorkId, Error> for CffWork {
             let charstring = pen.build(None, true)?;
             // ufo2ft measures the charstring it just built, rounds each side
             // (roundTolerance 0.5 never reaches the floor/ceil fallback), and
-            // treats an all-zero box as no box at all
-            let bounds = charstring
-                .bounds
-                .map(|r| {
-                    [
-                        r.x0.ot_round(),
-                        r.y0.ot_round(),
-                        r.x1.ot_round(),
-                        r.y1.ot_round(),
-                    ]
-                })
-                .filter(|bounds| *bounds != [0; 4]);
-            glyph_bounds.push(bounds);
+            // treats an all-zero box as no box at all. This is the box the
+            // side bearings come from.
+            glyph_bounds.push(
+                charstring
+                    .bounds
+                    .map(|r| {
+                        [
+                            r.x0.ot_round(),
+                            r.y0.ot_round(),
+                            r.x1.ot_round(),
+                            r.y1.ot_round(),
+                        ]
+                    })
+                    .filter(|bounds| *bounds != [0; 4]),
+            );
+            glyph_outer_bounds.push(outer_bounds(&charstring));
             builder.add_glyph(GlyphData {
                 name: final_name,
                 advance_width: instance.width,
                 charstring: charstring.bytes,
-                bounds,
+                bounds: charstring.bounds,
             });
         }
 
@@ -314,6 +408,7 @@ impl Work<Context, AnyWorkId, Error> for CffWork {
         context.cff.set(CffOutput {
             table: cff.as_bytes().to_vec(),
             glyph_bounds,
+            glyph_outer_bounds,
         });
         Ok(())
     }
@@ -325,6 +420,56 @@ mod tests {
 
     fn floats(values: &[f64]) -> Vec<OrderedFloat<f64>> {
         values.iter().copied().map(OrderedFloat).collect()
+    }
+
+    /// Afrotype/tac: the parenthesised URL in the copyright loses its
+    /// brackets *and* both slashes, which is most of what the corpus hits.
+    #[test]
+    fn postscript_string_strips_bracketing_and_slashes() {
+        assert_eq!(
+            postscript_string(Some(
+                "Copyright 2024 The Tac One Project Authors \
+                 (https://github.com/Afrotype/tac)"
+                    .to_string()
+            )),
+            Some(
+                "Copyright 2024 The Tac One Project Authors \
+                 https:github.comAfrotypetac"
+                    .to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn postscript_string_replaces_copyright_sign_before_normalizing() {
+        // the © must become "Copyright", not the "?" it would decompose to
+        assert_eq!(
+            postscript_string(Some("\u{00a9} 2024 Someone".to_string())),
+            Some("Copyright 2024 Someone".to_string())
+        );
+        assert_eq!(postscript_string(None), Some(String::new()));
+    }
+
+    #[test]
+    fn postscript_string_decomposes_to_ascii() {
+        // an all-ASCII decomposition is substituted whole
+        assert_eq!(normalize_string_for_postscript("\u{2122}\u{fb01}"), "TMfi");
+        // otherwise it is ASCII-encoded with one '?' per stranded character,
+        // so an accented letter keeps its base letter *and* gains a '?'
+        assert_eq!(normalize_string_for_postscript("caf\u{e9}"), "cafe?");
+        assert_eq!(normalize_string_for_postscript("na\u{ef}ve"), "nai?ve");
+        // no decomposition at all: one '?' for the character itself
+        assert_eq!(normalize_string_for_postscript("\u{65e5}\u{672c}"), "??");
+        // curly quotes and dashes are common in copyright strings
+        assert_eq!(
+            normalize_string_for_postscript("\u{2014}it\u{2019}s"),
+            "?it?s"
+        );
+        // NBSP decomposes to a plain space, and spaces survive
+        assert_eq!(normalize_string_for_postscript("a\u{a0}b c"), "a b c");
+        // a decomposition may reintroduce exception characters; they stay,
+        // because ufo2ft only filters the original character
+        assert_eq!(normalize_string_for_postscript("\u{2474}"), "(1)");
     }
 
     #[test]

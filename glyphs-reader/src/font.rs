@@ -1412,6 +1412,24 @@ pub struct AxisMapping {
 struct RawMetric {
     // So named to let FromPlist populate it from a field called "type"
     type_: String,
+    /// Set instead of `type_` for a metric the designer added, which Glyphs
+    /// identifies by name alone (e.g. "DA descender 1").
+    name: String,
+}
+
+impl RawMetric {
+    /// What to key this metric by: its type if it has one, else its name.
+    ///
+    /// A designer-defined metric has no type, so keying on the type alone
+    /// collapses every one of them onto the empty string and loses all but
+    /// the first one's alignment zone.
+    fn key(&self) -> String {
+        if self.type_.is_empty() {
+            self.name.clone()
+        } else {
+            self.type_.clone()
+        }
+    }
 }
 
 #[derive(Default, Clone, Debug, PartialEq, Eq, Hash, FromPlist)]
@@ -1814,6 +1832,8 @@ pub struct FontMaster {
     pub name: String,
     pub axes_values: Vec<OrderedFloat<f64>>,
     metric_values: BTreeMap<String, MetricValue>,
+    /// This master's alignment zones as (position, size), sorted.
+    alignment_zones: Vec<(OrderedFloat<f64>, OrderedFloat<f64>)>,
     pub number_values: BTreeMap<SmolStr, OrderedFloat<f64>>,
     pub custom_parameters: CustomParameters,
     pub user_data: BTreeMap<SmolStr, Plist>,
@@ -1853,17 +1873,16 @@ impl FontMaster {
 
     /// The master's alignment zones, as (position, size) pairs.
     ///
-    /// Like glyphsLib's `GSFontMaster.alignmentZones` when no explicit zones
-    /// exist: one zone per metric with a nonzero overshoot, skipping the
-    /// italic angle. (Glyphs 2 zones were already folded into metric
-    /// overshoots at parse time.) Order is not meaningful; callers that care
-    /// (blue values) sort by (position, size) as glyphsLib does.
-    pub fn alignment_zones(&self) -> Vec<(OrderedFloat<f64>, OrderedFloat<f64>)> {
-        self.metric_values
-            .iter()
-            .filter(|(name, value)| name.as_str() != "italic angle" && value.over != 0.0)
-            .map(|(_, value)| (value.pos, value.over))
-            .collect()
+    /// Mirrors glyphsLib's `GSFontMaster.alignmentZones`: zones the source
+    /// stated outright (Glyphs 2) are returned untouched — duplicates,
+    /// zero-height zones and all, because blue values are built from exactly
+    /// this list. Otherwise (Glyphs 3) they are derived from the metrics: one
+    /// zone per metric with a nonzero overshoot, skipping the italic angle.
+    ///
+    /// Order is not meaningful; callers that care (blue values) sort by
+    /// (position, size) as glyphsLib does.
+    pub fn alignment_zones(&self) -> &[(OrderedFloat<f64>, OrderedFloat<f64>)] {
+        &self.alignment_zones
     }
 }
 
@@ -2457,6 +2476,7 @@ impl RawFont {
             .iter()
             .map(|n| RawMetric {
                 type_: n.to_string(),
+                ..Default::default()
             })
             .collect();
 
@@ -2485,6 +2505,7 @@ impl RawFont {
             .filter(|(_, used)| *used)
             .map(|(name, _)| RawMetric {
                 type_: name.to_string(),
+                ..Default::default()
             })
             .collect();
 
@@ -2533,6 +2554,10 @@ impl RawFont {
                     {
                         metric_values[idx].over = Some(over);
                     }
+                    // A master that never states a baseline has no metric to
+                    // hang this on, and the zone is lost here — but only from
+                    // the metrics. The blue values read
+                    // `explicit_alignment_zones`, which keeps every zone.
                     continue;
                 }
 
@@ -2559,6 +2584,7 @@ impl RawFont {
                 let idx = self.metrics.len();
                 self.metrics.push(RawMetric {
                     type_: format!("zone {next_zone}"),
+                    ..Default::default()
                 });
                 new_metrics.insert(pos, idx);
             }
@@ -3808,9 +3834,17 @@ impl TryFrom<RawFont> for Font {
 
         let metric_names: BTreeMap<usize, String> = from
             .metrics
-            .into_iter()
+            .iter()
             .enumerate()
-            .map(|(idx, metric)| (idx, metric.type_))
+            .map(|(idx, metric)| (idx, metric.key()))
+            .collect();
+        // Alignment zones are read off the metrics *by position*, so unlike
+        // `metric_names` this keeps every entry — several metrics can share a
+        // name (or have none at all) and each still owns a zone.
+        let metric_is_italic_angle: Vec<bool> = from
+            .metrics
+            .iter()
+            .map(|metric| metric.type_ == "italic angle")
             .collect();
 
         let master_ids_to_names: IndexMap<_, _> = from
@@ -3844,24 +3878,64 @@ impl TryFrom<RawFont> for Font {
                         }
                         (h, v)
                     };
+                // glyphsLib's `GSFontMaster.alignmentZones` walks the font's
+                // metrics by index, skipping the italic angle and any metric
+                // with no overshoot; it never keys them by name, so metrics
+                // that share one (BadeenDisplay has three unnamed ones) each
+                // keep their zone.
+                let derived_zones: Vec<_> = m
+                    .metric_values
+                    .iter()
+                    .enumerate()
+                    .filter(|(idx, value)| {
+                        !metric_is_italic_angle.get(*idx).copied().unwrap_or(false)
+                            && value.over.is_some_and(|over| over != 0.0)
+                    })
+                    .map(|(_, value)| (value.pos.unwrap_or_default(), value.over.unwrap()))
+                    .collect();
+                let metric_values: BTreeMap<String, MetricValue> = m
+                    .metric_values
+                    .into_iter()
+                    .enumerate()
+                    .filter_map(|(idx, value)| {
+                        metric_names.get(&idx).map(|name| (name.clone(), value))
+                    })
+                    .fold(BTreeMap::new(), |mut acc, (name, value)| {
+                        // only insert a metric if one with the same name hasn't been added
+                        // yet; matches glyphsLib's behavior where the first duplicate wins
+                        // https://github.com/googlefonts/fontc/issues/1269
+                        acc.entry(name).or_insert(value.into());
+                        acc
+                    });
+                // Glyphs 2 states its zones outright and blue values are built
+                // from exactly that list, duplicates and zero-height zones
+                // included; folding them into metric overshoots (which is all
+                // `metric_values` can hold) loses both. Glyphs 3 has no such
+                // list, so there the zones *are* the metric overshoots.
+                let alignment_zones = if !m.alignment_zones.is_empty() {
+                    m.alignment_zones
+                        .iter()
+                        .filter_map(|zone| {
+                            parse_alignment_zone(zone).or_else(|| {
+                                warn!("Confusing alignment zone '{zone}', skipping");
+                                None
+                            })
+                        })
+                        .collect()
+                } else {
+                    derived_zones
+                };
+                // stored sorted so that a Glyphs 2 source and the Glyphs 3
+                // version of the same font agree; every consumer sorts anyway
+                let mut alignment_zones: Vec<_> = alignment_zones;
+                alignment_zones.sort();
+
                 Ok(FontMaster {
                     id: m.id,
                     name: m.name.unwrap_or_default(),
                     axes_values: m.axes_values,
-                    metric_values: m
-                        .metric_values
-                        .into_iter()
-                        .enumerate()
-                        .filter_map(|(idx, value)| {
-                            metric_names.get(&idx).map(|name| (name.clone(), value))
-                        })
-                        .fold(BTreeMap::new(), |mut acc, (name, value)| {
-                            // only insert a metric if one with the same name hasn't been added
-                            // yet; matches glyphsLib's behavior where the first duplicate wins
-                            // https://github.com/googlefonts/fontc/issues/1269
-                            acc.entry(name).or_insert(value.into());
-                            acc
-                        }),
+                    metric_values,
+                    alignment_zones,
                     number_values: from
                         .numbers
                         .iter()
@@ -5491,6 +5565,122 @@ etc;
         let master = font.default_master();
         assert_eq!(master.get_metric("zone 1"), Some((1000., 20.)));
         assert_eq!(master.get_metric("zone 2"), Some((-100., -15.)));
+    }
+
+    /// glyphsLib reads a Glyphs 3 master's zones off the font metrics *by
+    /// index*, so metrics that share a type (an `x-height` with a `filter` and
+    /// one without) or have no name at all still own a zone each. Keying them
+    /// by name instead cost BadeenDisplay three of its eleven blue zones.
+    #[test]
+    fn v3_metrics_sharing_a_name_each_keep_a_zone() {
+        let font = Font::load(&glyphs3_dir().join("DuplicateMetrics.glyphs")).unwrap();
+        let master = font.default_master();
+
+        assert_eq!(
+            master
+                .alignment_zones()
+                .iter()
+                .map(|(pos, size)| (pos.into_inner(), size.into_inner()))
+                .collect::<Vec<_>>(),
+            vec![
+                // the baseline zone is (position 0, size -20)
+                (0., -20.),
+                (300., 20.),
+                (300., 20.),
+                (600., 20.),
+                (600., 20.),
+                (700., 20.),
+                (800., 20.),
+            ]
+        );
+        // the name-keyed lookups still take the first of a repeated metric
+        assert_eq!(master.get_metric("x-height"), Some((300., 20.)));
+    }
+
+    /// Blue values are built from the zone list verbatim, so a Glyphs 2
+    /// source's duplicate and zero-height zones have to survive parsing.
+    /// Folding them into metric overshoots loses both — NotoSerifOttomanSiyaq
+    /// states `{0,-20}` three times and fontmake writes all three, and
+    /// Homenaje's `{-160, 0}` becomes the `[-160,-160]` pair.
+    #[test]
+    fn v2_keeps_duplicate_and_zero_height_zones() {
+        let font = Font::load(&glyphs2_dir().join("alignment_zones_v2_odd.glyphs")).unwrap();
+        assert_eq!(
+            font.default_master()
+                .alignment_zones()
+                .iter()
+                .map(|(pos, size)| (pos.into_inner(), size.into_inner()))
+                .collect::<Vec<_>>(),
+            vec![
+                (-634., -15.),
+                (-160., 0.),
+                (0., -20.),
+                (0., -20.),
+                (0., -20.),
+                (1069., 15.),
+            ]
+        );
+    }
+
+    /// A Glyphs 2 master only writes `baseline` when it isn't zero, so the
+    /// baseline metric gets filtered out as unused — and the `{0, -15}` zone
+    /// that wanted to attach to it used to be dropped on the floor, costing
+    /// NotoSansInscriptionalPahlavi (and much of the Noto corpus) its
+    /// `[-15, 0]` blue values. glyphsLib reads a Glyphs 2 master's zones
+    /// verbatim and loses none of them.
+    #[test]
+    fn v2_zone_at_zero_survives_an_implicit_baseline() {
+        let font =
+            Font::load(&glyphs2_dir().join("alignment_zones_v2_implicit_baseline.glyphs")).unwrap();
+        let master = font.default_master();
+
+        assert_eq!(
+            master
+                .alignment_zones()
+                .iter()
+                .copied()
+                .map(|(pos, size)| (pos.into_inner(), size.into_inner()))
+                .collect::<Vec<_>>(),
+            vec![
+                (-352., -15.),
+                (0., -15.),
+                (536., 15.),
+                (760., 15.),
+                (1069., 15.),
+            ]
+        );
+    }
+
+    /// A Glyphs 3 metric the designer added has a name and no type. Keying
+    /// metrics on the type alone put every one of them under the empty string,
+    /// so all but the first were dropped along with their alignment zones —
+    /// which is how NotoSerifDivesAkuru lost four of its ten blue zones.
+    #[test]
+    fn v3_custom_named_metrics_are_distinct() {
+        let font = Font::load(&glyphs3_dir().join("PsHints.glyphs")).unwrap();
+        let master = font.default_master();
+
+        assert_eq!(master.get_metric("custom high"), Some((620., 14.)));
+        assert_eq!(master.get_metric("custom low"), Some((-300., -20.)));
+        // the typed metrics still key on their type
+        assert_eq!(master.get_metric("ascender"), Some((800., 16.)));
+
+        assert_eq!(
+            master
+                .alignment_zones()
+                .iter()
+                .copied()
+                .map(|(pos, size)| (pos.into_inner(), size.into_inner()))
+                .collect::<Vec<_>>(),
+            vec![
+                (-300., -20.),
+                (-200., -17.),
+                (0., -18.),
+                (500., 12.),
+                (620., 14.),
+                (800., 16.),
+            ]
+        );
     }
 
     // If the source explicitly sets a category we don't recognize, we keep it unset

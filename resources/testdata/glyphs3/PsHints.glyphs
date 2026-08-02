@@ -18,6 +18,12 @@ value = (
 );
 }
 );
+properties = (
+{
+key = postscriptFullName;
+value = "PsHints-Regular";
+}
+);
 metrics = (
 {
 type = ascender;
@@ -30,6 +36,12 @@ type = descender;
 },
 {
 type = "x-height";
+},
+{
+name = "custom high";
+},
+{
+name = "custom low";
 }
 );
 stems = (
@@ -63,6 +75,14 @@ pos = -200;
 {
 over = 12;
 pos = 500;
+},
+{
+over = 14;
+pos = 620;
+},
+{
+over = -20;
+pos = -300;
 }
 );
 stemValues = (

@@ -1297,6 +1297,7 @@ impl Work<Context, WorkId, Error> for StaticMetadataWork {
             stem_snap_v: float_list(&font_info_at_default.postscript_stem_snap_v),
             force_bold: font_info_at_default.postscript_force_bold,
             weight_name: font_info_at_default.postscript_weight_name.clone(),
+            full_name: font_info_at_default.postscript_full_name.clone(),
             default_width_x: font_info_at_default
                 .postscript_default_width_x
                 .map(OrderedFloat),

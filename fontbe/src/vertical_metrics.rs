@@ -90,22 +90,35 @@ impl Work<Context, AnyWorkId, Error> for VerticalMetricsWork {
             let advance = instance.height(&default_metrics);
             let vertical_origin = instance.vertical_origin(&default_metrics);
 
-            let bbox = match &cff {
-                Some(cff) => cff
-                    .glyph_bounds
+            let glyf_bbox = || {
+                context
+                    .glyphs
+                    .get(&WorkId::GlyfFragment(gn.clone()).into())
+                    .data
+                    .bbox()
+            };
+            let cff_bbox = |bounds: &[Option<[i32; 4]>]| {
+                bounds
                     .get(gid.to_u16() as usize)
                     .copied()
                     .flatten()
                     .map(|bounds| bbox_from_cff(gn, bounds))
-                    .transpose()?,
-                None => context
-                    .glyphs
-                    .get(&WorkId::GlyfFragment(gn.clone()).into())
-                    .data
-                    .bbox(),
+                    .transpose()
+            };
+            let bbox = match &cff {
+                Some(cff) => cff_bbox(&cff.glyph_bounds)?,
+                None => glyf_bbox(),
+            };
+            // like hhea: the side bearing comes from the rounded box, but the
+            // height it spans comes from the outer one, because fontTools
+            // recalculates vhea from the charstrings with `ceil(yMax)` and
+            // `floor(yMin)`
+            let outer_bbox = match &cff {
+                Some(cff) => cff_bbox(&cff.glyph_outer_bounds)?,
+                None => bbox,
             };
             let side_bearing = vertical_origin - bbox.map(|bbox| bbox.y_max).unwrap_or_default();
-            let bounds_advance = bbox.map(|bbox| bbox.y_max as i32 - bbox.y_min as i32);
+            let bounds_advance = outer_bbox.map(|bbox| bbox.y_max as i32 - bbox.y_min as i32);
 
             builder.update(advance, side_bearing, bounds_advance);
         }

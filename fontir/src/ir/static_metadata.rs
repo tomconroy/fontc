@@ -262,6 +262,13 @@ pub struct PostscriptSettings {
     pub force_bold: Option<bool>,
     /// Becomes the CFF TopDict `Weight`; not necessarily a wght axis name.
     pub weight_name: Option<String>,
+    /// Becomes the CFF TopDict `FullName`.
+    ///
+    /// This is the source's `postscriptFullName`, which is neither the name
+    /// table's full font name (id 4) nor its PostScript name (id 6), and which
+    /// nothing but the CFF reads. When it is unset the CFF work falls back the
+    /// way ufo2ft does.
+    pub full_name: Option<String>,
     /// If set, overrides the computed CFF `defaultWidthX`.
     pub default_width_x: Option<OrderedFloat<f64>>,
     /// If set, overrides the computed CFF `nominalWidthX`.

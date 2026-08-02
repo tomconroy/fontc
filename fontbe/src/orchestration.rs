@@ -384,9 +384,15 @@ impl Persistable for Glyph {
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub struct CffOutput {
     pub table: Vec<u8>,
-    /// `[x_min, y_min, x_max, y_max]` per glyph, in glyph order; `None` for
-    /// glyphs with no outline
+    /// `[x_min, y_min, x_max, y_max]` per glyph, in glyph order, each side
+    /// rounded like ufo2ft's `glyphBoundingBoxes`; `None` for glyphs with no
+    /// outline, or whose box rounds to all zeros. Side bearings come from
+    /// here.
     pub glyph_bounds: Vec<Option<[i32; 4]>>,
+    /// The same boxes grown *outward* to integers, which is how fontTools
+    /// recalculates head/hhea/vhea for a CFF font; `None` only for glyphs
+    /// that draw nothing. See [`crate::cff::outer_bounds`].
+    pub glyph_outer_bounds: Vec<Option<[i32; 4]>>,
 }
 
 impl Persistable for CffOutput {
