@@ -109,20 +109,21 @@ fn to_ir_path(
         }
         path_builder.move_to((first.pt.x, first.pt.y))?;
         add_to_path(&mut path_builder, src_path.nodes[1..].iter())?;
-    } else if src_path.nodes.iter().any(|node| node.is_on_curve()) {
+    } else {
         // In Glyphs.app, the starting node of a closed contour is always
         // stored at the end of the nodes list.
         // Rotate right by 1 by way of chaining iterators
+        //
+        // glyphsLib rotates every closed contour, including one made only of
+        // off-curve points (the implied-quadratic case, rare but real). That
+        // rotation is not a no-op there: with no on-curve point to start from,
+        // the contour starts at the midpoint of the last and first off-curves,
+        // so which node sits first decides where it begins.
         let last_idx = src_path.nodes.len() - 1;
         add_to_path(
             &mut path_builder,
             std::iter::once(&src_path.nodes[last_idx]).chain(&src_path.nodes[..last_idx]),
         )?;
-    } else {
-        // except if the contour contains only off-curve points (implied quadratic)
-        // in which case we're already in the correct order (this is very rare
-        // in glyphs sources and might be the result of bugs, but it exists)
-        add_to_path(&mut path_builder, src_path.nodes.iter())?;
     };
 
     if erase_open_corners && path_builder.erase_open_corners()? {
@@ -777,8 +778,15 @@ mod tests {
         assert_eq!("M32,32 C64,64 64,0 32,32 Z", bez.to_svg());
     }
 
-    // in a curve with only offcurves, the 'start' of the curve is the last implied
-    // on-curve (the interpolation of the first and last points)
+    /// A closed contour of nothing but off-curve points starts at the midpoint
+    /// of the last and first off-curves — *after* glyphsLib's rotation, which
+    /// moves the source's last node to the front. fontc used to skip that
+    /// rotation here on the grounds that the order was "already correct",
+    /// which started the contour a quarter turn away (at (5,0) for these
+    /// nodes) and cost MaShanZheng 60 charstrings.
+    ///
+    /// (0,5) is what fontmake produces for exactly these four nodes, in both
+    /// otf and ttf.
     #[test]
     fn no_on_curve_path_order() {
         let nodes = [(10., 0.), (10., 10.), (0., 10.), (0., 0.)]
@@ -797,7 +805,7 @@ mod tests {
         let bez = to_ir_path("hello".into(), &path, false).unwrap();
         assert_eq!(
             bez.elements().first(),
-            Some(&kurbo::PathEl::MoveTo((5., 0.).into()))
+            Some(&kurbo::PathEl::MoveTo((0., 5.).into()))
         );
     }
 
