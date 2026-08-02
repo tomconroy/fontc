@@ -45,7 +45,8 @@ pub use path_builder::GlyphPathBuilder;
 pub use static_metadata::{
     AxisMapping, AxisValueLabel, Condition, ConditionSet, FilterScope, GdefCategories,
     MetaTableValues, MiscMetadata, NameKey, NamedInstance, Panose, PostscriptNames,
-    PreliminaryGdefCategories, Rule, StatAxis, StaticMetadata, Substitution, VariableFeature,
+    PostscriptSettings, PreliminaryGdefCategories, Rule, StatAxis, StaticMetadata, Substitution,
+    VariableFeature,
 };
 
 pub const DEFAULT_VENDOR_ID: &str = "NONE";
