@@ -32,6 +32,9 @@ dependencies = [
     "lxml",
     "cdifflib",
     "glyphsLib",
+    # instance mode converts .glyphs sources the way fontmake does, which means
+    # naming the ufo module explicitly
+    "ufoLib2",
     "gftools>=0.9.74",
     "pyyaml",
 ]

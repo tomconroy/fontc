@@ -49,6 +49,10 @@ struct RunSummary {
     input_file_sha: String,
     #[serde(default)]
     flavor: Flavor,
+    /// which instance was built from each variable source, if any; `None` is a
+    /// plain variable build, and is what every run before instance mode was
+    #[serde(default)]
+    instance: Option<String>,
     stats: super::ttx_diff_runner::Summary,
 }
 
@@ -137,13 +141,14 @@ fn run_crater_and_save_results(args: &CiArgs) -> Result<(), Error> {
         log::info!("no external configs, skipping google/fonts update");
     }
     log::info!("using cache dir {}", cache_dir.display());
-    let results_cache = ResultsCache::in_dir(&cache_dir, args.flavor);
+    let results_cache = ResultsCache::in_dir(&cache_dir, args.flavor, args.instance.as_deref());
 
     if let Some(last_run) = prev_runs.last() {
         if last_run.fontc_rev == fontc_rev
             && input_file_sha == last_run.input_file_sha
             && pip_freeze_sha == last_run.pip_freeze_sha
             && last_run.flavor == args.flavor
+            && last_run.instance == args.instance
         {
             log::info!("no changes since last run, skipping");
             return Ok(());
@@ -171,9 +176,14 @@ fn run_crater_and_save_results(args: &CiArgs) -> Result<(), Error> {
         failures,
     } = make_targets(&cache_dir, &inputs.sources);
 
-    if !args.gftools || args.flavor == Flavor::Otf {
+    // gftools decides its own build type and output set from the config file,
+    // so neither a CFF build nor an instanced build can be expressed through it
+    if !args.gftools || args.flavor == Flavor::Otf || args.instance.is_some() {
         if args.gftools && args.flavor == Flavor::Otf {
             log::info!("--flavor otf only runs default builds, ignoring gftools targets");
+        }
+        if args.gftools && args.instance.is_some() {
+            log::info!("--instance only runs default builds, ignoring gftools targets");
         }
         targets.retain(|t| t.build == BuildType::Default);
     }
@@ -186,6 +196,7 @@ fn run_crater_and_save_results(args: &CiArgs) -> Result<(), Error> {
         source_cache: cache_dir,
         results_cache,
         flavor: args.flavor,
+        instance: args.instance.clone(),
     };
 
     let began = Utc::now();
@@ -216,6 +227,7 @@ fn run_crater_and_save_results(args: &CiArgs) -> Result<(), Error> {
         results_file,
         input_file_sha,
         flavor: args.flavor,
+        instance: args.instance.clone(),
         stats: summary,
     };
 
