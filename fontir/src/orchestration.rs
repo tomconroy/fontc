@@ -2,7 +2,7 @@
 
 use std::{collections::HashMap, fmt::Debug, hash::Hash, sync::Arc};
 
-use crate::{error::Error, ir};
+use crate::{error::Error, instance::InstanceSpec, ir};
 use bitflags::bitflags;
 use fontdrasil::{
     coords::NormalizedLocation,
@@ -291,6 +291,15 @@ type FeContextMap<T> = ContextMap<WorkId, T>;
 pub struct Context {
     pub flags: Flags,
 
+    /// The single instance to compile, if the caller asked for one.
+    ///
+    /// Rides here, beside [`Self::flags`], because the pin has two
+    /// consumers that share no other channel: the orchestrator, which rewrites
+    /// this context's IR at a barrier, and (eventually) the global-metrics work,
+    /// which can interpolate its unrounded master values only while it still
+    /// has them.
+    pub instance: Option<InstanceSpec>,
+
     // work results we've completed
     // We create individual caches so we can return typed results from get fns
     pub static_metadata: FeContextItem<ir::StaticMetadata>,
@@ -318,6 +327,7 @@ impl Context {
         let acl = Arc::from(acl);
         Context {
             flags: self.flags,
+            instance: self.instance.clone(),
             static_metadata: self.static_metadata.clone_with_acl(acl.clone()),
             preliminary_glyph_order: self.preliminary_glyph_order.clone_with_acl(acl.clone()),
             glyph_order: self.glyph_order.clone_with_acl(acl.clone()),
@@ -337,9 +347,15 @@ impl Context {
     }
 
     pub fn new_root(flags: Flags) -> Context {
+        Self::new_root_for_instance(flags, None)
+    }
+
+    /// As [`Self::new_root`], compiling the single `instance` if there is one.
+    pub fn new_root_for_instance(flags: Flags, instance: Option<InstanceSpec>) -> Context {
         let acl = Arc::from(AccessControlList::read_only());
         Context {
             flags,
+            instance,
             static_metadata: ContextItem::new(WorkId::StaticMetadata, acl.clone()),
             preliminary_glyph_order: ContextItem::new(WorkId::PreliminaryGlyphOrder, acl.clone()),
             glyph_order: ContextItem::new(WorkId::GlyphOrder, acl.clone()),
