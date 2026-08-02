@@ -653,7 +653,21 @@ impl Work<Context, WorkId, Error> for StaticMetadataWork {
             });
         }
 
-        static_metadata.misc.postscript = postscript_settings(font, default_master);
+        // Every master's PostScript hinting data, keyed by location. Only CFF
+        // reads it today, and only the default master's, but CFF2 and IR-level
+        // instancing both want the rest.
+        static_metadata.postscript = font
+            .masters
+            .iter()
+            .map(|master| {
+                let location = font_info
+                    .locations
+                    .get(&master.axes_values)
+                    .cloned()
+                    .unwrap();
+                (location, postscript_settings(font, master))
+            })
+            .collect();
 
         if let Some(gasp) = &font.custom_parameters.gasp_table {
             for (max_ppem, behavior) in gasp.iter() {
@@ -2441,7 +2455,8 @@ mod tests {
     #[test]
     fn v2_alignment_zones_to_blue_values() {
         let (_, context) = build_static_metadata(glyphs2_dir().join("alignment_zones_v2.glyphs"));
-        let postscript = &context.static_metadata.get().misc.postscript;
+        let static_metadata = context.static_metadata.get();
+        let postscript = static_metadata.postscript_default();
         // zones sorted by position; the baseline zone (0, -16) is a blue
         // zone despite its negative size, like glyphsLib's to_ufo_blue_values
         assert_eq!(
@@ -2462,7 +2477,8 @@ mod tests {
     #[test]
     fn v3_postscript_hints() {
         let (_, context) = build_static_metadata(glyphs3_dir().join("PsHints.glyphs"));
-        let postscript = &context.static_metadata.get().misc.postscript;
+        let static_metadata = context.static_metadata.get();
+        let postscript = static_metadata.postscript_default();
         // "custom high" and "custom low" are metrics the designer named rather
         // than typed; each still has to contribute its own zone
         assert_eq!(
@@ -2486,6 +2502,33 @@ mod tests {
         // postscriptFullName is a property, not a name table entry: ufo2ft
         // reads it only when it builds the CFF Top DICT
         assert_eq!(postscript.full_name.as_deref(), Some("PsHints-Regular"));
+    }
+
+    #[test]
+    fn postscript_hints_for_every_master() {
+        let (_, context) = build_static_metadata(glyphs3_dir().join("WghtVar.glyphs"));
+        let static_metadata = context.static_metadata.get();
+        let regular = NormalizedLocation::for_pos(&[("wght", 0.0)]);
+        let bold = NormalizedLocation::for_pos(&[("wght", 1.0)]);
+
+        // one entry per master, not just the default
+        assert_eq!(
+            static_metadata.postscript.keys().collect::<HashSet<_>>(),
+            HashSet::from([&regular, &bold])
+        );
+        // Regular states overshoots, so it has zones ...
+        assert_eq!(
+            static_metadata.postscript_at(&regular).blue_values,
+            [-16.0, 0.0, 737.0, 753.0].map(OrderedFloat)
+        );
+        assert_eq!(
+            static_metadata.postscript_at(&regular).other_blues,
+            [-58.0, -42.0].map(OrderedFloat)
+        );
+        // ... Bold states none, so it has none: masters routinely disagree on
+        // zone *count*, which is why they can't share one list
+        assert!(static_metadata.postscript_at(&bold).blue_values.is_empty());
+        assert!(static_metadata.postscript_at(&bold).other_blues.is_empty());
     }
 
     #[test]

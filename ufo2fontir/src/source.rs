@@ -912,6 +912,32 @@ fn font_infos<'a>(
     Ok(results)
 }
 
+/// The `postscript*` fontinfo keys of one master, mostly CFF hinting data.
+fn postscript_settings(font_info: &norad::FontInfo) -> PostscriptSettings {
+    fn float_list(values: &Option<Vec<f64>>) -> Vec<OrderedFloat<f64>> {
+        values
+            .as_ref()
+            .map(|values| values.iter().copied().map(OrderedFloat).collect())
+            .unwrap_or_default()
+    }
+    PostscriptSettings {
+        blue_values: float_list(&font_info.postscript_blue_values),
+        other_blues: float_list(&font_info.postscript_other_blues),
+        family_blues: float_list(&font_info.postscript_family_blues),
+        family_other_blues: float_list(&font_info.postscript_family_other_blues),
+        blue_scale: font_info.postscript_blue_scale.map(OrderedFloat),
+        blue_shift: font_info.postscript_blue_shift.map(OrderedFloat),
+        blue_fuzz: font_info.postscript_blue_fuzz.map(OrderedFloat),
+        stem_snap_h: float_list(&font_info.postscript_stem_snap_h),
+        stem_snap_v: float_list(&font_info.postscript_stem_snap_v),
+        force_bold: font_info.postscript_force_bold,
+        weight_name: font_info.postscript_weight_name.clone(),
+        full_name: font_info.postscript_full_name.clone(),
+        default_width_x: font_info.postscript_default_width_x.map(OrderedFloat),
+        nominal_width_x: font_info.postscript_nominal_width_x.map(OrderedFloat),
+    }
+}
+
 fn names(font_info: &norad::FontInfo) -> HashMap<NameKey, String> {
     let mut builder = NameBuilder::default();
 
@@ -1078,15 +1104,30 @@ impl Work<Context, WorkId, Error> for StaticMetadataWork {
             })
             .collect();
 
-        let global_locations = master_locations(
+        let master_locations = master_locations(
             &axes,
             self.designspace
                 .sources
                 .iter()
                 .filter(|s| !is_glyph_only(s)),
-        )
-        .into_values()
-        .collect();
+        );
+        let global_locations = master_locations.values().cloned().collect();
+
+        // Every master's PostScript hinting data, keyed by location. Only CFF
+        // reads it today, and only the default master's, but CFF2 and IR-level
+        // instancing both want the rest. Glyph-only sources contribute no
+        // fontinfo, matching ufo2ft's `collect_info_masters`.
+        let postscript: HashMap<NormalizedLocation, PostscriptSettings> = self
+            .designspace
+            .sources
+            .iter()
+            .filter(|s| !is_glyph_only(s))
+            .filter_map(|source| {
+                let loc = master_locations.get(source.name.as_ref()?)?;
+                let font_info = font_infos.get(&source.filename)?;
+                Some((loc.clone(), postscript_settings(font_info)))
+            })
+            .collect();
 
         let lib_plist =
             match load_plist(&designspace_dir.join(&default_master.filename), "lib.plist") {
@@ -1278,33 +1319,7 @@ impl Work<Context, WorkId, Error> for StaticMetadataWork {
                 .collect();
         }
         static_metadata.variations = variations;
-
-        let float_list = |values: &Option<Vec<f64>>| -> Vec<OrderedFloat<f64>> {
-            values
-                .as_ref()
-                .map(|values| values.iter().copied().map(OrderedFloat).collect())
-                .unwrap_or_default()
-        };
-        static_metadata.misc.postscript = PostscriptSettings {
-            blue_values: float_list(&font_info_at_default.postscript_blue_values),
-            other_blues: float_list(&font_info_at_default.postscript_other_blues),
-            family_blues: float_list(&font_info_at_default.postscript_family_blues),
-            family_other_blues: float_list(&font_info_at_default.postscript_family_other_blues),
-            blue_scale: font_info_at_default.postscript_blue_scale.map(OrderedFloat),
-            blue_shift: font_info_at_default.postscript_blue_shift.map(OrderedFloat),
-            blue_fuzz: font_info_at_default.postscript_blue_fuzz.map(OrderedFloat),
-            stem_snap_h: float_list(&font_info_at_default.postscript_stem_snap_h),
-            stem_snap_v: float_list(&font_info_at_default.postscript_stem_snap_v),
-            force_bold: font_info_at_default.postscript_force_bold,
-            weight_name: font_info_at_default.postscript_weight_name.clone(),
-            full_name: font_info_at_default.postscript_full_name.clone(),
-            default_width_x: font_info_at_default
-                .postscript_default_width_x
-                .map(OrderedFloat),
-            nominal_width_x: font_info_at_default
-                .postscript_nominal_width_x
-                .map(OrderedFloat),
-        };
+        static_metadata.postscript = postscript;
 
         context.preliminary_glyph_order.set(glyph_order);
         context.static_metadata.set(static_metadata);
@@ -3177,6 +3192,36 @@ mod tests {
                 GlyphName::from("manualcomponent")
             )])),
         );
+    }
+
+    #[test]
+    fn postscript_hints_for_every_master() {
+        let (_, context) = build_static_metadata(
+            "designspace_from_glyphs/WghtVar.designspace",
+            Flags::default(),
+        );
+        let static_metadata = context.static_metadata.get();
+        let regular = NormalizedLocation::for_pos(&[("wght", 0.0)]);
+        let bold = NormalizedLocation::for_pos(&[("wght", 1.0)]);
+
+        // one entry per master, not just the default
+        assert_eq!(
+            static_metadata.postscript.keys().collect::<HashSet<_>>(),
+            HashSet::from([&regular, &bold])
+        );
+        // Regular states blues, so it has them ...
+        assert_eq!(
+            static_metadata.postscript_at(&regular).blue_values,
+            [-16.0, 0.0, 737.0, 753.0].map(OrderedFloat)
+        );
+        assert_eq!(
+            static_metadata.postscript_at(&regular).other_blues,
+            [-58.0, -42.0].map(OrderedFloat)
+        );
+        // ... Bold states none, so it has none: masters routinely disagree on
+        // zone *count*, which is why they can't share one list
+        assert!(static_metadata.postscript_at(&bold).blue_values.is_empty());
+        assert!(static_metadata.postscript_at(&bold).other_blues.is_empty());
     }
 
     #[test]

@@ -1,6 +1,7 @@
 //! Global font metadata
 
 use std::{
+    borrow::Cow,
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     fmt::Debug,
     io::Read,
@@ -58,6 +59,14 @@ pub struct StaticMetadata {
     pub variation_model: VariationModel,
     /// Glyphsapp only; named numbers defined per-master
     pub number_values: HashMap<NormalizedLocation, BTreeMap<SmolStr, OrderedFloat<f64>>>,
+    /// PostScript-specific data per master, feeding the CFF table.
+    ///
+    /// Keyed like [`Self::number_values`]: one entry per master that defines
+    /// any, at that master's location. Read it with [`Self::postscript_at`] or
+    /// [`Self::postscript_default`] rather than indexing directly; sources that
+    /// have no PostScript data at all (fontra) leave the map empty.
+    #[serde(default)]
+    pub postscript: HashMap<NormalizedLocation, PostscriptSettings>,
     default_location: NormalizedLocation,
 
     /// See <https://learn.microsoft.com/en-us/typography/opentype/spec/name>.
@@ -230,10 +239,6 @@ pub struct MiscMetadata {
     /// `None` means the key was absent (use the built-in defaults); `Some` fully
     /// replaces the defaults (an empty list disables all automatic features).
     pub feature_generation: Option<Vec<FeatureWriterSpec>>,
-
-    /// PostScript-specific data at the default location, feeding the CFF table.
-    #[serde(default)]
-    pub postscript: PostscriptSettings,
 }
 
 /// The `postscript*` keys of UFO fontinfo, mostly CFF hinting data.
@@ -243,9 +248,10 @@ pub struct MiscMetadata {
 /// it generates.
 ///
 /// Arrays are empty when the source provides none. Values are kept unrounded;
-/// CFF compilation rounds them the same way ufo2ft does. All values are taken
-/// from the default master: hints for other masters would only matter to
-/// CFF2, which is not supported.
+/// CFF compilation rounds them the same way ufo2ft does. One of these is
+/// stored per master in [`StaticMetadata::postscript`]; CFF, which is
+/// single-master, reads the default master's via
+/// [`StaticMetadata::postscript_default`].
 ///
 /// See <https://unifiedfontobject.org/versions/ufo3/fontinfo.plist/#postscript-specific-data>
 #[derive(Serialize, Deserialize, Default, Debug, Clone, PartialEq, Eq)]
@@ -524,6 +530,7 @@ impl StaticMetadata {
             postscript_names,
             italic_angle: italic_angle.into(),
             number_values: glyphsapp_number_values.unwrap_or_default(),
+            postscript: Default::default(),
             build_vertical,
             misc: MiscMetadata {
                 fs_type: None, // default is, sigh, inconsistent across source formats
@@ -547,7 +554,6 @@ impl StaticMetadata {
                 us_width_class: None,
                 gasp: Vec::new(),
                 feature_generation: None,
-                postscript: Default::default(),
             },
             variations: None,
         })
@@ -556,6 +562,27 @@ impl StaticMetadata {
     /// The default on all variable axes.
     pub fn default_location(&self) -> &NormalizedLocation {
         &self.default_location
+    }
+
+    /// The PostScript settings of the master at `loc`.
+    ///
+    /// Falls back to the default master's settings when `loc` names no master
+    /// (or names one the source gave no PostScript data), and to
+    /// [`PostscriptSettings::default`] when the source has none at all.
+    pub fn postscript_at(&self, loc: &NormalizedLocation) -> Cow<'_, PostscriptSettings> {
+        self.postscript
+            .get(loc)
+            .or_else(|| self.postscript.get(&self.default_location))
+            .map(Cow::Borrowed)
+            .unwrap_or_default()
+    }
+
+    /// The PostScript settings of the default master.
+    ///
+    /// This is what a single-master table like CFF wants; a CFF2 writer would
+    /// walk [`Self::postscript`] in [`Self::variation_model`] order instead.
+    pub fn postscript_default(&self) -> Cow<'_, PostscriptSettings> {
+        self.postscript_at(self.default_location())
     }
 
     pub fn axis(&self, tag: &Tag) -> Option<&Axis> {
@@ -713,14 +740,30 @@ mod tests {
                     mode: FeatureWriterMode::Append,
                     features: None,
                 }]),
-                postscript: PostscriptSettings {
-                    blue_values: vec![(-10.0).into(), 0.0.into(), 700.0.into(), 710.0.into()],
-                    blue_scale: Some(0.05.into()),
-                    weight_name: Some("Chonky".to_string()),
-                    ..Default::default()
-                },
             },
             number_values: Default::default(),
+            // one entry per master, so the round-trip tests exercise a
+            // multi-entry map
+            postscript: HashMap::from([
+                (
+                    vec![(WGHT, NormalizedCoord::new(0.0))].into(),
+                    PostscriptSettings {
+                        blue_values: vec![(-10.0).into(), 0.0.into(), 700.0.into(), 710.0.into()],
+                        blue_scale: Some(0.05.into()),
+                        weight_name: Some("Chonky".to_string()),
+                        ..Default::default()
+                    },
+                ),
+                (
+                    vec![(WGHT, NormalizedCoord::new(1.0))].into(),
+                    PostscriptSettings {
+                        blue_values: vec![(-12.0).into(), 0.0.into(), 720.0.into(), 734.0.into()],
+                        stem_snap_v: vec![120.0.into()],
+                        weight_name: Some("Chonkier".to_string()),
+                        ..Default::default()
+                    },
+                ),
+            ]),
             variations: None,
             build_vertical: false,
         }
@@ -772,6 +815,52 @@ mod tests {
         assert_eq!(
             reverse_names.get("Fam").unwrap().iter().next().unwrap(),
             &NameId::FAMILY_NAME
+        );
+    }
+
+    #[test]
+    fn postscript_at_master_locations() {
+        let static_metadata = test_static_metadata();
+        let default = vec![(WGHT, NormalizedCoord::new(0.0))].into();
+        let bold = vec![(WGHT, NormalizedCoord::new(1.0))].into();
+
+        assert_eq!(
+            static_metadata
+                .postscript_at(&default)
+                .weight_name
+                .as_deref(),
+            Some("Chonky")
+        );
+        assert_eq!(
+            static_metadata.postscript_at(&bold).weight_name.as_deref(),
+            Some("Chonkier")
+        );
+        // the default master is what a single-master table gets
+        assert_eq!(
+            static_metadata.postscript_default().weight_name.as_deref(),
+            Some("Chonky")
+        );
+    }
+
+    #[test]
+    fn postscript_at_falls_back() {
+        let mut static_metadata = test_static_metadata();
+        let unknown: NormalizedLocation = vec![(WGHT, NormalizedCoord::new(-1.0))].into();
+
+        // a location with no entry of its own gets the default master's
+        assert_eq!(
+            static_metadata
+                .postscript_at(&unknown)
+                .weight_name
+                .as_deref(),
+            Some("Chonky")
+        );
+
+        // a source with no PostScript data at all (e.g. fontra) gets defaults
+        static_metadata.postscript.clear();
+        assert_eq!(
+            static_metadata.postscript_default().into_owned(),
+            PostscriptSettings::default()
         );
     }
 
