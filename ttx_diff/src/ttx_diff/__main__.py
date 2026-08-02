@@ -44,6 +44,23 @@ flags.DEFINE_enum(
     "and --compare default; fontmake is run with --optimize-cff 1 so that "
     "charstrings are specialized but not subroutinized, matching fontc.",
 )
+flags.DEFINE_string(
+    "instance",
+    default=None,
+    help="Build a single static instance from a variable source instead of a "
+    "variable font, and compare it against `fontmake -i <instance>`. Requires a "
+    "variable source and --compare default; a static source is skipped. The "
+    "value is either the policy '@default' (the named instance sitting at the "
+    "default location; a source without one is skipped) or a literal instance "
+    "name -- the DesignSpace instance 'name' attribute, e.g. 'Bona Nova Bold'. "
+    "Use --print_instances to see the choices.",
+)
+flags.DEFINE_bool(
+    "print_instances",
+    False,
+    "List the source's named instances (index, name, design and user location, "
+    "and which one --instance @default would pick) and exit.",
+)
 flags.DEFINE_enum(
     "rebuild",
     "both",
