@@ -624,6 +624,22 @@ pub fn pin_kerning<'a>(
         .iter()
         .map(|instance| (fit(&instance.location, &axis_order), *instance))
         .collect();
+
+    // ufo2ft's Variator.instance_at short-circuits when the pin IS a master:
+    // that master's kerning comes back verbatim (a deep copy), so neither the
+    // class-fallback resolution nor MathKerning.cleanup ever runs, and a pair
+    // a designer explicitly kerned to zero between two ungrouped glyphs
+    // survives. Measured on Bona Nova, whose Bold master states
+    // ('maqaf-hb', 'kafdagesh-hb') = 0: fontmake -i "Bona Nova Bold" keeps
+    // the zero PairPos rule, and every @default pin is an exact-master pin.
+    if let Some(instance) = by_location.get(&fit(pin, &axis_order)) {
+        return Ok(KerningInstance {
+            location: key.clone(),
+            kerns: instance.kerns.clone(),
+            groups,
+        });
+    }
+
     let model = VariationModel::new(by_location.keys().cloned().collect(), axis_order);
 
     // Only masters the pin actually reaches, in model order; a zero scalar
@@ -1550,6 +1566,53 @@ mod tests {
         assert_eq!(
             pinned.kerns.get(&kern_pair("A", "space")),
             Some(&OrderedFloat(-1.5))
+        );
+    }
+
+    /// A pin that lands on a master takes that master's kerning verbatim —
+    /// ufo2ft's `Variator.instance_at` short circuit — so an explicit zero
+    /// pair between two ungrouped glyphs survives there, while any other pin
+    /// runs the cascade and cleanup, which drops it. Measured on Bona Nova:
+    /// the Bold master states ('maqaf-hb', 'kafdagesh-hb') = 0 and
+    /// `fontmake -i "Bona Nova Bold"` emits the zero PairPos rule.
+    #[test]
+    fn pin_kerning_at_a_master_is_that_master_verbatim() {
+        let meta = test_static_metadata();
+        let groups = kern_groups(&[(KernGroup::Side1("A".into()), &["A"])]);
+        let instances = [
+            KerningInstance {
+                location: regular(),
+                kerns: kerns(&[(kern_pair("A", "V"), -20.0)]),
+                groups: groups.clone(),
+            },
+            KerningInstance {
+                location: bold(),
+                kerns: kerns(&[
+                    (kern_pair("A", "V"), -41.0),
+                    // explicitly zero, neither glyph in any group
+                    (kern_pair("maqaf-hb", "kafdagesh-hb"), 0.0),
+                ]),
+                groups: Default::default(),
+            },
+        ];
+
+        // at the Bold master: verbatim, zero pair kept, no resolution
+        let pinned = pin_kerning(&meta, instances.iter(), &bold()).unwrap();
+        assert_eq!(&pinned.location, meta.default_location());
+        assert_eq!(pinned.groups, groups);
+        assert_eq!(
+            pinned.kerns,
+            kerns(&[
+                (kern_pair("A", "V"), -41.0),
+                (kern_pair("maqaf-hb", "kafdagesh-hb"), 0.0),
+            ])
+        );
+
+        // off-master: the general path's cleanup drops the ungrouped zero
+        let pinned = pin_kerning(&meta, instances.iter(), &mid()).unwrap();
+        assert_eq!(
+            pinned.kerns.get(&kern_pair("maqaf-hb", "kafdagesh-hb")),
+            None
         );
     }
 
