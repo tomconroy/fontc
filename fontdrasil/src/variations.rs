@@ -1126,6 +1126,55 @@ mod tests {
         assert_eq!(vec![default_master_weight()], model.delta_weights);
     }
 
+    /// A model with no axes at all, as a pinned instance or a bare UFO has.
+    ///
+    /// Every coordinate is stripped, so *any* set of locations collapses to the
+    /// single empty one - silently, with no error. That is what we want when
+    /// pinning, but it does mean the model can never report that a pin left
+    /// several locations behind.
+    ///
+    /// ```text
+    /// `>>> models.VariationModel([{}]).locations`
+    /// `[{}]`
+    /// `>>> models.VariationModel([{'wght': 0}, {'wght': 1}], []).locations`
+    /// `[{}]`
+    /// ```
+    #[test]
+    fn delta_weights_for_static_family_no_axes() {
+        let model = VariationModel::new(HashSet::from([NormalizedLocation::new()]), Vec::new());
+        assert_eq!(vec![NormalizedLocation::new()], model.locations);
+        assert_eq!(vec![default_master_weight()], model.delta_weights);
+        assert!(model.axis_order().is_empty());
+        assert_eq!(NormalizedLocation::new(), model.default);
+
+        // a location with axis tags is still all-zero, so it is the default;
+        // and distinct locations dedupe rather than erroring
+        let model = VariationModel::new(
+            HashSet::from([
+                NormalizedLocation::for_pos(&[("wght", 0.0), ("wdth", 0.0)]),
+                NormalizedLocation::for_pos(&[("wght", 1.0), ("wdth", 0.0)]),
+            ]),
+            Vec::new(),
+        );
+        assert_eq!(vec![NormalizedLocation::new()], model.locations);
+        assert_eq!(vec![default_master_weight()], model.delta_weights);
+
+        // and it interpolates: one master, so deltas are absolute values
+        let deltas = model
+            .deltas(&HashMap::from([(
+                NormalizedLocation::for_pos(&[("wght", 0.0), ("wdth", 0.0)]),
+                vec![Point::new(1.0, 2.0)],
+            )]))
+            .unwrap();
+        assert_eq!(
+            vec![Vec2::new(1.0, 2.0)],
+            model.interpolate_from_deltas(
+                &NormalizedLocation::for_pos(&[("wght", 0.5), ("wdth", 0.0)]),
+                &deltas
+            )
+        );
+    }
+
     /// # two-master weight family
     ///
     /// ```text
