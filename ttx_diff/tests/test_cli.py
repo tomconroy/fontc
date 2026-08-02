@@ -1,5 +1,6 @@
 """Tests for the ttx-diff CLI."""
 
+import json
 import re
 import subprocess
 import sys
@@ -16,13 +17,20 @@ from ttx_diff.core import (
 
 
 def _write_designspace(
-    tmp_path, axes, sources, instances=None, name="test.designspace"
+    tmp_path,
+    axes,
+    sources,
+    instances=None,
+    name="test.designspace",
+    without=(),
 ):
     """Write a designspace.
 
     Each axis is (tag, name, min, default, max) and may carry a sixth element,
     the axis map, as [(user, design), ...]. Sources are design locations;
-    instances are (name, design location) pairs.
+    instances are (name, design location) pairs. `without` names instance
+    attributes to leave unset, e.g. ("name",) for a designspace whose
+    <instance> elements carry no name attribute, as RobotoMono's does.
     """
     from fontTools.designspaceLib import (
         AxisDescriptor,
@@ -50,6 +58,8 @@ def _write_designspace(
         i.styleName = instance_name.removeprefix("Test ")
         i.filename = f"instance_ufos/{instance_name.replace(' ', '')}.ufo"
         i.designLocation = dict(loc)
+        for attr in without:
+            setattr(i, attr, None)
         ds.addInstance(i)
     path = tmp_path / name
     ds.write(path)
@@ -257,13 +267,16 @@ def instance():
     flags.FLAGS.instance = previous
 
 
-def _variable_designspace(tmp_path, instances, axes=None, name="test.designspace"):
+def _variable_designspace(
+    tmp_path, instances, axes=None, name="test.designspace", without=()
+):
     return _write_designspace(
         tmp_path,
         axes=axes or [("wght", "Weight", 400, 400, 700)],
         sources=[{"Weight": 400}, {"Weight": 700}],
         instances=instances,
         name=name,
+        without=without,
     )
 
 
@@ -404,6 +417,107 @@ class TestInstance:
         with pytest.raises(SystemExit) as e:
             resolve_instance(path, "@default")
         assert e.value.code == "SKIP: non-injective axis map (fontc pins in user space)"
+
+    def test_nameless_instance_takes_the_name_fontmake_makes_up(self, tmp_path):
+        # RobotoFlex/RobotoMono/RobotoSerif have <instance> elements with no
+        # name attribute. fontmake still builds them: splitInterpolable() fills
+        # the name in as "{familyName} {styleName}" before -i is matched
+        # against it, so the pattern we pass has to be that same string.
+        path = _variable_designspace(
+            tmp_path,
+            instances=[
+                ("Test Bold", {"Weight": 700}),
+                ("Test Regular", {"Weight": 400}),
+            ],
+            without=("name",),
+        )
+        from fontTools.designspaceLib import DesignSpaceDocument
+
+        # the fixture really is nameless, i.e. this is not a vacuous test
+        assert [i.name for i in DesignSpaceDocument.fromfile(path).instances] == [
+            None,
+            None,
+        ]
+        resolved = resolve_instance(path, "@default")
+        assert resolved.name == "Test Regular"
+        assert re.fullmatch(resolved.fontmake_arg(), "Test Regular")
+        assert resolved.fontc_arg() == "wght=400"
+
+    def test_instance_with_nothing_to_name_it_is_a_skip(self, tmp_path):
+        # no name, no family/style name and no STAT labels to derive one from:
+        # fontmake would call it "None None", which is not a name we will chase
+        path = _variable_designspace(
+            tmp_path,
+            instances=[("Test Regular", {"Weight": 400})],
+            without=("name", "familyName", "styleName"),
+        )
+        with pytest.raises(SystemExit) as e:
+            resolve_instance(path, "@default")
+        assert e.value.code == (
+            "SKIP: instance has no name (fontmake selects instances by name)"
+        )
+
+    def test_point_axis_is_left_out_of_the_pin(self, tmp_path):
+        # fontc drops axes whose min == default == max (Axis::is_point), so a
+        # pin naming one is rejected: "--instance does not know axis 'wdth'".
+        # Glyphs 2 sources with a constant interpolationWidth (Battambang,
+        # KohSantepheap, Suwannaphum, GwendolynPro) get exactly such an axis.
+        path = _write_designspace(
+            tmp_path,
+            axes=[
+                ("wght", "Weight", 100, 400, 900),
+                ("wdth", "Width", 100, 100, 100),
+            ],
+            sources=[
+                {"Weight": 100, "Width": 100},
+                {"Weight": 400, "Width": 100},
+                {"Weight": 900, "Width": 100},
+            ],
+            instances=[("Test Regular", {"Weight": 400, "Width": 100})],
+        )
+        resolved = resolve_instance(path, "@default")
+        assert resolved.fontc_arg() == "wght=400"
+        # the point axis is still part of what makes this the default instance
+        assert dict(resolved.design_location)["Width"] == 100
+
+    def test_a_pin_of_only_point_axes_keeps_them(self, tmp_path):
+        # dropping every axis would leave an empty --instance, which fontc
+        # rejects as "not a location" -- a worse error than the honest one
+        path = _write_designspace(
+            tmp_path,
+            axes=[("wdth", "Width", 100, 100, 100)],
+            sources=[{"Width": 100}, {"Width": 100}],
+            instances=[("Test Regular", {"Width": 100})],
+        )
+        assert resolve_instance(path, "@default").fontc_arg() == "wdth=100"
+
+    def test_glyphslib_failure_is_reported_as_fontmakes(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        # listing a .glyphs source's instances means running the same
+        # glyphsLib conversion fontmake runs first (build_master_ufos), so a
+        # source it cannot convert -- MuseoModerno's duplicate fsType,
+        # PathwayExtreme's smart components -- must read as fontmake failing,
+        # not as ttx_diff crashing
+        import glyphsLib
+
+        import ttx_diff.__main__  # noqa: F401  (defines --json)
+        import ttx_diff.core as core
+
+        if not core.FLAGS.is_parsed():
+            core.FLAGS.mark_as_parsed()
+        path = _write_glyphs(tmp_path, masters=[400, 700])
+
+        def boom(*args, **kwargs):
+            raise RuntimeError("More than one value for this customParameter: fsType")
+
+        monkeypatch.setattr(glyphsLib, "to_designspace", boom)
+        monkeypatch.setattr(core.FLAGS, "json", True)
+        with pytest.raises(SystemExit) as e:
+            resolve_instance(path, "@default")
+        assert e.value.code == 2
+        failure = json.loads(capsys.readouterr().out)["error"]["fontmake"]
+        assert "customParameter: fsType" in failure["stderr"]
 
     def test_static_source_is_a_skip(self, tmp_path):
         ufo = tmp_path / "test.ufo"

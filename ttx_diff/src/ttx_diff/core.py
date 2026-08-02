@@ -52,6 +52,7 @@ import shutil
 import subprocess
 import sys
 import time
+import traceback
 from collections import defaultdict
 from contextlib import contextmanager
 from functools import cache
@@ -64,6 +65,7 @@ import yaml
 from absl import flags
 from cdifflib import CSequenceMatcher as SequenceMatcher
 from fontTools.designspaceLib import DesignSpaceDocument
+from fontTools.designspaceLib.statNames import getStatNames
 from fontTools.misc.fixedTools import otRound
 from fontTools.ttLib import TTFont
 from fontTools.varLib.iup import iup_delta
@@ -101,6 +103,7 @@ SKIP_NO_INSTANCES = "source has no named instances"
 SKIP_NO_DEFAULT_INSTANCE = "no named instance at the default location"
 SKIP_AMBIGUOUS_INSTANCE = "ambiguous instance name"
 SKIP_NON_INJECTIVE_MAP = "non-injective axis map (fontc pins in user space)"
+SKIP_UNNAMED_INSTANCE = "instance has no name (fontmake selects instances by name)"
 
 # fontc and fontmake's builds may be off by a second or two in the
 # head.created/modified; setting this makes them the same
@@ -126,6 +129,23 @@ def skip(reason: str, detail: Optional[str] = None) -> NoReturn:
     if detail is not None:
         eprint(detail)
     sys.exit(f"SKIP: {reason}")
+
+
+def fontmake_failed(command: str, error: BaseException) -> NoReturn:
+    """Exit reporting `error` as a failure of fontmake's, not of ours.
+
+    Work we do on fontmake's behalf -- converting a .glyphs source to a
+    DesignSpace, which is step one of every fontmake build (`FontProject.
+    build_master_ufos`) -- fails exactly where fontmake would fail. Reporting
+    that as a crash of ttx_diff hides a real, and correctly reported, upstream
+    limitation behind "unknown error"; reporting it as a compiler failure puts
+    it in the same bucket as the identical failure of `fontmake` itself.
+    """
+    detail = "".join(traceback.format_exception(error))
+    report_errors_and_exit_if_there_were_any(
+        {"fontmake": {"command": command, "stderr": detail[-MAX_ERR_LEN:]}}
+    )
+    raise AssertionError("unreachable")  # pragma: no cover
 
 
 _timing_log: List[Tuple[str, float, int]] = []
@@ -581,9 +601,11 @@ class ResolvedInstance:
     alone, so we resolve once here and hand each compiler its own dialect.
     """
 
-    # the DesignSpace instance 'name' attribute -> fontmake -i
-    name: str
-    # (axis tag, user-space value) per axis, in axis order -> fontc --instance
+    # the DesignSpace instance 'name' attribute (or, when it has none, the name
+    # fontmake makes up for it) -> fontmake -i. None if it cannot be named.
+    name: Optional[str]
+    # (axis tag, user-space value) per *variable* axis, in axis order, which is
+    # the location fontc's --instance accepts
     user_location: Tuple[Tuple[str, float], ...]
     # (axis name, design-space value) per axis; @default matches on this
     design_location: Tuple[Tuple[str, float], ...]
@@ -599,10 +621,14 @@ class ResolvedInstance:
         not string equality, so a name containing regex metacharacters -- or a
         space, which re.escape also escapes -- has to be escaped.
         """
+        assert self.name is not None, "resolve_instance skips a nameless instance"
         return re.escape(self.name)
 
     def fontc_arg(self) -> str:
-        """The `--instance` location, e.g. 'wght=400,wdth=87.5'."""
+        """The `--instance` location, e.g. 'wght=400,wdth=87.5'.
+
+        Point axes are absent: see `_variable_axes`.
+        """
         return ",".join(f"{tag}={_fmt_coord(v)}" for tag, v in self.user_location)
 
     def describe(self) -> str:
@@ -628,13 +654,66 @@ def _designspace_for(path: Path) -> DesignSpaceDocument:
         import ufoLib2
         from glyphsLib import to_designspace
 
-        return to_designspace(
-            GSFont(path),
-            ufo_module=ufoLib2,
-            minimal=True,
-            store_editor_state=False,
-        )
+        # the same arguments fontmake passes in FontProject.build_master_ufos,
+        # so that a source glyphsLib cannot convert fails here exactly when it
+        # would fail there -- and is reported as fontmake's failure, below
+        try:
+            return to_designspace(
+                GSFont(path),
+                ufo_module=ufoLib2,
+                minimal=True,
+                store_editor_state=False,
+                write_skipexportglyphs=True,
+                generate_GDEF=True,
+            )
+        except Exception as e:
+            fontmake_failed(f"glyphsLib.to_designspace({rel_user(path)})", e)
     skip(f"cannot list the instances of a '{path.suffix}' source")
+
+
+def _fontmake_instance_name(doc: DesignSpaceDocument, instance) -> Optional[str]:
+    """What fontmake's `-i` will match this instance's name against.
+
+    A DesignSpace `<instance>` need not have a `name` attribute (RobotoFlex,
+    RobotoMono and RobotoSerif have none), but fontmake still names it:
+    `interpolate_instance_ufos` iterates `splitInterpolable(designspace)`,
+    which fills a missing name in with `f"{familyName} {styleName}"`, each part
+    falling back to the STAT-derived name for the location
+    (fontTools.designspaceLib.split, `_extractSubSpace`, makeNames=True).
+    We synthesize it identically rather than reading `instance.name`, which is
+    None on those sources and used to crash `re.escape`.
+
+    None when there is nothing to make a name out of -- fontmake would call
+    such an instance "None None" -- which is a skip, not a name we will chase.
+    """
+    if instance.name is not None:
+        return instance.name
+    stat_names = getStatNames(doc, instance.getFullUserLocation(doc))
+    family = instance.familyName or stat_names.familyNames.get("en")
+    style = instance.styleName or stat_names.styleNames.get("en")
+    if family is None and style is None:
+        return None
+    return f"{family} {style}"
+
+
+def _variable_axes(doc: DesignSpaceDocument) -> List[str]:
+    """The axis names fontc keeps, i.e. every axis that is not a point.
+
+    `StaticMetadata::new` drops axes whose user-space min == default == max
+    (`Axis::is_point`), so a pin that names one is rejected outright:
+    "--instance does not know axis 'wdth'". Glyphs 2 sources with no `Axes`
+    custom parameter and a constant `interpolationWidth` (Battambang,
+    KohSantepheap, ...) get exactly such a synthetic wdth axis from glyphsLib.
+    """
+
+    def is_point(axis) -> bool:
+        # a discrete axis (DesignSpace 5) has values, not a min/max
+        values = getattr(axis, "values", None)
+        if values is not None:
+            return len(set(values)) < 2
+        return axis.minimum == axis.maximum
+
+    return [axis.name for axis in doc.axes if not is_point(axis)]
 
 
 def _axis_map_is_non_injective(axis) -> bool:
@@ -653,6 +732,10 @@ def instances_of(source: Path) -> List[ResolvedInstance]:
     """Every named instance of a source, in document order."""
     doc = _designspace_for(source)
     tag_for_axis = {axis.name: axis.tag for axis in doc.axes}
+    # a pin may only name axes fontc has; if every axis is a point (so there is
+    # nothing left to pin) keep them all, because an empty --instance is not a
+    # location at all and fontc's complaint about it would be the less useful one
+    pinnable = set(_variable_axes(doc)) or set(tag_for_axis)
     # the default location is design space on both sides of this comparison:
     # a source with an axis <map> has an axis default (user) that is not its
     # default source's coordinate (design), and comparing the two would be
@@ -670,9 +753,11 @@ def instances_of(source: Path) -> List[ResolvedInstance]:
         user = instance.getFullUserLocation(doc)
         resolved.append(
             ResolvedInstance(
-                name=instance.name,
+                name=_fontmake_instance_name(doc, instance),
                 user_location=tuple(
-                    (tag_for_axis[name], float(value)) for name, value in user.items()
+                    (tag_for_axis[name], float(value))
+                    for name, value in user.items()
+                    if name in pinnable
                 ),
                 design_location=tuple(
                     (name, float(value)) for name, value in design.items()
@@ -726,11 +811,19 @@ def resolve_instance(source: Path, spec: str) -> ResolvedInstance:
             )
     # instances_of returns document order, so the first match is the lowest index
     chosen = matches[0]
+    if chosen.name is None:
+        skip(
+            SKIP_UNNAMED_INSTANCE,
+            f"'{rel_user(source)}' instance {chosen.index} has neither a name "
+            "nor a family/style name to make one from",
+        )
     # fontmake selects with re.fullmatch and errors out ("output_path requires a
     # single input") if the pattern matches more than one instance; an escaped
     # name matches only itself, so this fires exactly when names are duplicated
     pattern = chosen.fontmake_arg()
-    twins = [i for i in instances if re.fullmatch(pattern, i.name)]
+    twins = [
+        i for i in instances if i.name is not None and re.fullmatch(pattern, i.name)
+    ]
     if len(twins) > 1:
         skip(
             SKIP_AMBIGUOUS_INSTANCE,
