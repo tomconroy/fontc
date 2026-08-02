@@ -97,6 +97,9 @@ pub enum Error {
     CoordinateConversionError(#[from] fontdrasil::error::Error),
     #[error("Unsupported featureWriters configuration: {0}")]
     UnsupportedFeatureWriters(String),
+    /// The `--instance` the caller asked for isn't a position this source has.
+    #[error(transparent)]
+    Pin(#[from] crate::instance::PinError),
 }
 
 /// An error related to loading source input files

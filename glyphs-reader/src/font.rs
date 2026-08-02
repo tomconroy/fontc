@@ -2002,6 +2002,19 @@ pub struct Instance {
     pub axes_values: Vec<OrderedFloat<f64>>,
     pub custom_parameters: CustomParameters,
     properties: Vec<RawName>, // used for name resolution
+    /// The "Style Linking" checkboxes of the Instances tab.
+    ///
+    /// glyphsLib derives `styleMapStyleName` from these two flags and nothing
+    /// else — the style *name* is never parsed for "Bold", so an instance
+    /// called `Bold` with the box unchecked is style-linked as regular.
+    /// <https://github.com/googlefonts/glyphsLib/blob/main/Lib/glyphsLib/builder/names.py#L77-L82>
+    pub is_bold: bool,
+    pub is_italic: bool,
+    /// "Style Linking > this instance is the X of", i.e. the family to link into.
+    ///
+    /// Empty or `Regular` means "work it out from the style name"; see
+    /// [`Instance::style_map_names`].
+    pub link_style: Option<String>,
 }
 
 /// <https://github.com/googlefonts/glyphsLib/blob/6f243c1f732ea1092717918d0328f3b5303ffe56/Lib/glyphsLib/classes.py#L150>
@@ -2040,6 +2053,11 @@ struct RawInstance {
 
     weight_class: Option<String>,
     width_class: Option<String>,
+    // Style Linking; both default to off
+    // <https://github.com/googlefonts/glyphsLib/blob/main/Lib/glyphsLib/classes.py#L3269-L3270>
+    is_bold: Option<i64>,
+    is_italic: Option<i64>,
+    link_style: Option<String>,
     properties: Vec<RawName>,
     custom_parameters: RawCustomParameters,
 }
@@ -3639,10 +3657,14 @@ impl Instance {
             axes_values: value.axes_values.clone(),
             properties: value.properties.clone(),
             custom_parameters: value.custom_parameters.to_custom_params()?,
+            is_bold: value.is_bold.unwrap_or_default() != 0,
+            is_italic: value.is_italic.unwrap_or_default() != 0,
+            link_style: value.link_style.clone(),
         })
     }
 
-    fn family_name(&self) -> Option<&str> {
+    /// The instance's own family name, if it states one.
+    pub fn family_name(&self) -> Option<&str> {
         self.properties
             .iter()
             .find(|raw| raw.key == "familyNames")
@@ -3651,6 +3673,48 @@ impl Instance {
         // don't have that key? Possible that we're ignoring it in the raw params
         // conversion..
         // https://github.com/googlefonts/glyphsLib/blob/c4db6b981d577/Lib/glyphsLib/classes.py#L3271
+    }
+
+    /// This instance's `styleMapFamilyName`, i.e. name ID 1.
+    ///
+    /// glyphsLib's `build_stylemap_names`: the family name plus the "linked
+    /// style", which is `linkStyle` when it says anything other than
+    /// `Regular`, and otherwise the style name with the *last* occurrence of
+    /// each style-linking word removed — `Regular` only when neither box is
+    /// ticked, `Bold` only when the bold box is, `Italic` or `Oblique` only
+    /// when the italic box is, each consumed once. An empty remainder leaves
+    /// the family name alone.
+    ///
+    /// `family_name` is the instance's own if it has one, else the font's.
+    ///
+    /// <https://github.com/googlefonts/glyphsLib/blob/main/Lib/glyphsLib/builder/names.py#L59-L106>
+    pub fn style_map_family_name(&self, family_name: &str) -> String {
+        let linked_style = match self.link_style.as_deref() {
+            Some(style) if !style.is_empty() && style != "Regular" => style.to_string(),
+            _ => self.linked_style_from_name(),
+        };
+        if linked_style.is_empty() {
+            family_name.to_string()
+        } else {
+            format!("{family_name} {linked_style}")
+        }
+    }
+
+    /// glyphsLib's `_get_linked_style`, walking the style name in reverse.
+    fn linked_style_from_name(&self) -> String {
+        let (mut wants_bold, mut wants_italic) = (self.is_bold, self.is_italic);
+        let mut wants_regular = !(wants_bold || wants_italic);
+        let mut kept: Vec<&str> = Vec::new();
+        for part in self.name.split_ascii_whitespace().rev() {
+            match part {
+                "Regular" if wants_regular => wants_regular = false,
+                "Bold" if wants_bold => wants_bold = false,
+                "Italic" | "Oblique" if wants_italic => wants_italic = false,
+                _ => kept.push(part),
+            }
+        }
+        kept.reverse();
+        kept.join(" ")
     }
 
     /// Get the optional postscript name to use for the `fvar` named instance.

@@ -6607,8 +6607,15 @@ mod tests {
     /// Pinning at the default master must be the same font as compiling that
     /// master on its own — the whole design is "make the IR look static".
     ///
-    /// `head` is exempt: it carries the modification time and the checksum
-    /// adjustment, neither of which is about instancing.
+    /// Three tables are exempt. `head` carries the modification time and the
+    /// checksum adjustment, neither of which is about instancing. `OS/2` and
+    /// `post` carry the fields where an interpolated instance is
+    /// *deliberately* not its master: fontmake hands every instance to
+    /// glyphsLib's `apply_instance_data_to_ufo`, which merges PANOSE across
+    /// the masters (this fixture's disagree, so the instance gets none) and
+    /// defaults `fsType` and the underline position to Glyphs.app's values
+    /// rather than ufo2ft's. Those three fields are asserted instead; every
+    /// other field of both tables is covered by the ttx_diff oracle.
     #[test]
     fn instance_at_the_default_is_the_default_master_compiled_alone() {
         let pinned = compile_instance("wght_var.designspace", "wght=400");
@@ -6617,7 +6624,7 @@ mod tests {
         let (pinned, alone) = (pinned.font(), alone.font());
         assert_eq!(table_tags(&pinned), table_tags(&alone));
         for tag in table_tags(&pinned) {
-            if tag == Tag::new(b"head") {
+            if [Tag::new(b"head"), Tag::new(b"OS/2"), Tag::new(b"post")].contains(&tag) {
                 continue;
             }
             assert_eq!(
@@ -6626,6 +6633,118 @@ mod tests {
                 "{tag}"
             );
         }
+
+        let (pinned_os2, alone_os2) = (pinned.os2().unwrap(), alone.os2().unwrap());
+        assert_eq!(
+            (alone_os2.fs_type(), pinned_os2.fs_type()),
+            (1 << 2, 1 << 3)
+        );
+        assert_eq!(
+            (alone_os2.panose_10(), pinned_os2.panose_10()),
+            (
+                [2u8, 11, 5, 2, 4, 5, 4, 2, 2, 4].as_slice(),
+                [0u8; 10].as_slice()
+            ),
+            "the masters' PANOSE disagree, so the instance has none"
+        );
+        assert_eq!(
+            (
+                alone.post().unwrap().underline_position().to_i16(),
+                pinned.post().unwrap().underline_position().to_i16()
+            ),
+            (-75, -100)
+        );
+    }
+
+    /// Every name record of a pinned font, by id.
+    fn name_records(font: &FontRef) -> Vec<(u16, String)> {
+        let names = font.name().unwrap();
+        let mut records: Vec<_> = names
+            .name_record()
+            .iter()
+            .map(|record| {
+                (
+                    record.name_id().to_u16(),
+                    record
+                        .string(names.string_data())
+                        .unwrap()
+                        .chars()
+                        .collect::<String>(),
+                )
+            })
+            .collect();
+        records.sort();
+        records
+    }
+
+    /// A pinned instance is named for the instance, not for the family.
+    ///
+    /// The strings are `fontmake -m wght_var.designspace -i 'Wght Var Bold'
+    /// --keep-overlaps -o ttf`'s, read out of the ttf it produced (fontmake
+    /// 3.12.1). Name id 5 is the one place fontc deliberately differs: it
+    /// stamps its own version on, and ttx_diff normalises that away.
+    ///
+    /// This instance states `stylemapstylename="bold"`, so ids 1 and 2 come
+    /// from the `<instance>` rather than from the RIBBI fallback, and 16/17 are
+    /// dropped for matching 1/2. `usWeightClass` is the pin's user coordinate
+    /// truncated, `fsSelection` bit 5 and `macStyle` bit 0 are the style
+    /// linking, and `fsType` 8 is glyphsLib's instance default.
+    #[test]
+    fn instance_names_a_style_linked_instance_like_fontmake() {
+        let result = compile_instance("wght_var.designspace", "wght=700");
+        let font = result.font();
+
+        assert_eq!(
+            name_records(&font)
+                .into_iter()
+                .filter(|(id, _)| *id != 5)
+                .collect::<Vec<_>>(),
+            vec![
+                (1, "Wght Var".to_string()),
+                (2, "Bold".to_string()),
+                (3, "0.000;NONE;WghtVar-Bold".to_string()),
+                (4, "Wght Var Bold".to_string()),
+                (6, "WghtVar-Bold".to_string()),
+            ]
+        );
+        let os2 = font.os2().unwrap();
+        assert_eq!(os2.us_weight_class(), 700);
+        assert_eq!(os2.us_width_class(), 5);
+        assert_eq!(os2.fs_selection().bits(), 0b100000);
+        assert_eq!(os2.fs_type(), 8);
+        assert_eq!(font.head().unwrap().mac_style().bits(), 0b1);
+    }
+
+    /// A non-RIBBI style name with no style linking takes ufo2ft's fallback.
+    ///
+    /// Ids 1 and 2 are `styleMapFamilyNameFallback` and
+    /// `styleMapStyleNameFallback`: "Foo" is not one of the four, so id 2 is
+    /// "Regular" and id 1 gains the style as a suffix — which makes 1 and 2
+    /// differ from 16 and 17, so all four are emitted.
+    ///
+    /// Strings from `fontmake -i 'Wght Var Foo' --keep-overlaps -o ttf` on a
+    /// scratch copy of `wght_var.designspace` carrying this fixture's
+    /// `<instance stylename="Foo">` with the `name` and `familyname`
+    /// attributes fontmake's `-i` needs to select it (fontmake 3.12.1).
+    #[test]
+    fn instance_names_a_non_ribbi_instance_like_fontmake() {
+        let result = compile_instance("wght_var_instance_stylename.designspace", "Foo");
+
+        assert_eq!(
+            name_records(&result.font())
+                .into_iter()
+                .filter(|(id, _)| *id != 5)
+                .collect::<Vec<_>>(),
+            vec![
+                (1, "Wght Var Foo".to_string()),
+                (2, "Regular".to_string()),
+                (3, "0.000;NONE;WghtVar-Foo".to_string()),
+                (4, "Wght Var Foo".to_string()),
+                (6, "WghtVar-Foo".to_string()),
+                (16, "Wght Var".to_string()),
+                (17, "Foo".to_string()),
+            ]
+        );
     }
 
     /// A .glyphs v3 source, where the axis is real and declared.

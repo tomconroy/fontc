@@ -94,11 +94,110 @@ pub struct StaticMetadata {
 }
 
 /// IR for a named position in variation space
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+///
+/// A variable font uses only [`Self::name`], [`Self::postscript_name`] and
+/// [`Self::location`], for `fvar`. The rest is what an instance *built* here is
+/// called, which only `--instance` reads. All of it is `#[serde(default)]`
+/// because IR is schema-less YAML and additive fields are how it grows.
+#[derive(Serialize, Deserialize, Debug, Default, Clone, PartialEq, Eq)]
 pub struct NamedInstance {
+    /// The style name: designspace `<instance stylename>`, or a Glyphs
+    /// instance's `name`.
     pub name: String,
     pub postscript_name: Option<String>,
     pub location: UserLocation,
+    /// The family name of the UFO fontmake would interpolate here.
+    ///
+    /// The instance's own — designspace `<instance familyname>`, or a Glyphs
+    /// instance's `familyNames` property — falling back to the font's, which
+    /// is what the instance UFO inherits. Name ID 16 is exactly this: the
+    /// instance never inherits `openTypeNamePreferredFamilyName`, so ufo2ft's
+    /// fallback chain always lands on `familyName`.
+    #[serde(default)]
+    pub family_name: Option<String>,
+    /// Name ID 1 for this instance, if the source states one.
+    ///
+    /// designspace `<instance stylemapfamilyname>`; for Glyphs, built by
+    /// glyphsLib from the instance's style linking. Absent means "let the
+    /// RIBBI fallback decide", which is what [`NameBuilder::build`] already
+    /// does.
+    ///
+    /// [`NameBuilder::build`]: crate::ir::NameBuilder::build
+    #[serde(default)]
+    pub style_map_family_name: Option<String>,
+    /// Name ID 2 for this instance, if the source states one.
+    ///
+    /// Drives `fsSelection` and `head.macStyle` as well as the name.
+    #[serde(default)]
+    pub style_map_style_name: Option<StyleMapStyle>,
+}
+
+/// The four style-linking styles, i.e. UFO `styleMapStyleName`.
+///
+/// <https://unifiedfontobject.org/versions/ufo3/fontinfo.plist/#generic-identification-information>
+#[derive(Serialize, Deserialize, Debug, Copy, Clone, PartialEq, Eq, Hash)]
+pub enum StyleMapStyle {
+    Regular,
+    Italic,
+    Bold,
+    BoldItalic,
+}
+
+impl StyleMapStyle {
+    /// The `Regular` / `Bold Italic` form, which is what name ID 2 holds.
+    ///
+    /// ufo2ft `.title()`s `styleMapStyleName` on the way into the name table,
+    /// so the record is title case whatever the UFO's casing was.
+    ///
+    /// <https://github.com/googlefonts/ufo2ft/blob/main/Lib/ufo2ft/outlineCompiler.py#L404>
+    pub fn to_name(self) -> &'static str {
+        match self {
+            StyleMapStyle::Regular => "Regular",
+            StyleMapStyle::Italic => "Italic",
+            StyleMapStyle::Bold => "Bold",
+            StyleMapStyle::BoldItalic => "Bold Italic",
+        }
+    }
+
+    /// The `fsSelection` bits this style contributes, which are also macStyle's.
+    ///
+    /// <https://github.com/googlefonts/ufo2ft/blob/main/Lib/ufo2ft/outlineCompiler.py#L714-L725>
+    pub fn selection_flags(self) -> SelectionFlags {
+        match self {
+            StyleMapStyle::Regular => SelectionFlags::REGULAR,
+            StyleMapStyle::Italic => SelectionFlags::ITALIC,
+            StyleMapStyle::Bold => SelectionFlags::BOLD,
+            StyleMapStyle::BoldItalic => SelectionFlags::BOLD | SelectionFlags::ITALIC,
+        }
+    }
+
+    /// Parse a UFO `styleMapStyleName`, which ufo2ft lowercases first.
+    ///
+    /// `None` for anything that isn't one of the four: ufo2ft logs "not one of
+    /// ..." and leaves the attribute unset.
+    ///
+    /// <https://github.com/googlefonts/ufo2ft/blob/main/Lib/ufo2ft/instantiator.py#L778-L792>
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw.trim().to_lowercase().as_str() {
+            "regular" => Some(StyleMapStyle::Regular),
+            "italic" => Some(StyleMapStyle::Italic),
+            "bold" => Some(StyleMapStyle::Bold),
+            "bold italic" => Some(StyleMapStyle::BoldItalic),
+            _ => None,
+        }
+    }
+
+    /// glyphsLib's flag-driven derivation, which never looks at the style name.
+    ///
+    /// <https://github.com/googlefonts/glyphsLib/blob/main/Lib/glyphsLib/builder/names.py#L77-L82>
+    pub fn from_flags(is_bold: bool, is_italic: bool) -> Self {
+        match (is_bold, is_italic) {
+            (true, true) => StyleMapStyle::BoldItalic,
+            (true, false) => StyleMapStyle::Bold,
+            (false, true) => StyleMapStyle::Italic,
+            (false, false) => StyleMapStyle::Regular,
+        }
+    }
 }
 
 /// See <https://learn.microsoft.com/en-us/typography/opentype/spec/name>
@@ -215,6 +314,19 @@ pub struct MiscMetadata {
 
     pub panose: Option<Panose>,
 
+    /// The PANOSE an interpolated *instance* gets, which is not [`Self::panose`].
+    ///
+    /// ufo2ft merges every source's PANOSE into the instance element-wise,
+    /// keeping a digit only when every source that has a PANOSE agrees about
+    /// it and zeroing the rest, and dropping the whole thing when nothing
+    /// survives — so two masters with different PANOSE produce an instance
+    /// with none at all. Only `--instance` reads this; a variable build takes
+    /// the default master's, as fontmake does.
+    ///
+    /// <https://github.com/googlefonts/ufo2ft/blob/main/Lib/ufo2ft/instantiator.py#L480-L502>
+    #[serde(default)]
+    pub instance_panose: Option<Panose>,
+
     // Allows source to explicitly control bits. <https://github.com/googlefonts/fontc/issues/1027>
     pub unicode_range_bits: Option<HashSet<u32>>,
 
@@ -313,6 +425,67 @@ pub struct Panose {
     pub letterform: u8,
     pub midline: u8,
     pub x_height: u8,
+}
+
+impl Panose {
+    /// The ten digits, in `OS/2` order.
+    pub fn digits(&self) -> [u8; 10] {
+        [
+            self.family_type,
+            self.serif_style,
+            self.weight,
+            self.proportion,
+            self.contrast,
+            self.stroke_variation,
+            self.arm_style,
+            self.letterform,
+            self.midline,
+            self.x_height,
+        ]
+    }
+
+    pub fn from_digits(digits: [u8; 10]) -> Panose {
+        Panose {
+            family_type: digits[0],
+            serif_style: digits[1],
+            weight: digits[2],
+            proportion: digits[3],
+            contrast: digits[4],
+            stroke_variation: digits[5],
+            arm_style: digits[6],
+            letterform: digits[7],
+            midline: digits[8],
+            x_height: digits[9],
+        }
+    }
+
+    /// The PANOSE an instance interpolated from these masters gets.
+    ///
+    /// ufo2ft keeps a digit only when every master that *has* a PANOSE agrees
+    /// about it, zeroes the rest, and drops the whole thing when nothing
+    /// survives — so a family whose masters disagree everywhere produces
+    /// instances with no PANOSE at all, and `OS/2` writes zeros. Masters with
+    /// no PANOSE don't vote; if none of them has one, there is nothing to
+    /// merge.
+    ///
+    /// <https://github.com/googlefonts/ufo2ft/blob/main/Lib/ufo2ft/instantiator.py#L480-L502>
+    pub fn merged_for_instance<'a>(
+        masters: impl IntoIterator<Item = &'a Panose>,
+    ) -> Option<Panose> {
+        let mut shared: Option<[u8; 10]> = None;
+        for master in masters {
+            let digits = master.digits();
+            shared = Some(match shared {
+                None => digits,
+                Some(shared) => {
+                    std::array::from_fn(|i| if shared[i] == digits[i] { shared[i] } else { 0 })
+                }
+            });
+        }
+        shared
+            .filter(|digits| digits.iter().any(|digit| *digit != 0))
+            .map(Panose::from_digits)
+    }
 }
 
 /// A series of substitution rules to be applied to layout features
@@ -547,6 +720,7 @@ impl StaticMetadata {
                 created: None,
                 family_class: None,
                 panose: None,
+                instance_panose: None,
                 unicode_range_bits: None,
                 codepage_range_bits: None,
                 meta_table: None,
@@ -687,6 +861,7 @@ mod tests {
                 name: "Nobody".to_string(),
                 postscript_name: None,
                 location: vec![(WGHT, UserCoord::new(100.0))].into(),
+                ..Default::default()
             }],
             variation_model: VariationModel::new(
                 HashSet::from([
@@ -729,6 +904,7 @@ mod tests {
                 created: None,
                 family_class: None,
                 panose: None,
+                instance_panose: None,
                 unicode_range_bits: None,
                 codepage_range_bits: None,
                 meta_table: None,

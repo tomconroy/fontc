@@ -21,9 +21,9 @@ use fontir::{
         DEFAULT_VENDOR_ID, FEATURE_WRITERS_LIB_KEY, FeatureWriterOptionValue, FeatureWriterSpec,
         GlobalMetric, GlobalMetrics, GlobalMetricsBuilder, GlyphAnchors, GlyphInstance, GlyphOrder,
         KernGroup, KernSide, KerningInstance, KerningLocations, MetaTableValues, NameBuilder,
-        NameKey, NamedInstance, Paint, PaintGlyph, PostscriptNames, PostscriptSettings,
-        PreliminaryGdefCategories, Rule, StaticMetadata, Substitution, VariableFeature,
-        reject_duplicate_writers, validate_feature_writer,
+        NameKey, NamedInstance, Paint, PaintGlyph, Panose, PostscriptNames, PostscriptSettings,
+        PreliminaryGdefCategories, Rule, StaticMetadata, StyleMapStyle, Substitution,
+        VariableFeature, reject_duplicate_writers, validate_feature_writer,
     },
     orchestration::{Context, Flags, IrWork, WorkId},
     source::Source,
@@ -444,6 +444,14 @@ impl Work<Context, WorkId, Error> for StaticMetadataWork {
                 if inst.type_ != InstanceType::Single || !inst.active {
                     return None;
                 }
+                // What `--instance` needs and fvar doesn't: what glyphsLib
+                // would call the instance UFO it generated here. Style linking
+                // is flag-driven, never name-driven.
+                // https://github.com/googlefonts/glyphsLib/blob/main/Lib/glyphsLib/builder/instances.py#L114-L152
+                let family_name = inst
+                    .family_name()
+                    .or_else(|| font.get_default_name("familyNames"))
+                    .unwrap_or_default();
                 Some(NamedInstance {
                     name: inst.name.clone(),
                     postscript_name: inst.postscript_name().map(str::to_string),
@@ -452,6 +460,12 @@ impl Work<Context, WorkId, Error> for StaticMetadataWork {
                         .get(&inst.axes_values)
                         .map(|nc| nc.to_user(&axes).unwrap())
                         .unwrap(),
+                    family_name: Some(family_name.to_string()),
+                    style_map_family_name: Some(inst.style_map_family_name(family_name)),
+                    style_map_style_name: Some(StyleMapStyle::from_flags(
+                        inst.is_bold,
+                        inst.is_italic,
+                    )),
                 })
             })
             .collect();
@@ -613,6 +627,33 @@ impl Work<Context, WorkId, Error> for StaticMetadataWork {
                 .for_each(|(dst, src)| *dst = *src as u8);
             static_metadata.misc.panose = Some(bytes.into());
         }
+
+        // What an *interpolated* instance gets instead: ufo2ft merges the
+        // PANOSE of every UFO glyphsLib generated, which is the master's own
+        // parameter or the font's. The default instance's parameter, which
+        // `misc.panose` prefers above, is not among them - glyphsLib applies
+        // that to the instance UFO afterwards, and only to its own instance.
+        static_metadata.misc.instance_panose = Panose::merged_for_instance(
+            &font
+                .masters
+                .iter()
+                .filter_map(|master| {
+                    master
+                        .custom_parameters
+                        .panose
+                        .as_ref()
+                        .or(font.custom_parameters.panose.as_ref())
+                })
+                .map(|raw| {
+                    let mut bytes = [0u8; 10];
+                    bytes
+                        .iter_mut()
+                        .zip(raw)
+                        .for_each(|(dst, src)| *dst = *src as u8);
+                    Panose::from(bytes)
+                })
+                .collect::<Vec<_>>(),
+        );
 
         static_metadata.misc.version_major = font.version_major;
         static_metadata.misc.version_minor = font.version_minor;
@@ -1151,9 +1192,15 @@ impl Work<Context, WorkId, Error> for GlobalMetricWork {
             );
         }
 
+        // pinned here, not at the pin barrier: only the builder still has the
+        // unrounded per-master values `fontmake -i` interpolates
         context
             .global_metrics
-            .set(metrics.build(&static_metadata.axes)?);
+            .set(fontir::instance::build_global_metrics(
+                metrics,
+                &static_metadata,
+                context.instance.as_ref(),
+            )?);
         Ok(())
     }
 }

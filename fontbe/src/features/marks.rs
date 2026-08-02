@@ -1297,6 +1297,7 @@ mod tests {
                     name: format!("instance{i}"),
                     postscript_name: None,
                     location: loc.to_user(&axes).unwrap(),
+                    ..Default::default()
                 })
                 .collect();
             let glyph_locations = self.locations.iter().cloned().collect();

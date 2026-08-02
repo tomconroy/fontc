@@ -25,8 +25,8 @@ use fontir::{
         FeaturesSource, GlobalMetric, GlobalMetricsBuilder, GlyphOrder, KernGroup, KernSide,
         KerningInstance, KerningLocations, MetaTableValues, NameBuilder, NameKey, NamedInstance,
         Paint, PaintGlyph, PaintSolid, Panose, PostscriptNames, PostscriptSettings,
-        PreliminaryGdefCategories, Rule, StaticMetadata, Substitution, VariableFeature,
-        reject_duplicate_writers, validate_feature_writer,
+        PreliminaryGdefCategories, Rule, StaticMetadata, StyleMapStyle as IrStyleMapStyle,
+        Substitution, VariableFeature, reject_duplicate_writers, validate_feature_writer,
     },
     orchestration::{Context, Flags, IrWork, WorkId},
     source::Source,
@@ -912,6 +912,21 @@ fn font_infos<'a>(
     Ok(results)
 }
 
+fn to_ir_panose(panose: &norad::fontinfo::Os2Panose) -> Panose {
+    Panose {
+        family_type: panose.family_type as u8,
+        serif_style: panose.serif_style as u8,
+        weight: panose.weight as u8,
+        proportion: panose.proportion as u8,
+        contrast: panose.contrast as u8,
+        stroke_variation: panose.stroke_variation as u8,
+        arm_style: panose.arm_style as u8,
+        letterform: panose.letterform as u8,
+        midline: panose.midline as u8,
+        x_height: panose.x_height as u8,
+    }
+}
+
 /// The `postscript*` fontinfo keys of one master, mostly CFF hinting data.
 fn postscript_settings(font_info: &norad::FontInfo) -> PostscriptSettings {
     fn float_list(values: &Option<Vec<f64>>) -> Vec<OrderedFloat<f64>> {
@@ -1100,6 +1115,19 @@ impl Work<Context, WorkId, Error> for StaticMetadataWork {
                     location: to_design_location(&tags_by_name, &inst.location)
                         .to_user(&axes)
                         .unwrap(),
+                    // What `--instance` needs and fvar doesn't: the
+                    // <instance> attributes ufo2ft's instantiator writes
+                    // straight into the generated UFO's fontinfo.
+                    // https://github.com/googlefonts/ufo2ft/blob/main/Lib/ufo2ft/instantiator.py#L756-L792
+                    family_name: inst
+                        .familyname
+                        .clone()
+                        .or_else(|| font_info_at_default.family_name.clone()),
+                    style_map_family_name: inst.stylemapfamilyname.clone(),
+                    style_map_style_name: inst
+                        .stylemapstylename
+                        .as_deref()
+                        .and_then(IrStyleMapStyle::parse),
                 }
             })
             .collect();
@@ -1234,14 +1262,14 @@ impl Work<Context, WorkId, Error> for StaticMetadataWork {
             .open_type_os2_width_class
             .map(|v| v as u16);
 
-        // <https://github.com/googlefonts/glyphsLib/blob/cb8a4a914b0a33431f0a77f474bf57eec2f19bcc/Lib/glyphsLib/builder/custom_params.py#L1117-L1119>
-        static_metadata.misc.fs_type = Some(
-            font_info_at_default
-                .open_type_os2_type
-                .as_ref()
-                .map(|flags| flags.iter().fold(0_u16, |acc, e| acc | (1 << *e)))
-                .unwrap_or(1_u16 << 2),
-        );
+        // Left None when the source says nothing, because *which* default
+        // applies depends on what we're building: ufo2ft's [2] for an ordinary
+        // compile, glyphsLib's [3] for an interpolated instance. `fontbe`'s
+        // OS/2 work and the pin each supply their own.
+        static_metadata.misc.fs_type = font_info_at_default
+            .open_type_os2_type
+            .as_ref()
+            .map(|flags| flags.iter().fold(0_u16, |acc, e| acc | (1 << *e)));
 
         static_metadata.misc.is_fixed_pitch = font_info_at_default.postscript_is_fixed_pitch;
 
@@ -1254,20 +1282,22 @@ impl Work<Context, WorkId, Error> for StaticMetadataWork {
             .as_ref()
             .map(|bits| bits.iter().map(|b| *b as u32).collect());
 
-        if let Some(ot_panose) = &font_info_at_default.open_type_os2_panose {
-            static_metadata.misc.panose = Some(Panose {
-                family_type: ot_panose.family_type as u8,
-                serif_style: ot_panose.serif_style as u8,
-                weight: ot_panose.weight as u8,
-                proportion: ot_panose.proportion as u8,
-                contrast: ot_panose.contrast as u8,
-                stroke_variation: ot_panose.stroke_variation as u8,
-                arm_style: ot_panose.arm_style as u8,
-                letterform: ot_panose.letterform as u8,
-                midline: ot_panose.midline as u8,
-                x_height: ot_panose.x_height as u8,
-            });
-        }
+        static_metadata.misc.panose = font_info_at_default
+            .open_type_os2_panose
+            .as_ref()
+            .map(to_ir_panose);
+        // ufo2ft merges every source's PANOSE into an interpolated instance,
+        // which for masters that disagree means no PANOSE at all. Only
+        // `--instance` reads this; a variable build takes the default
+        // master's, above. Layer-only sources share their parent UFO's
+        // fontinfo, and `font_infos` is keyed by filename, so listing them
+        // twice — which ufo2ft does — cannot change the answer.
+        static_metadata.misc.instance_panose = Panose::merged_for_instance(
+            &font_infos
+                .values()
+                .filter_map(|info| info.open_type_os2_panose.as_ref().map(to_ir_panose))
+                .collect::<Vec<_>>(),
+        );
 
         static_metadata.misc.version_major = font_info_at_default
             .version_major
@@ -1738,9 +1768,15 @@ impl Work<Context, WorkId, Error> for GlobalMetricsWork {
         }
 
         trace!("{metrics:#?}");
+        // pinned here, not at the pin barrier: only the builder still has the
+        // unrounded per-master values `fontmake -i` interpolates
         context
             .global_metrics
-            .set(metrics.build(&static_metadata.axes)?);
+            .set(fontir::instance::build_global_metrics(
+                metrics,
+                &static_metadata,
+                context.instance.as_ref(),
+            )?);
         Ok(())
     }
 }
@@ -3255,20 +3291,25 @@ mod tests {
         );
     }
 
-    fn assert_fs_type(src: &str, expected: u16) {
+    fn assert_fs_type(src: &str, expected: Option<u16>) {
         let (_, context) = build_static_metadata(src, Flags::default());
         let static_metadata = context.static_metadata.get();
-        assert_eq!(Some(expected), static_metadata.misc.fs_type);
+        assert_eq!(expected, static_metadata.misc.fs_type);
     }
 
+    /// A UFO that says nothing leaves it to whoever is building.
+    ///
+    /// ufo2ft's default is [2] and glyphsLib's, which an interpolated instance
+    /// gets, is [3]; which applies isn't ours to decide here. `fontbe`'s OS/2
+    /// work supplies the first and `fontir::instance` the second.
     #[test]
     fn default_fs_type() {
-        assert_fs_type("wght_var.designspace", 1 << 2);
+        assert_fs_type("wght_var.designspace", None);
     }
 
     #[test]
     fn obeys_explicit_fs_type() {
-        assert_fs_type("MVAR.designspace", 1 << 3);
+        assert_fs_type("MVAR.designspace", Some(1 << 3));
     }
 
     #[test]

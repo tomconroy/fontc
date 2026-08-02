@@ -73,7 +73,7 @@ pub(crate) struct Pin {
 pub(crate) fn pin_frontend(fe_root: &Context, spec: &InstanceSpec) -> Result<Pin, Error> {
     let context = fe_root.copy_for_work(Access::All, Access::All);
     let source_metadata = context.static_metadata.get();
-    let asked_for = resolve_user(&source_metadata, spec)?;
+    let asked_for = instance::resolve_user(&source_metadata, spec)?;
     let location = normalize(&source_metadata, &asked_for)?;
 
     if let Some(features) = context.features.try_get()
@@ -96,13 +96,9 @@ pub(crate) fn pin_frontend(fe_root: &Context, spec: &InstanceSpec) -> Result<Pin
             .map_err(fontir::error::Error::from)?;
         context.anchors.set(pinned);
     }
-    if let Some(metrics) = context.global_metrics.try_get() {
-        context.global_metrics.set(instance::pin_global_metrics(
-            &source_metadata,
-            &metrics,
-            &location,
-        )?);
-    }
+    // global metrics are not pinned here: the frontend's own work does it, as
+    // the only place that still has the unrounded master values fontmake
+    // interpolates. See `fontir::instance::build_global_metrics`.
 
     // Feature variation rules become plain glyph swaps in a static instance,
     // and they run *after* interpolation — on the glyphs we just pinned — the
@@ -121,7 +117,8 @@ pub(crate) fn pin_frontend(fe_root: &Context, spec: &InstanceSpec) -> Result<Pin
     };
 
     // last, because everything above reads the *source's* axes to interpolate
-    let mut pinned = instance::pin_static_metadata(&source_metadata, &location)?;
+    let named = instance::named_instance_at(&source_metadata, spec, &location);
+    let mut pinned = instance::pin_static_metadata(&source_metadata, &location, &asked_for, named)?;
     prune_variable_names(&mut pinned, &source_metadata);
     context.static_metadata.set(pinned);
 
@@ -273,70 +270,6 @@ pub(crate) fn pin_kerning(fe_root: &Context, pin: &Pin) -> Result<(), Error> {
     Ok(())
 }
 
-/// The user-space location `spec` names, on every axis, or why it names none.
-///
-/// Axes the user didn't mention take their default, so the result is a
-/// complete location and not the subset that was asked for.
-fn resolve_user(
-    static_metadata: &StaticMetadata,
-    spec: &InstanceSpec,
-) -> Result<UserLocation, Error> {
-    // fontc's universal "this is static" test. Point axes are fine: fontmake
-    // pins a single-master designspace without complaint, and only rejects
-    // `-i` outright for bare UFO input.
-    if static_metadata.axes.is_empty() {
-        return Err(Error::InstanceRequiresVariableSource);
-    }
-
-    let asked_for = match spec {
-        InstanceSpec::Named(name) => static_metadata
-            .named_instances
-            .iter()
-            .find(|instance| instance.name == *name)
-            .ok_or_else(|| Error::UnknownInstance {
-                name: name.clone(),
-                available: comma_separated(
-                    static_metadata
-                        .named_instances
-                        .iter()
-                        .map(|instance| instance.name.clone()),
-                ),
-            })?
-            .location
-            .clone(),
-        InstanceSpec::Location(location) => {
-            for (tag, pos) in location.iter() {
-                let Some(axis) = static_metadata.axes.get(tag) else {
-                    return Err(Error::UnknownInstanceAxis {
-                        tag: *tag,
-                        available: comma_separated(
-                            static_metadata.axes.iter().map(|axis| axis.tag.to_string()),
-                        ),
-                    });
-                };
-                // deliberately not clamped: a silently moved pin is worse than
-                // a rejected one
-                if *pos < axis.min || *pos > axis.max {
-                    return Err(Error::InstanceAxisOutOfRange {
-                        tag: *tag,
-                        pos: pos.to_f64(),
-                        min: axis.min.to_f64(),
-                        max: axis.max.to_f64(),
-                    });
-                }
-            }
-            location.clone()
-        }
-    };
-
-    // an axis nobody mentioned sits at its default
-    Ok(static_metadata
-        .axes
-        .iter()
-        .map(|axis| (axis.tag, asked_for.get(axis.tag).unwrap_or(axis.default)))
-        .collect())
-}
-
 /// The pin in normalized space, which is how the IR keys everything.
 ///
 /// The conversion runs through the source's own axis mapping (what becomes
@@ -347,7 +280,7 @@ fn normalize(
     user: &UserLocation,
 ) -> Result<NormalizedLocation, Error> {
     user.to_normalized(&static_metadata.axes)
-        .map_err(|e| Error::InstanceLocation(e.to_string()))
+        .map_err(|e| fontir::instance::PinError::Location(e.to_string()).into())
 }
 
 /// The pin in design space, which is the space rule conditions are written in.
@@ -370,15 +303,6 @@ fn design_pin(static_metadata: &StaticMetadata, user: &UserLocation) -> DesignLo
             (axis.tag, pos.to_design(&axis.converter))
         })
         .collect()
-}
-
-fn comma_separated(items: impl Iterator<Item = String>) -> String {
-    let items: Vec<_> = items.collect();
-    if items.is_empty() {
-        "none".to_string()
-    } else {
-        items.join(", ")
-    }
 }
 
 /// Drop the name records that only fvar and STAT were ever going to reference.
@@ -516,7 +440,10 @@ mod tests {
         static_metadata: &StaticMetadata,
         spec: &InstanceSpec,
     ) -> Result<NormalizedLocation, Error> {
-        normalize(static_metadata, &resolve_user(static_metadata, spec)?)
+        normalize(
+            static_metadata,
+            &instance::resolve_user(static_metadata, spec)?,
+        )
     }
 
     #[test]
@@ -571,6 +498,7 @@ mod tests {
             name: "Bold".to_string(),
             postscript_name: None,
             location: vec![(WGHT, UserCoord::new(700.0)), (WDTH, UserCoord::new(100.0))].into(),
+            ..Default::default()
         }];
 
         let resolved = resolve(&meta, &spec("Bold")).unwrap();
@@ -611,6 +539,7 @@ mod tests {
             name: "Bold".to_string(),
             postscript_name: None,
             location: vec![(WGHT, UserCoord::new(700.0)), (WDTH, UserCoord::new(100.0))].into(),
+            ..Default::default()
         }];
 
         let e = resolve(&meta, &spec("Boldish")).unwrap_err();
@@ -631,6 +560,7 @@ mod tests {
             name: "Bold".to_string(),
             postscript_name: Some("Test-Bold".to_string()),
             location: vec![(WGHT, UserCoord::new(700.0)), (WDTH, UserCoord::new(100.0))].into(),
+            ..Default::default()
         }];
         // re-run the constructor so the axis/instance names get minted
         let meta = StaticMetadata::new(

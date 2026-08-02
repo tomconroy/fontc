@@ -52,21 +52,24 @@ use std::{
 
 use fontdrasil::{
     coords::{DesignLocation, NormalizedLocation, UserCoord, UserLocation},
-    types::{Axes, GlyphName},
+    types::{Axes, GlyphName, WidthClass},
     variations::{DeltaError, VariationModel},
 };
 use kurbo::Point;
 use ordered_float::OrderedFloat;
 use serde::{Deserialize, Serialize};
 use smol_str::SmolStr;
-use write_fonts::types::{InvalidTag, Tag};
+use write_fonts::{
+    tables::os2::SelectionFlags,
+    types::{InvalidTag, NameId, Tag},
+};
 
 use crate::{
     error::{BadGlyph, Error},
     ir::{
         Anchor, Condition, GlobalMetrics, GlobalMetricsBuilder, Glyph, GlyphAnchors, GlyphInstance,
-        KernGroup, KernPair, KernSide, KerningInstance, PostscriptSettings, Rule, StaticMetadata,
-        VariableFeature,
+        KernGroup, KernPair, KernSide, KerningInstance, NameBuilder, NameKey, NamedInstance,
+        PostscriptSettings, Rule, StaticMetadata, StyleMapStyle, VariableFeature,
     },
 };
 
@@ -154,6 +157,149 @@ impl FromStr for InstanceSpec {
         }
         Ok(InstanceSpec::Location(coords.into()))
     }
+}
+
+/// Why an [`InstanceSpec`] doesn't name a position this source has.
+///
+/// The wording is load-bearing: ttx_diff and fontc_crater classify a source
+/// they cannot compare by matching on it, the way they already do for
+/// "--flavor otf requires a static source".
+#[derive(Debug, thiserror::Error)]
+pub enum PinError {
+    #[error("--instance requires a variable source; this source has no variable axes")]
+    RequiresVariableSource,
+    #[error("--instance does not know axis '{tag}'; this source has {available}")]
+    UnknownAxis { tag: Tag, available: String },
+    #[error("--instance puts '{tag}' at {pos}, outside its range {min}..={max}")]
+    AxisOutOfRange {
+        tag: Tag,
+        pos: f64,
+        min: f64,
+        max: f64,
+    },
+    #[error("--instance does not know an instance named '{name}'; this source has {available}")]
+    UnknownInstance { name: String, available: String },
+    #[error("--instance cannot resolve that location: {0}")]
+    Location(String),
+}
+
+/// The user-space location `spec` names, on every axis, or why it names none.
+///
+/// Axes the user didn't mention take their default, so the result is a
+/// complete location and not the subset that was asked for.
+///
+/// Lives here rather than beside the CLI because both the pin barrier and the
+/// global metrics work need the answer, and the metrics work runs long before
+/// the barrier — see [`GlobalMetricsBuilder::build_pinned`].
+pub fn resolve_user(
+    static_metadata: &StaticMetadata,
+    spec: &InstanceSpec,
+) -> Result<UserLocation, PinError> {
+    // fontc's universal "this is static" test. Point axes are fine: fontmake
+    // pins a single-master designspace without complaint, and only rejects
+    // `-i` outright for bare UFO input.
+    if static_metadata.axes.is_empty() {
+        return Err(PinError::RequiresVariableSource);
+    }
+
+    let asked_for = match spec {
+        InstanceSpec::Named(name) => static_metadata
+            .named_instances
+            .iter()
+            .find(|instance| instance.name == *name)
+            .ok_or_else(|| PinError::UnknownInstance {
+                name: name.clone(),
+                available: comma_separated(
+                    static_metadata
+                        .named_instances
+                        .iter()
+                        .map(|instance| instance.name.clone()),
+                ),
+            })?
+            .location
+            .clone(),
+        InstanceSpec::Location(location) => {
+            for (tag, pos) in location.iter() {
+                let Some(axis) = static_metadata.axes.get(tag) else {
+                    return Err(PinError::UnknownAxis {
+                        tag: *tag,
+                        available: comma_separated(
+                            static_metadata.axes.iter().map(|axis| axis.tag.to_string()),
+                        ),
+                    });
+                };
+                // deliberately not clamped: a silently moved pin is worse than
+                // a rejected one
+                if *pos < axis.min || *pos > axis.max {
+                    return Err(PinError::AxisOutOfRange {
+                        tag: *tag,
+                        pos: pos.to_f64(),
+                        min: axis.min.to_f64(),
+                        max: axis.max.to_f64(),
+                    });
+                }
+            }
+            location.clone()
+        }
+    };
+
+    // an axis nobody mentioned sits at its default
+    Ok(static_metadata
+        .axes
+        .iter()
+        .map(|axis| (axis.tag, asked_for.get(axis.tag).unwrap_or(axis.default)))
+        .collect())
+}
+
+/// Where `spec` puts us in normalized space, which is how the IR keys everything.
+///
+/// The conversion runs through the source's own axis mapping (what becomes
+/// `avar`), which is the same normalization `fontmake -i` applies to a
+/// designspace `<instance>`'s location for any strictly monotonic map.
+pub fn resolve(
+    static_metadata: &StaticMetadata,
+    spec: &InstanceSpec,
+) -> Result<NormalizedLocation, PinError> {
+    resolve_user(static_metadata, spec)?
+        .to_normalized(&static_metadata.axes)
+        .map_err(|e| PinError::Location(e.to_string()))
+}
+
+fn comma_separated(items: impl Iterator<Item = String>) -> String {
+    let items: Vec<_> = items.collect();
+    if items.is_empty() {
+        "none".to_string()
+    } else {
+        items.join(", ")
+    }
+}
+
+/// Finish a frontend's [`GlobalMetricsBuilder`], pinned if we're building an instance.
+///
+/// The one pin that cannot wait for the pin barrier: what `fontmake -i`
+/// interpolates is the *unrounded* master values, and
+/// [`GlobalMetricsBuilder::build`] rounds them on the way in. So the frontend
+/// asks here, while it still has them. Every other pin runs later, on published
+/// IR.
+///
+/// `instance` is [`Context::instance`](crate::orchestration::Context::instance).
+/// A spec that doesn't resolve is not this work's business to report — the pin
+/// barrier says the same thing with the same words, and stops the build — but
+/// there is no sensible metrics to publish either, so it errors.
+pub fn build_global_metrics(
+    builder: GlobalMetricsBuilder,
+    static_metadata: &StaticMetadata,
+    instance: Option<&InstanceSpec>,
+) -> Result<GlobalMetrics, Error> {
+    let Some(spec) = instance else {
+        return builder.build(&static_metadata.axes);
+    };
+    let pin = resolve(static_metadata, spec)?;
+    builder.build_pinned(
+        &static_metadata.axes,
+        &pin,
+        static_metadata.default_location(),
+    )
 }
 
 /// The model to interpolate `glyph` with.
@@ -726,14 +872,20 @@ pub fn pin_postscript(
         stem_snap_v: list(|ps| &ps.stem_snap_v),
         // copied from the default master, not interpolated
         force_bold: static_metadata.postscript_default().force_bold,
-        // Derived, in fontMath, from the *interpolated* OS/2 weight class, which
-        // is why an instance's CFF `Weight` and its `OS/2.usWeightClass` can
-        // legitimately disagree. IR has one `misc.us_weight_class` for the whole
-        // font rather than one per master, so there is nothing here to
-        // interpolate; this waits on the commit that makes the OS/2 classes
-        // instance-aware. Absent is at least what fontmake produces for a pin
-        // that lands on a master, where no math runs and `postscriptWeightName`
-        // is never set.
+        // fontMath derives `postscriptWeightName` — the CFF `Weight` operator —
+        // from the *interpolated* `openTypeOS2WeightClass`, which is not the
+        // one that reaches OS/2: glyphsLib overwrites that from the axis
+        // afterwards, so the two legitimately disagree. IR keeps one
+        // `misc.us_weight_class`, the default master's, and no per-master
+        // weight classes, so there is nothing here to interpolate — and
+        // deriving from the default master's class would be *wrong* wherever
+        // the masters disagree, which for a weight axis is always. Absent is
+        // right for the exact-master pins, where no math runs and fontMath
+        // never sets the attribute; a non-master pin loses a CFF operator that
+        // neither master had. Fixing it needs per-master OS/2 weight classes
+        // in IR.
+        //
+        // <https://github.com/robotools/fontMath/blob/0.10.0/Lib/fontMath/mathInfo.py#L154-L169>
         weight_name: None,
         full_name: None,
         default_width_x: number(|ps| ps.default_width_x),
@@ -785,34 +937,6 @@ fn accumulate_list(
     }
 }
 
-/// Global metrics evaluated at `pin` and re-published as a static space.
-///
-/// Every metric the input defines gets an entry, because `GlobalMetrics::deltas`
-/// assumes the map is complete.
-///
-/// Note this is the one pin that is not unrounded, and cannot be:
-/// [`GlobalMetricsBuilder::build`] rounds each master value before computing
-/// deltas (deliberately, so that instancing a *variable* font at a master
-/// matches building that master), so by the time [`GlobalMetrics`] exists the
-/// unrounded master values are gone. What we interpolate is therefore
-/// `interp(round(master))` where fontmake computes `round(interp(master))`,
-/// and re-publishing through the builder rounds the result again. That second
-/// round costs nothing today — every consumer `ot_round`s the value it reads,
-/// and `ot_round` is idempotent — but the first one can be off by a unit.
-/// Interpolating the builder's unrounded values instead is a separate change.
-pub fn pin_global_metrics(
-    static_metadata: &StaticMetadata,
-    metrics: &GlobalMetrics,
-    pin: &NormalizedLocation,
-) -> Result<GlobalMetrics, Error> {
-    let key = static_metadata.default_location();
-    let mut builder = GlobalMetricsBuilder::new();
-    for (metric, _) in metrics.iter() {
-        builder.set(*metric, key.clone(), metrics.get(*metric, pin));
-    }
-    builder.build(&Axes::default())
-}
-
 /// `static_metadata` rewritten as the static metadata of the instance at `pin`.
 ///
 /// Axes are emptied — `axes.is_empty()` is fontc's universal "this is a static
@@ -820,6 +944,10 @@ pub fn pin_global_metrics(
 /// location. `all_source_axes` and the private default location are left alone:
 /// they are what the pinned keys are built from, and the frontends that read
 /// `all_source_axes` have already run.
+///
+/// `user_pin` is the same position in user space, which is what the OS/2
+/// classes are read off, and `instance` is the named instance the pin lands on
+/// if it lands on one — see [`named_instance_at`].
 ///
 /// What this deliberately does *not* do, because it belongs to the caller:
 ///
@@ -829,15 +957,16 @@ pub fn pin_global_metrics(
 ///   `axes` is empty.
 /// - Name records >= 256 minted for axis labels and named instances are left in
 ///   place; with fvar and STAT skipped they are orphans and want pruning.
-/// - `misc.us_weight_class`/`us_width_class`, `selection_flags` and the name
-///   table still describe the family, not the instance. Until they don't,
-///   [`pin_postscript`] cannot derive `weight_name` either — fontMath reads it
-///   off the interpolated OS/2 weight class.
 /// - `italic_angle` is a single scalar taken from the default master, so an
 ///   instance on a `slnt`/`ital` axis gets the wrong `post.italicAngle`.
+///   ufo2ft's own `italicAngle = clamp(slnt_user, -90, 90)` derivation is live
+///   under `fontmake -i`, so this is a real gap; it needs a per-master italic
+///   angle in IR, which is a change of its own.
 pub fn pin_static_metadata(
     static_metadata: &StaticMetadata,
     pin: &NormalizedLocation,
+    user_pin: &UserLocation,
+    instance: Option<&NamedInstance>,
 ) -> Result<StaticMetadata, DeltaError> {
     let key = static_metadata.default_location().clone();
     let number_values = pin_number_values(static_metadata, pin)?;
@@ -852,7 +981,227 @@ pub fn pin_static_metadata(
     pinned.number_values = number_values;
     pinned.postscript = postscript;
     pinned.variations = None;
+
+    if let Some(instance) = instance {
+        pinned.names = pin_names(static_metadata, instance);
+        pinned.misc.selection_flags = pin_selection_flags(static_metadata, instance);
+    }
+    pin_os2_classes(&mut pinned, &static_metadata.axes, user_pin);
+    pin_instance_fontinfo(&mut pinned, static_metadata);
+
     Ok(pinned)
+}
+
+/// The named instance `pin` builds, if the source has one there.
+///
+/// `fontmake -i` only ever builds a *named* instance, so this is the case that
+/// matters; a pin at an arbitrary location has no style name, no style linking
+/// and no PostScript name, and keeps the family's.
+///
+/// Matching is by resolved normalized location, not by user coordinates: two
+/// ways of writing the same position — an axis left out and an axis given its
+/// default — have to name the same instance.
+///
+/// A `--instance` that named an instance outright wins over the location
+/// match, and it is the only way to be unambiguous: several instances may sit
+/// at one location (a family that ships "Regular" and "Book" at the same
+/// weight, say) and a location pin then picks the first in source order. There
+/// is nothing better to pick — a location does not say which name was meant —
+/// so a caller that cares should pass the name.
+pub fn named_instance_at<'a>(
+    static_metadata: &'a StaticMetadata,
+    spec: &InstanceSpec,
+    pin: &NormalizedLocation,
+) -> Option<&'a NamedInstance> {
+    let by_name = match spec {
+        InstanceSpec::Named(name) => static_metadata
+            .named_instances
+            .iter()
+            .find(|instance| instance.name == *name),
+        InstanceSpec::Location(..) => None,
+    };
+    by_name.or_else(|| {
+        static_metadata.named_instances.iter().find(|instance| {
+            resolve(static_metadata, &InstanceSpec::Named(instance.name.clone()))
+                .is_ok_and(|at| at == *pin)
+        })
+    })
+}
+
+/// The name table of the instance, as ufo2ft would build it from its UFO.
+///
+/// Every name id the compiler *derives* is rebuilt, because the instance UFO
+/// does not inherit any of them: `openTypeNamePreferredFamilyName`,
+/// `...SubfamilyName`, `styleMapFamilyName`, `styleMapStyleName`, `styleName`,
+/// `postscriptFontName` and `openTypeNameUniqueID` are all on the
+/// deliberately-not-copied list, so ids 1, 2, 3, 4, 6, 16 and 17 come from the
+/// `<instance>` and from ufo2ft's fallbacks alone. Everything else — copyright,
+/// version, designer, licence, the arbitrary `openTypeNameRecords` — is on the
+/// copy whitelist and passes through.
+///
+/// Two ids that are *not* on the whitelist and so are dropped rather than
+/// rebuilt: 18 `openTypeNameCompatibleFullName` and 21/22, the WWS names.
+///
+/// Non-English records are left exactly as they are. For a UFO source they came
+/// from `openTypeNameRecords`, which the instance keeps and which override the
+/// computed records anyway; [`NameBuilder`] only ever writes English ones.
+///
+/// <https://github.com/googlefonts/ufo2ft/blob/main/Lib/ufo2ft/instantiator.py#L108-L180>
+/// <https://github.com/googlefonts/ufo2ft/blob/main/Lib/ufo2ft/outlineCompiler.py#L387-L464>
+fn pin_names(
+    static_metadata: &StaticMetadata,
+    instance: &NamedInstance,
+) -> HashMap<NameKey, String> {
+    /// Derived from the instance, so never inherited.
+    const REBUILT: [NameId; 7] = [
+        NameId::FAMILY_NAME,
+        NameId::SUBFAMILY_NAME,
+        NameId::UNIQUE_ID,
+        NameId::FULL_NAME,
+        NameId::POSTSCRIPT_NAME,
+        NameId::TYPOGRAPHIC_FAMILY_NAME,
+        NameId::TYPOGRAPHIC_SUBFAMILY_NAME,
+    ];
+    /// Instance-specific and not on ufo2ft's copy whitelist: simply lost.
+    const DROPPED: [NameId; 3] = [
+        NameId::COMPATIBLE_FULL_NAME,
+        NameId::WWS_FAMILY_NAME,
+        NameId::WWS_SUBFAMILY_NAME,
+    ];
+    const ENGLISH: u16 = 0x409;
+
+    let mut builder = NameBuilder::default();
+    builder.set_version(
+        static_metadata.misc.version_major,
+        static_metadata.misc.version_minor,
+    );
+    let mut kept: Vec<(&NameKey, &String)> = static_metadata
+        .names
+        .iter()
+        .filter(|(key, _)| key.lang_id == ENGLISH)
+        .filter(|(key, _)| !REBUILT.contains(&key.name_id) && !DROPPED.contains(&key.name_id))
+        .collect();
+    // HashMap order would otherwise decide which of two records sharing a name
+    // id survives NameBuilder's one-key-per-id map
+    kept.sort_by_key(|(key, _)| **key);
+    for (key, value) in kept {
+        builder.add(key.name_id, value.clone());
+    }
+
+    // ID 16 <- the instance UFO's familyName, ID 17 <- its styleName. Neither
+    // "preferred" name is inherited, so the fallback chain always lands here.
+    if let Some(family_name) = instance.family_name.as_ref() {
+        builder.add(NameId::TYPOGRAPHIC_FAMILY_NAME, family_name.clone());
+    }
+    builder.add(NameId::TYPOGRAPHIC_SUBFAMILY_NAME, instance.name.clone());
+    // ID 1 and 2, when the source states them. When it doesn't, NameBuilder's
+    // RIBBI fallback is already ufo2ft's `styleMapFamilyNameFallback` /
+    // `styleMapStyleNameFallback`.
+    if let Some(style_map_family_name) = instance.style_map_family_name.as_ref() {
+        builder.add(NameId::FAMILY_NAME, style_map_family_name.clone());
+    }
+    if let Some(style) = instance.style_map_style_name {
+        builder.add(NameId::SUBFAMILY_NAME, style.to_name().to_string());
+    }
+    if let Some(postscript_name) = instance.postscript_name.as_ref() {
+        builder.add(NameId::POSTSCRIPT_NAME, postscript_name.clone());
+    }
+
+    // `Tag` pads a short vendor id out to four bytes, but name id 3's fallback
+    // reads the raw `openTypeOS2VendorID`; only `achVendID` is `ljust`ed
+    let vendor_id = static_metadata.misc.vendor_id.to_string();
+    let mut names = builder.build(vendor_id.trim_end());
+    names.extend(
+        static_metadata
+            .names
+            .iter()
+            .filter(|(key, _)| key.lang_id != ENGLISH)
+            .map(|(key, value)| (*key, value.clone())),
+    );
+    names
+}
+
+/// `fsSelection` for the instance, which is also where `head.macStyle` comes from.
+///
+/// ufo2ft unions whatever `openTypeOS2Selection` says with exactly one of
+/// regular / bold / italic / bold-italic, chosen by `styleMapStyleName`; and it
+/// builds macStyle from `styleMapStyleName` alone. IR keeps one set of flags
+/// for both, so the RIBBI three are replaced and the rest — USE_TYPO_METRICS,
+/// WWS, OBLIQUE, the legacy bits — are kept. A source that put a RIBBI bit in
+/// `openTypeOS2Selection` explicitly loses it, which is the price of not
+/// keeping the two apart in IR; the family's own style linking would have set
+/// the same bit for the default instance anyway.
+///
+/// With no `styleMapStyleName` the fallback is ufo2ft's: the style name if it
+/// is one of the four, else regular.
+///
+/// <https://github.com/googlefonts/ufo2ft/blob/main/Lib/ufo2ft/outlineCompiler.py#L714-L725>
+/// <https://github.com/googlefonts/ufo2ft/blob/main/Lib/ufo2ft/outlineCompiler.py#L365-L374>
+fn pin_selection_flags(
+    static_metadata: &StaticMetadata,
+    instance: &NamedInstance,
+) -> SelectionFlags {
+    let ribbi = SelectionFlags::REGULAR | SelectionFlags::BOLD | SelectionFlags::ITALIC;
+    let style = instance
+        .style_map_style_name
+        .or_else(|| StyleMapStyle::parse(&instance.name))
+        .unwrap_or(StyleMapStyle::Regular);
+    (static_metadata.misc.selection_flags - ribbi) | style.selection_flags()
+}
+
+/// `usWeightClass` and `usWidthClass` from where the pin is in *user* space.
+///
+/// glyphsLib's `apply_instance_data_to_ufo`, which fontmake runs over every
+/// instance it interpolates — for `.designspace` sources as much as for
+/// `.glyphs` ones — sets both unconditionally whenever the axis exists,
+/// overriding what the masters interpolated and even an explicit
+/// `public.fontInfo` override. Only when the axis is *absent* does the
+/// interpolated value stand, which is what leaving `misc` alone does here.
+///
+/// The weight class is `int(user)`: truncation toward zero, not rounding, so
+/// an instance at user 442.857 is class **442**. There is no clamp either.
+/// The width class is the nearest of the nine standard percentages with ties
+/// going to the lower class, which is what [`WidthClass::nearest`] does.
+///
+/// <https://github.com/googlefonts/glyphsLib/blob/main/Lib/glyphsLib/builder/axes.py#L85-L103>
+/// <https://github.com/googlefonts/glyphsLib/blob/main/Lib/glyphsLib/builder/instances.py#L454-L470>
+fn pin_os2_classes(pinned: &mut StaticMetadata, axes: &Axes, user_pin: &UserLocation) {
+    let user_at = |tag: Tag| {
+        axes.get(&tag)
+            .map(|axis| user_pin.get(tag).unwrap_or(axis.default).to_f64())
+    };
+    if let Some(weight) = user_at(Tag::new(b"wght")) {
+        pinned.misc.us_weight_class = Some(weight.trunc().clamp(0.0, u16::MAX as f64) as u16);
+    }
+    if let Some(width) = user_at(Tag::new(b"wdth")) {
+        pinned.misc.us_width_class = Some(WidthClass::nearest(width) as u16);
+    }
+}
+
+/// The fontinfo an interpolated instance loses, and what fills the gaps.
+///
+/// An instance UFO inherits only what is on ufo2ft's copy whitelist, and then
+/// glyphsLib's `apply_instance_data_to_ufo` fills three of the holes with
+/// *Glyphs.app's* defaults rather than ufo2ft's. Both happen for
+/// `.designspace` sources too — fontmake calls glyphsLib on the instances it
+/// interpolates whatever the source was — and neither happens for an ordinary
+/// build, so this is `--instance` only.
+///
+/// - **PANOSE** is merged across the masters rather than copied, see
+///   [`MiscMetadata::instance_panose`].
+/// - **`fsType`** defaults to Glyphs.app's `[3]` (editable embedding) instead
+///   of ufo2ft's `[2]` (preview and print). A `.glyphs` source already carries
+///   `[3]` from glyphsLib, so this only moves UFO sources.
+/// - **`postscriptUnderlinePosition` / `Thickness`** default to Glyphs.app's
+///   flat -100 and 50 instead of ufo2ft's `upem * -0.075` and `upem * 0.05` —
+///   the same numbers at 1000 upem and different at any other. Those two are
+///   [`GlobalMetric`]s rather than static metadata, so they are handled where
+///   the metrics are pinned, in [`GlobalMetricsBuilder::build_pinned`].
+///
+/// <https://github.com/googlefonts/glyphsLib/blob/main/Lib/glyphsLib/builder/custom_params.py#L1161-L1181>
+fn pin_instance_fontinfo(pinned: &mut StaticMetadata, static_metadata: &StaticMetadata) {
+    pinned.misc.panose = static_metadata.misc.instance_panose.clone();
+    pinned.misc.fs_type = Some(static_metadata.misc.fs_type.unwrap_or(1 << 3));
 }
 
 #[cfg(test)]
@@ -907,6 +1256,11 @@ mod tests {
 
     fn mid() -> NormalizedLocation {
         at(0.5)
+    }
+
+    /// [`mid`] in user space: `wght` runs 400..700, unmapped.
+    fn user_mid() -> UserLocation {
+        vec![(WGHT, UserCoord::new(550.0))].into()
     }
 
     fn test_static_metadata_at(locations: HashSet<NormalizedLocation>) -> StaticMetadata {
@@ -1427,26 +1781,168 @@ mod tests {
         assert_eq!(values.get("crossbar"), Some(&OrderedFloat(4.0)));
     }
 
+    /// Two masters, one of each formatter class, pinned at the midpoint.
+    ///
+    /// The x-height is the discriminator: it is a `_numberFormatter`
+    /// attribute, so 505.5 has to *stay* 505.5. The old pin, which read an
+    /// already-built (and therefore already-rounded) `GlobalMetrics`, gave 506
+    /// — and, worse, fed 506 to the strikeout-position fallback.
     #[test]
-    fn pin_global_metrics_midpoint() {
+    fn build_pinned_midpoint_rounds_per_attribute() {
         let meta = test_static_metadata();
+        let axes = Axes::new(vec![wght()]);
         let mut builder = GlobalMetricsBuilder::new();
         for (loc, x_height, ascender) in [(regular(), 500.0, 700.0), (bold(), 511.0, 700.0)] {
             builder.populate_defaults(&loc, 1000, Some(x_height), Some(ascender), None, None);
         }
-        let metrics = builder.build(&Axes::new(vec![wght()])).unwrap();
 
-        let pinned = pin_global_metrics(&meta, &metrics, &mid()).unwrap();
+        let pinned = builder
+            .build_pinned(&axes, &mid(), meta.default_location())
+            .unwrap();
 
-        // every metric the input had, so GlobalMetrics::deltas can't panic
-        assert_eq!(pinned.iter().count(), metrics.iter().count());
         let at = pinned.at(meta.default_location());
-        // the metric really is evaluated at the pin, not at a master; 505.5 is
-        // rounded on the way back in, see the fn docs
-        assert_eq!(at.x_height, OrderedFloat(506.0));
+        // _numberFormatter: unrounded
+        assert_eq!(at.x_height, OrderedFloat(505.5));
         assert_eq!(at.ascender, OrderedFloat(700.0));
+        // _integerFormatter, and the reason the line above matters. ufo2ft
+        // computes yStrikeoutPosition as otRound(0.6 * xHeight) on the
+        // *instance*: 0.6 * 505.5 = 303.3 -> 303. Rounding the masters first
+        // gives otRound(0.6 * 500) = 300 and otRound(0.6 * 511) = 307, whose
+        // midpoint 303.5 rounds to 304.
+        assert_eq!(at.strikeout_position, OrderedFloat(303.0));
         // and the pinned space really is static: same answer anywhere
         assert_eq!(pinned.get(GlobalMetric::XHeight, &bold()), at.x_height);
+        // `at` reads every metric, so reaching here says the map is complete;
+        // `GlobalMetrics::deltas` unwraps and would have panicked otherwise
+        assert!(pinned.iter().count() > 30);
+    }
+
+    /// Every formatter class, against numbers `fontmake -i` actually produced.
+    ///
+    /// Fixture `BlueMatch.designspace` (masters `k = 0` and `k = 101`, so every
+    /// value is `base + 50.5` at the midpoint) built with fontmake 3.12.1 as
+    /// `fontmake -m BlueMatch.designspace -i`, and read out of the generated
+    /// `BlueMatch-Mid.ufo`'s fontinfo.plist. `-250` rather than `-251` is
+    /// otRound being `floor(v + 0.5)`, i.e. half toward *positive* infinity
+    /// rather than away from zero.
+    #[test]
+    fn build_pinned_matches_fontmake_per_formatter() {
+        let meta = test_static_metadata();
+        let axes = Axes::new(vec![wght()]);
+        let mut builder = GlobalMetricsBuilder::new();
+        for (loc, k) in [(regular(), 0.0), (bold(), 101.0)] {
+            for (metric, base) in [
+                // _integerFormatter
+                (GlobalMetric::Os2TypoAscender, 800.0),
+                (GlobalMetric::Os2TypoDescender, -200.0 - 2.0 * k),
+                (GlobalMetric::Os2TypoLineGap, 0.0),
+                (GlobalMetric::HheaDescender, -250.0 - 2.0 * k),
+                (GlobalMetric::SubscriptYOffset, 75.0),
+                // _nonNegativeIntegerFormatter
+                (GlobalMetric::Os2WinAscent, 1000.0),
+                // _numberFormatter
+                (GlobalMetric::CapHeight, 700.0),
+                (GlobalMetric::UnderlinePosition, -100.0 - 2.0 * k),
+                (GlobalMetric::UnderlineThickness, 50.0),
+            ] {
+                builder.set(metric, loc.clone(), base + k);
+            }
+            builder.populate_defaults(&loc, 1000, Some(500.0 + k), Some(800.0 + k), None, None);
+        }
+
+        let pinned = builder
+            .build_pinned(&axes, &mid(), meta.default_location())
+            .unwrap();
+        let at = pinned.at(meta.default_location());
+
+        // integers, otRounded once
+        assert_eq!(at.os2_typo_ascender, OrderedFloat(851.0)); // 850.5
+        assert_eq!(at.os2_typo_descender, OrderedFloat(-250.0)); // -250.5
+        assert_eq!(at.os2_typo_line_gap, OrderedFloat(51.0)); // 50.5
+        assert_eq!(at.hhea_descender, OrderedFloat(-300.0)); // -300.5
+        assert_eq!(at.subscript_y_offset, OrderedFloat(126.0)); // 125.5
+        assert_eq!(at.os2_win_ascent, OrderedFloat(1051.0)); // 1050.5
+        // reals, kept
+        assert_eq!(at.ascender, OrderedFloat(850.5));
+        assert_eq!(at.cap_height, OrderedFloat(750.5));
+        assert_eq!(at.x_height, OrderedFloat(550.5));
+        assert_eq!(at.underline_position, OrderedFloat(-150.5));
+        assert_eq!(at.underline_thickness, OrderedFloat(100.5));
+    }
+
+    /// A pin that lands on a master is that master, exactly.
+    #[test]
+    fn build_pinned_at_a_master_is_that_master() {
+        let meta = test_static_metadata();
+        let axes = Axes::new(vec![wght()]);
+        let mut builder = GlobalMetricsBuilder::new();
+        for (loc, x_height) in [(regular(), 500.5), (bold(), 511.25)] {
+            builder.set(GlobalMetric::Os2TypoAscender, loc.clone(), 800.0);
+            builder.populate_defaults(&loc, 1000, Some(x_height), None, None, None);
+        }
+
+        let pinned = builder
+            .build_pinned(&axes, &bold(), meta.default_location())
+            .unwrap();
+
+        let at = pinned.at(meta.default_location());
+        assert_eq!(at.x_height, OrderedFloat(511.25));
+        assert_eq!(at.os2_typo_ascender, OrderedFloat(800.0));
+    }
+
+    /// A metric only one master states is an un-normalised partial sum.
+    ///
+    /// fontMath's `_processMathOne` treats a missing term as the identity, not
+    /// as a zero-weighted contribution, so the masters that *do* state an
+    /// attribute are simply scaled and added — and their scalars no longer sum
+    /// to one. Measured with fontmake 3.12.1: `openTypeHheaAscender = 900` in
+    /// the default master and unset in the other gives **450** at the midpoint.
+    ///
+    /// A metric *no* master states falls back to the densified per-master
+    /// values, which is our stand-in for the fallback ufo2ft would compute on
+    /// the instance UFO.
+    #[test]
+    fn build_pinned_partial_declaration_is_a_partial_sum() {
+        let meta = test_static_metadata();
+        let axes = Axes::new(vec![wght()]);
+        let mut builder = GlobalMetricsBuilder::new();
+        builder.set(GlobalMetric::HheaAscender, regular(), 900.0);
+        for loc in [regular(), bold()] {
+            builder.populate_defaults(&loc, 1000, None, Some(800.0), None, None);
+        }
+
+        let pinned = builder
+            .build_pinned(&axes, &mid(), meta.default_location())
+            .unwrap();
+
+        let at = pinned.at(meta.default_location());
+        assert_eq!(at.hhea_ascender, OrderedFloat(450.0));
+        // nobody stated the line gap, so it interpolates over every master
+        assert_eq!(at.hhea_line_gap, OrderedFloat(0.0));
+        assert_eq!(at.ascender, OrderedFloat(800.0));
+    }
+
+    /// The pin reaches no master that stated the metric: fall back, don't zero.
+    #[test]
+    fn build_pinned_undeclared_at_the_pin_falls_back() {
+        let meta = test_static_metadata();
+        let axes = Axes::new(vec![wght()]);
+        let mut builder = GlobalMetricsBuilder::new();
+        // stated only by the master the pin does *not* reach
+        builder.set(GlobalMetric::HheaAscender, regular(), 900.0);
+        for loc in [regular(), bold()] {
+            builder.populate_defaults(&loc, 1000, None, Some(770.0), None, None);
+        }
+
+        let pinned = builder
+            .build_pinned(&axes, &bold(), meta.default_location())
+            .unwrap();
+
+        // 770 + the computed typo line gap (1200 - 770 - 200 = 230), not 0
+        assert_eq!(
+            pinned.at(meta.default_location()).hhea_ascender,
+            OrderedFloat(1000.0)
+        );
     }
 
     #[test]
@@ -1456,9 +1952,10 @@ mod tests {
             name: "Bold".to_string(),
             postscript_name: None,
             location: vec![(WGHT, UserCoord::new(700.0))].into(),
+            ..Default::default()
         }];
 
-        let pinned = pin_static_metadata(&meta, &mid()).unwrap();
+        let pinned = pin_static_metadata(&meta, &mid(), &user_mid(), None).unwrap();
 
         assert!(pinned.axes.is_empty(), "axes.is_empty() means static");
         assert!(pinned.named_instances.is_empty());
@@ -1479,6 +1976,252 @@ mod tests {
             vec![WGHT]
         );
         assert_eq!(pinned.units_per_em, meta.units_per_em);
+    }
+
+    /// `usWeightClass` truncates the user coordinate; it does not round it.
+    ///
+    /// glyphsLib's `user_loc_value_to_class` is `int(user_loc)`. Measured with
+    /// fontmake 3.12.1 on a fixture whose `wght` map is `[(100, 0), (900, 7)]`
+    /// with the instance at design 3, i.e. user 442.857...: the instance's
+    /// `usWeightClass` is **442**, where otRound would have said 443.
+    #[test]
+    fn pin_weight_class_truncates() {
+        let mut meta = test_static_metadata();
+        // the fixture's axis, so that user 442.857 is inside it
+        meta.axes = Axes::new(vec![Axis {
+            min: UserCoord::new(100.0),
+            default: UserCoord::new(100.0),
+            max: UserCoord::new(900.0),
+            converter: fontdrasil::coords::CoordConverter::unmapped(
+                UserCoord::new(100.0),
+                UserCoord::new(100.0),
+                UserCoord::new(900.0),
+            ),
+            ..wght()
+        }]);
+
+        for (user, class) in [(442.857, 442), (443.0, 443), (899.999, 899), (100.0, 100)] {
+            let mut pinned = meta.clone();
+            pin_os2_classes(
+                &mut pinned,
+                &meta.axes,
+                &vec![(WGHT, UserCoord::new(user))].into(),
+            );
+            assert_eq!(pinned.misc.us_weight_class, Some(class), "wght={user}");
+        }
+    }
+
+    /// `usWidthClass` is the nearest of the nine, and a tie goes to the lower.
+    ///
+    /// Measured with fontmake 3.12.1: an instance at user width **106.25**,
+    /// exactly between class 5 (100%) and class 6 (112.5%), comes out class
+    /// **5**. The instantiator's own piecewise-linear formula — which
+    /// glyphsLib overrides — would have said 6.
+    #[test]
+    fn pin_width_class_breaks_ties_low() {
+        const WDTH: Tag = Tag::new(b"wdth");
+        let mut meta = test_static_metadata();
+        let wdth = Axis {
+            name: "Width".to_string(),
+            tag: WDTH,
+            min: UserCoord::new(50.0),
+            default: UserCoord::new(100.0),
+            max: UserCoord::new(200.0),
+            hidden: false,
+            converter: fontdrasil::coords::CoordConverter::unmapped(
+                UserCoord::new(50.0),
+                UserCoord::new(100.0),
+                UserCoord::new(200.0),
+            ),
+            localized_names: Default::default(),
+        };
+        meta.axes = Axes::new(vec![wdth]);
+
+        for (user, class) in [
+            (106.25, 5),
+            (106.26, 6),
+            (100.0, 5),
+            (68.75, 2),
+            (200.0, 9),
+            (50.0, 1),
+        ] {
+            let mut pinned = meta.clone();
+            pin_os2_classes(
+                &mut pinned,
+                &meta.axes,
+                &vec![(WDTH, UserCoord::new(user))].into(),
+            );
+            assert_eq!(pinned.misc.us_width_class, Some(class), "wdth={user}");
+        }
+    }
+
+    /// An axis the source doesn't have leaves the interpolated class alone.
+    #[test]
+    fn pin_classes_only_where_there_is_an_axis() {
+        let mut meta = test_static_metadata();
+        meta.misc.us_weight_class = Some(501);
+        meta.misc.us_width_class = Some(3);
+
+        let pinned = pin_static_metadata(&meta, &mid(), &user_mid(), None).unwrap();
+
+        // there is a wght axis, so the pin decides
+        assert_eq!(pinned.misc.us_weight_class, Some(550));
+        // there is no wdth axis, so whatever the masters said stands
+        assert_eq!(pinned.misc.us_width_class, Some(3));
+    }
+
+    fn named(name: &str) -> NamedInstance {
+        NamedInstance {
+            name: name.to_string(),
+            family_name: Some("Fam".to_string()),
+            location: vec![(WGHT, UserCoord::new(550.0))].into(),
+            ..Default::default()
+        }
+    }
+
+    /// Style-linked instances put ids 1 and 2 where the source said.
+    #[test]
+    fn pin_names_uses_the_style_map_names() {
+        let mut meta = test_static_metadata();
+        meta.names = HashMap::from([
+            (NameKey::new(NameId::FAMILY_NAME, "Fam"), "Fam".to_string()),
+            (
+                NameKey::new(NameId::COPYRIGHT_NOTICE, "(c) Nobody"),
+                "(c) Nobody".to_string(),
+            ),
+        ]);
+        let instance = NamedInstance {
+            style_map_family_name: Some("Fam".to_string()),
+            style_map_style_name: Some(StyleMapStyle::BoldItalic),
+            ..named("Bold Italic")
+        };
+
+        let names = pin_names(&meta, &instance);
+
+        let get = |id: NameId| {
+            names
+                .iter()
+                .find(|(key, _)| key.name_id == id)
+                .map(|(_, v)| v.clone())
+        };
+        assert_eq!(get(NameId::FAMILY_NAME), Some("Fam".to_string()));
+        assert_eq!(get(NameId::SUBFAMILY_NAME), Some("Bold Italic".to_string()));
+        assert_eq!(get(NameId::FULL_NAME), Some("Fam Bold Italic".to_string()));
+        assert_eq!(
+            get(NameId::POSTSCRIPT_NAME),
+            Some("Fam-BoldItalic".to_string())
+        );
+        // 16 and 17 match 1 and 2, so ufo2ft drops both
+        assert_eq!(get(NameId::TYPOGRAPHIC_FAMILY_NAME), None);
+        assert_eq!(get(NameId::TYPOGRAPHIC_SUBFAMILY_NAME), None);
+        // the copy whitelist keeps this one
+        assert_eq!(
+            get(NameId::COPYRIGHT_NOTICE),
+            Some("(c) Nobody".to_string())
+        );
+
+        assert_eq!(
+            pin_selection_flags(&meta, &instance),
+            SelectionFlags::BOLD | SelectionFlags::ITALIC
+        );
+    }
+
+    /// Without style linking, the RIBBI fallback runs on the *style name*.
+    #[test]
+    fn pin_names_falls_back_for_a_non_ribbi_style() {
+        let mut meta = test_static_metadata();
+        meta.names = HashMap::from([(NameKey::new(NameId::FAMILY_NAME, "Fam"), "Fam".to_string())]);
+        // ufo2ft's OBLIQUE bit is not RIBBI and has to survive
+        meta.misc.selection_flags = SelectionFlags::REGULAR | SelectionFlags::USE_TYPO_METRICS;
+        let instance = named("SemiBold Condensed");
+
+        let names = pin_names(&meta, &instance);
+
+        let get = |id: NameId| {
+            names
+                .iter()
+                .find(|(key, _)| key.name_id == id)
+                .map(|(_, v)| v.clone())
+        };
+        assert_eq!(
+            get(NameId::FAMILY_NAME),
+            Some("Fam SemiBold Condensed".to_string())
+        );
+        assert_eq!(get(NameId::SUBFAMILY_NAME), Some("Regular".to_string()));
+        assert_eq!(
+            get(NameId::TYPOGRAPHIC_FAMILY_NAME),
+            Some("Fam".to_string())
+        );
+        assert_eq!(
+            get(NameId::TYPOGRAPHIC_SUBFAMILY_NAME),
+            Some("SemiBold Condensed".to_string())
+        );
+        assert_eq!(
+            get(NameId::FULL_NAME),
+            Some("Fam SemiBold Condensed".to_string())
+        );
+
+        assert_eq!(
+            pin_selection_flags(&meta, &instance),
+            SelectionFlags::REGULAR | SelectionFlags::USE_TYPO_METRICS
+        );
+    }
+
+    /// The instance loses what ufo2ft's copy whitelist doesn't carry.
+    #[test]
+    fn pin_drops_the_names_an_instance_cannot_inherit() {
+        let mut meta = test_static_metadata();
+        for (id, value) in [
+            (NameId::COMPATIBLE_FULL_NAME, "Fam Bold"),
+            (NameId::WWS_FAMILY_NAME, "Fam"),
+            (NameId::WWS_SUBFAMILY_NAME, "Bold"),
+            (NameId::UNIQUE_ID, "hand written"),
+        ] {
+            meta.names
+                .insert(NameKey::new(id, value), value.to_string());
+        }
+
+        let names = pin_names(&meta, &named("Bold"));
+
+        for id in [
+            NameId::COMPATIBLE_FULL_NAME,
+            NameId::WWS_FAMILY_NAME,
+            NameId::WWS_SUBFAMILY_NAME,
+        ] {
+            assert!(
+                !names.keys().any(|key| key.name_id == id),
+                "{id:?} should be gone"
+            );
+        }
+        // the unique id is rebuilt, not inherited
+        assert_eq!(
+            names
+                .iter()
+                .find(|(key, _)| key.name_id == NameId::UNIQUE_ID)
+                .map(|(_, value)| value.as_str()),
+            Some("0.000;NONE;Fam-Bold")
+        );
+    }
+
+    /// PANOSE, fsType: what the instance path replaces rather than inherits.
+    #[test]
+    fn pin_instance_only_fontinfo_fallbacks() {
+        let mut meta = test_static_metadata();
+        meta.misc.panose = Some(crate::ir::Panose::from_digits([
+            2, 11, 5, 2, 4, 5, 4, 2, 2, 4,
+        ]));
+        meta.misc.instance_panose = None; // the masters disagreed
+        meta.misc.fs_type = None; // the source said nothing
+
+        let pinned = pin_static_metadata(&meta, &mid(), &user_mid(), None).unwrap();
+
+        assert_eq!(pinned.misc.panose, None);
+        assert_eq!(pinned.misc.fs_type, Some(1 << 3));
+
+        // an explicit fsType is not overridden
+        meta.misc.fs_type = Some(0);
+        let pinned = pin_static_metadata(&meta, &mid(), &user_mid(), None).unwrap();
+        assert_eq!(pinned.misc.fs_type, Some(0));
     }
 
     /// The two masters of the `BlueMatch` fixture, whose list lengths agree.
@@ -1664,7 +2407,7 @@ mod tests {
         let mut meta = test_static_metadata();
         meta.postscript = blue_match();
 
-        let pinned = pin_static_metadata(&meta, &mid()).unwrap();
+        let pinned = pin_static_metadata(&meta, &mid(), &user_mid(), None).unwrap();
 
         assert_eq!(
             pinned.postscript.keys().collect::<Vec<_>>(),
@@ -1687,7 +2430,7 @@ mod tests {
             instance(600.0, vec![rect(0.0, 0.0, 300.0, 700.0)], Vec::new()),
         );
 
-        let pinned_meta = pin_static_metadata(&meta, &mid()).unwrap();
+        let pinned_meta = pin_static_metadata(&meta, &mid(), &user_mid(), None).unwrap();
         let pinned_glyph = pin_glyph(&meta, &glyph, &mid()).unwrap();
 
         assert!(

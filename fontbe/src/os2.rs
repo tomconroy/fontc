@@ -560,7 +560,12 @@ impl Work<Context, AnyWorkId, Error> for Os2Work {
         let mut os2 = Os2 {
             us_weight_class,
             us_width_class,
-            fs_type: static_metadata.misc.fs_type.unwrap_or_default(),
+            // ufo2ft's default for `openTypeOS2Type` is [2], "Preview & Print
+            // embedding". A `.glyphs` source never reaches this fallback:
+            // glyphsLib writes Glyphs.app's [3] into every UFO it generates,
+            // and `--instance` does the same thing at the pin.
+            // https://github.com/googlefonts/ufo2ft/blob/main/Lib/ufo2ft/fontInfoData.py#L383
+            fs_type: static_metadata.misc.fs_type.unwrap_or(1 << 2),
             ach_vend_id: static_metadata.misc.vendor_id,
             fs_selection: static_metadata.misc.selection_flags,
             x_avg_char_width: x_avg_char_width(context)?,
