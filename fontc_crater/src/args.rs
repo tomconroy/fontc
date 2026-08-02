@@ -44,9 +44,45 @@ pub(super) struct CiArgs {
     /// gftools mode (disable to reduce target count when running locally)
     #[arg(long, default_value = "true", action = clap::ArgAction::Set)]
     pub(super) gftools: bool,
+    /// Which outline flavor to build and compare: 'ttf' (glyf) or 'otf'
+    /// (static CFF, compared at fontmake's --optimize-cff 1).
+    ///
+    /// 'otf' only runs default (non-gftools) builds and expects a target list
+    /// of static sources; variable sources are reported as skipped. Use a
+    /// separate out dir and expect a separate results cache from ttf runs.
+    #[arg(long, value_enum, default_value_t)]
+    pub(super) flavor: Flavor,
     /// only generate html (for the provided out_dir)
     #[arg(long)]
     pub(super) html_only: bool,
+}
+
+/// Which outline flavor ttx_diff compiles and compares.
+#[derive(
+    Debug,
+    Default,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    serde::Serialize,
+    serde::Deserialize,
+    clap::ValueEnum,
+)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum Flavor {
+    #[default]
+    Ttf,
+    Otf,
+}
+
+impl std::fmt::Display for Flavor {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        match self {
+            Flavor::Ttf => write!(f, "ttf"),
+            Flavor::Otf => write!(f, "otf"),
+        }
+    }
 }
 
 impl CiArgs {

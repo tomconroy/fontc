@@ -7,6 +7,7 @@ use std::{
 
 use crate::{
     BuildType, Results, RunResult, Target,
+    args::Flavor,
     ci::{FontmakeOutput, ResultsCache},
 };
 
@@ -23,6 +24,7 @@ pub(super) struct TtxContext {
     pub normalizer_path: PathBuf,
     pub source_cache: PathBuf,
     pub results_cache: ResultsCache,
+    pub flavor: Flavor,
     pub reused_cached_results: AtomicUsize,
     pub reused_fontmake_failures: AtomicUsize,
 }
@@ -57,6 +59,9 @@ pub(super) fn run_ttx_diff(ctx: &TtxContext, target: &Target) -> RunResult<DiffO
     .arg("--normalizer_path")
     .arg(&ctx.normalizer_path)
     .args(["--rebuild", "fontc"]);
+    if ctx.flavor != Flavor::Ttf {
+        cmd.args(["--flavor", "otf"]);
+    }
     if let Some(cached) = cached.as_ref() {
         cmd.arg("--expected_fontc_ttf_hash")
             .arg(&cached.fontc_ttf_hash);
@@ -106,6 +111,12 @@ pub(super) fn run_ttx_diff(ctx: &TtxContext, target: &Target) -> RunResult<DiffO
             )),
         },
         Some(124) => RunResult::Fail(DiffError::Other("ttx_diff timed out".to_string())),
+        // ttx_diff refuses sources it can't compare in the requested flavor
+        // (e.g. a variable source with --flavor otf); report that distinctly
+        // from a crash so it reads as a skip, not a failure
+        Some(1) if stderr.contains("requires a static source") => RunResult::Fail(
+            DiffError::Other("skipped: variable source (fontc cannot write CFF2)".to_string()),
+        ),
         Some(other) => RunResult::Fail(DiffError::Other(format!(
             "unknown error (status {other}): '{stderr}'"
         ))),

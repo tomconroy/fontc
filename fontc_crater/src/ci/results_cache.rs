@@ -4,13 +4,17 @@ use std::path::{Path, PathBuf};
 
 use crate::{
     RunResult, Target,
+    args::Flavor,
     ttx_diff_runner::{DiffError, DiffOutput},
 };
 
 static CACHE_DIR_NAME: &str = "crater_cached_results";
 
 // the files that we cache for each target. The font is all that is required;
-// other files are derived from it.
+// other files are derived from it. The font is "fontmake.ttf" or
+// "fontmake.otf" depending on the flavor (see [`ResultsCache::in_dir`]); this
+// is the ttf name, which the tests use.
+#[cfg(test)]
 static FONT_FILE: &str = "fontmake.ttf";
 static DERIVED_FILES: [&str; 2] = ["fontmake.ttx", "fontmake.markkern.txt"];
 // what ttx_diff leaves in place of the font when fontmake fails; keep in sync
@@ -28,8 +32,8 @@ pub(crate) enum FontmakeOutput {
 }
 
 impl FontmakeOutput {
-    fn in_dir(dir: &Path) -> Option<Self> {
-        if dir.join(FONT_FILE).exists() {
+    fn in_dir(dir: &Path, font_file: &str) -> Option<Self> {
+        if dir.join(font_file).exists() {
             Some(Self::Font)
         } else if dir.join(FAILURE_FILE).exists() {
             Some(Self::Failure)
@@ -38,9 +42,9 @@ impl FontmakeOutput {
         }
     }
 
-    fn files(self) -> Vec<&'static str> {
+    fn files(self, font_file: &str) -> Vec<&str> {
         match self {
-            Self::Font => std::iter::once(FONT_FILE).chain(DERIVED_FILES).collect(),
+            Self::Font => std::iter::once(font_file).chain(DERIVED_FILES).collect(),
             Self::Failure => vec![FAILURE_FILE],
         }
     }
@@ -77,15 +81,26 @@ impl CachedRun {
 /// Manages a cache of files on disk
 pub(crate) struct ResultsCache {
     base_results_cache_dir: PathBuf,
+    // "fontmake.ttf" or "fontmake.otf"; the derived file names are shared, so
+    // each flavor gets its own cache tree (see [`ResultsCache::in_dir`])
+    font_file: String,
 }
 
 impl ResultsCache {
     /// argument is the directory that will contain the cache dir.
     ///
     /// By convention this is the same directory where we checkout git repos.
-    pub fn in_dir(path: &Path) -> Self {
+    /// The ttf cache lives where it always did; other flavors get a sibling
+    /// subdirectory, since the cached ttx/markkern files are named the same
+    /// but their contents differ per flavor.
+    pub fn in_dir(path: &Path, flavor: Flavor) -> Self {
+        let mut base_results_cache_dir = path.join(CACHE_DIR_NAME);
+        if flavor != Flavor::Ttf {
+            base_results_cache_dir.push(flavor.to_string());
+        }
         Self {
-            base_results_cache_dir: path.join(CACHE_DIR_NAME),
+            base_results_cache_dir,
+            font_file: format!("fontmake.{flavor}"),
         }
     }
 
@@ -111,7 +126,7 @@ impl ResultsCache {
             return None;
         }
 
-        let copied = copy_cache_files(&target_cache_dir, build_dir).unwrap();
+        let copied = copy_cache_files(&target_cache_dir, build_dir, &self.font_file).unwrap();
         if copied.is_some() {
             log::trace!("reused cached files for {target}",);
         }
@@ -170,7 +185,7 @@ impl ResultsCache {
         if !target_cache_dir.exists() {
             std::fs::create_dir_all(&target_cache_dir).unwrap();
         }
-        if copy_cache_files(build_dir, &target_cache_dir)
+        if copy_cache_files(build_dir, &target_cache_dir, &self.font_file)
             .unwrap()
             .is_some()
         {
@@ -181,14 +196,18 @@ impl ResultsCache {
 
 /// Copy whatever fontmake left in `from_dir`, skipping any files the
 /// destination already has.
-fn copy_cache_files(from_dir: &Path, to_dir: &Path) -> std::io::Result<Option<FontmakeOutput>> {
-    let Some(output) = FontmakeOutput::in_dir(from_dir) else {
+fn copy_cache_files(
+    from_dir: &Path,
+    to_dir: &Path,
+    font_file: &str,
+) -> std::io::Result<Option<FontmakeOutput>> {
+    let Some(output) = FontmakeOutput::in_dir(from_dir, font_file) else {
         return Ok(None);
     };
     if !to_dir.exists() {
         std::fs::create_dir_all(to_dir)?;
     }
-    for name in output.files() {
+    for name in output.files(font_file) {
         let (from, to) = (from_dir.join(name), to_dir.join(name));
         if from.exists() && !to.exists() {
             std::fs::copy(from, to)?;
@@ -215,7 +234,7 @@ mod tests {
     #[test]
     fn result_round_trip() {
         let tempdir = tempfile::tempdir().unwrap();
-        let cache = ResultsCache::in_dir(tempdir.path());
+        let cache = ResultsCache::in_dir(tempdir.path(), Flavor::Ttf);
         let target = test_target();
         assert!(cache.load_result(&target).is_none());
 
@@ -239,7 +258,7 @@ mod tests {
     #[test]
     fn compile_failures_are_cached() {
         let tempdir = tempfile::tempdir().unwrap();
-        let cache = ResultsCache::in_dir(tempdir.path());
+        let cache = ResultsCache::in_dir(tempdir.path(), Flavor::Ttf);
         let target = test_target();
         cache.save_result(
             &target,
@@ -264,7 +283,7 @@ mod tests {
     #[test]
     fn runtime_failures_are_not_cached() {
         let tempdir = tempfile::tempdir().unwrap();
-        let cache = ResultsCache::in_dir(tempdir.path());
+        let cache = ResultsCache::in_dir(tempdir.path(), Flavor::Ttf);
         let target = test_target();
         cache.save_result(
             &target,
@@ -293,7 +312,7 @@ mod tests {
     #[test]
     fn font_alone_is_enough_to_cache() {
         let tempdir = tempfile::tempdir().unwrap();
-        let cache = ResultsCache::in_dir(tempdir.path());
+        let cache = ResultsCache::in_dir(tempdir.path(), Flavor::Ttf);
         let target = test_target();
         let build_dir = tempdir.path().join("build");
         write_files(&build_dir, &[FONT_FILE]);
@@ -310,7 +329,7 @@ mod tests {
     #[test]
     fn derived_files_are_added_to_an_existing_entry() {
         let tempdir = tempfile::tempdir().unwrap();
-        let cache = ResultsCache::in_dir(tempdir.path());
+        let cache = ResultsCache::in_dir(tempdir.path(), Flavor::Ttf);
         let target = test_target();
         let build_dir = tempdir.path().join("build");
         write_files(&build_dir, &[FONT_FILE]);
@@ -333,7 +352,7 @@ mod tests {
     #[test]
     fn nothing_is_cached_without_the_font() {
         let tempdir = tempfile::tempdir().unwrap();
-        let cache = ResultsCache::in_dir(tempdir.path());
+        let cache = ResultsCache::in_dir(tempdir.path(), Flavor::Ttf);
         let target = test_target();
         let build_dir = tempdir.path().join("build");
         write_files(&build_dir, &DERIVED_FILES);
@@ -349,7 +368,7 @@ mod tests {
     #[test]
     fn failure_is_cached_in_place_of_the_font() {
         let tempdir = tempfile::tempdir().unwrap();
-        let cache = ResultsCache::in_dir(tempdir.path());
+        let cache = ResultsCache::in_dir(tempdir.path(), Flavor::Ttf);
         let target = test_target();
         let build_dir = tempdir.path().join("build");
         write_files(&build_dir, &[FAILURE_FILE]);
@@ -366,7 +385,7 @@ mod tests {
     #[test]
     fn font_takes_precedence_over_failure() {
         let tempdir = tempfile::tempdir().unwrap();
-        let cache = ResultsCache::in_dir(tempdir.path());
+        let cache = ResultsCache::in_dir(tempdir.path(), Flavor::Ttf);
         let target = test_target();
         write_files(
             &target.cache_dir(&cache.base_results_cache_dir),
@@ -384,7 +403,7 @@ mod tests {
     #[test]
     fn delete_all_clears_results() {
         let tempdir = tempfile::tempdir().unwrap();
-        let cache = ResultsCache::in_dir(tempdir.path());
+        let cache = ResultsCache::in_dir(tempdir.path(), Flavor::Ttf);
         let target = test_target();
         cache.save_result(
             &target,
