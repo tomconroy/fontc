@@ -339,7 +339,7 @@ pub fn testdata_dir() -> std::path::PathBuf {
 mod tests {
 
     use std::{
-        collections::{HashMap, HashSet, VecDeque},
+        collections::{BTreeMap, HashMap, HashSet, VecDeque},
         fs::{self, File},
         io::Read,
         path::Path,
@@ -6799,6 +6799,315 @@ mod tests {
             Some(vec!["uoA", "uoB"])
         );
         assert_eq!(kerning.groups.len(), 6);
+    }
+
+    // ---- --instance: feature variation rules become glyph swaps ----
+
+    /// What a pinned glyph draws, how wide it is and what it is made of.
+    fn pinned(result: &TestCompile, name: &str) -> (f64, String, Vec<String>) {
+        let glyph = result.fe_context.get_glyph(name);
+        let instance = glyph.default_instance();
+        (
+            instance.width,
+            instance
+                .contours
+                .iter()
+                .map(|contour| contour.to_svg())
+                .collect::<Vec<_>>()
+                .join(" "),
+            instance
+                .components
+                .iter()
+                .map(|component| component.base.to_string())
+                .collect(),
+        )
+    }
+
+    /// The codepoint -> glyph name map of the compiled font.
+    fn cmap_names(result: &TestCompile) -> BTreeMap<u32, String> {
+        let font = result.font();
+        let charmap = Charmap::new(&font);
+        charmap
+            .mappings()
+            .map(|(codepoint, gid)| {
+                (
+                    codepoint,
+                    result
+                        .get_glyph_name(GlyphId16::new(gid.to_u32() as u16))
+                        .unwrap()
+                        .to_string(),
+                )
+            })
+            .collect()
+    }
+
+    /// `dspace_rules/Basic.designspace` substitutes `plus` with `bar` from
+    /// Weight 550; 400 is outside that, so both glyphs are simply themselves.
+    #[test]
+    fn instance_outside_every_rule_range_swaps_nothing() {
+        let result = compile_instance("dspace_rules/Basic.designspace", "wght=400");
+
+        // the Regular master's own values, because the pin is on it
+        assert_eq!(pinned(&result, "plus").0, 557.0);
+        assert_eq!(pinned(&result, "bar").0, 517.0);
+        assert_eq!(pinned(&result, "plus").1.matches('L').count(), 12);
+        assert_eq!(pinned(&result, "bar").1.matches('L').count(), 4);
+    }
+
+    /// Inside the range it is a *swap*, not a replacement: each glyph ends up
+    /// drawing the other one, both survive with their own codepoint and GID.
+    ///
+    /// Weight 550 is the range's own minimum — designspaceLib's condition
+    /// bounds are inclusive on both ends — and normalized 0.5 on a 400..700
+    /// axis, so `bar` interpolates to 534 and `plus` to 564.5.
+    ///
+    /// Verified against `fontmake -m Basic.designspace -i --keep-overlaps`:
+    /// `glyf`, `cmap` and `hmtx` come out byte-identical.
+    #[test]
+    fn instance_inside_a_rule_range_swaps_both_glyphs() {
+        let result = compile_instance("dspace_rules/Basic.designspace", "wght=550");
+
+        let (width, path, _) = pinned(&result, "plus");
+        assert_eq!(width, 534.0, "plus is as wide as bar");
+        assert_eq!(
+            path, "M222,-234 L312,-234 L312,758.5 L222,758.5 L222,-234 Z",
+            "and draws bar"
+        );
+
+        let (width, path, _) = pinned(&result, "bar");
+        assert_eq!(width, 564.5, "bar is as wide as plus");
+        assert_eq!(path.matches('L').count(), 12, "and draws plus: {path}");
+
+        // "The rules mechanism is supposed to swap glyphs, not characters"
+        assert_eq!(
+            cmap_names(&result),
+            BTreeMap::from([(0x2b, "plus".to_string()), (0x7c, "bar".to_string())])
+        );
+        assert!(result.contains_glyph("plus") && result.contains_glyph("bar"));
+        assert_eq!(
+            result
+                .fe_context
+                .glyph_order
+                .get()
+                .names()
+                .collect::<Vec<_>>(),
+            compile_instance("dspace_rules/Basic.designspace", "wght=400")
+                .fe_context
+                .glyph_order
+                .get()
+                .names()
+                .collect::<Vec<_>>(),
+            "a swap never touches glyph order"
+        );
+    }
+
+    /// Two rules firing at once chain as *sequential swaps on live state*:
+    /// `A -> B` then `B -> C` is the 3-cycle in which A takes B's drawing, B
+    /// takes C's and C takes A's. Resolving the chain to `A -> C` first would
+    /// give A the 550-wide drawing instead of the 450-wide one.
+    ///
+    /// Numbers measured from `fontmake -m Chain.designspace -i`, which puts
+    /// `A 450/250, B 550/350, C 350/150` in the instance UFO; the pre-rule
+    /// interpolation is `A 350/150, B 450/250, C 550/350`.
+    #[test]
+    fn instance_chains_two_rules_into_a_three_cycle() {
+        let before = compile_instance("dspace_rules/Chain.designspace", "wght=450");
+        let after = compile_instance("dspace_rules/Chain.designspace", "wght=550");
+
+        let top = |result: &TestCompile, name: &str| {
+            let (width, path, _) = pinned(result, name);
+            (width, path)
+        };
+        assert_eq!(
+            top(&after, "A"),
+            (450.0, "M0,0 L100,0 L100,250 L0,250 L0,0 Z".into()),
+            "A draws B"
+        );
+        assert_eq!(
+            top(&after, "B"),
+            (550.0, "M0,0 L100,0 L100,350 L0,350 L0,0 Z".into()),
+            "B draws C"
+        );
+        assert_eq!(
+            top(&after, "C"),
+            (350.0, "M0,0 L100,0 L100,150 L0,150 L0,0 Z".into()),
+            "and C draws A: a cycle, not a chain resolved to A -> C"
+        );
+        // and a third of the way up the axis, where no rule fires, each glyph
+        // is its own interpolation
+        // 450 is a sixth of the way up a 400..700 axis
+        assert!((top(&before, "A").0 - (300.0 + 100.0 / 6.0)).abs() < 1e-9);
+        assert!((top(&before, "C").0 - (500.0 + 100.0 / 6.0)).abs() < 1e-9);
+    }
+
+    /// A glyph that *references* a swapped glyph follows it: `Bcomp` is a
+    /// composite of `B`, and after `A <-> B` (then `B <-> C`, which no longer
+    /// concerns it) it is a composite of `A`.
+    ///
+    /// ufo2ft remaps every component reference in the whole font as part of
+    /// each swap, which is why this composes rather than cancelling out.
+    #[test]
+    fn instance_rules_remap_components_that_point_at_a_swapped_glyph() {
+        let before = compile_instance("dspace_rules/Chain.designspace", "wght=450");
+        let after = compile_instance("dspace_rules/Chain.designspace", "wght=550");
+
+        assert_eq!(pinned(&before, "Bcomp").2, vec!["B".to_string()]);
+        assert_eq!(pinned(&after, "Bcomp").2, vec!["A".to_string()]);
+        // its own width is its own business
+        assert_eq!(pinned(&after, "Bcomp").0, 450.0);
+    }
+
+    /// Kerning is swapped too, and — because it does not exist until after
+    /// the glyphs are pinned — in the pin's second phase: literal pair keys
+    /// naming either glyph, and kern group *membership*, never group names.
+    ///
+    /// `('A','C')` through `A <-> B` then `B <-> C` becomes `('C','B')`, and
+    /// the groups `kern1.A = [A]` / `kern2.C = [C]` become `[C]` / `[B]`.
+    /// Both measured from `fontmake -m Chain.designspace -i`.
+    #[test]
+    fn instance_rules_swap_kerning_pairs_and_group_membership() {
+        let glyph = |name: &str| KernSide::Glyph(GlyphName::from(name));
+        let kerning_of = |result: &TestCompile| {
+            let at = result
+                .fe_context
+                .static_metadata
+                .get()
+                .default_location()
+                .clone();
+            result
+                .fe_context
+                .kerning_at
+                .get(&FeWorkIdentifier::KernInstance(at))
+        };
+
+        let before = kerning_of(&compile_instance(
+            "dspace_rules/Chain.designspace",
+            "wght=450",
+        ));
+        assert_eq!(
+            before.kerns.keys().collect::<Vec<_>>(),
+            vec![&(glyph("A"), glyph("C"))]
+        );
+
+        let after = kerning_of(&compile_instance(
+            "dspace_rules/Chain.designspace",
+            "wght=550",
+        ));
+        assert_eq!(
+            after.kerns.keys().collect::<Vec<_>>(),
+            vec![&(glyph("C"), glyph("B"))]
+        );
+        assert_eq!(
+            after.kerns.values().next().map(|v| v.into_inner()),
+            Some(-60.0)
+        );
+        let members = |group: KernGroup| {
+            after
+                .groups
+                .get(&group)
+                .map(|m| m.iter().map(|g| g.to_string()).collect::<Vec<_>>())
+        };
+        assert_eq!(
+            members(KernGroup::Side1("A".into())),
+            Some(vec!["C".into()])
+        );
+        assert_eq!(
+            members(KernGroup::Side2("C".into())),
+            Some(vec!["B".into()])
+        );
+    }
+
+    /// A `.glyphs` bracket layer is the same mechanism: glyphsLib mints a
+    /// `X.BRACKET.varAltNN` alternate, appends it to glyph order and writes a
+    /// rule substituting the parent with it. Pinning inside the bracket swaps
+    /// them — and the alternate *stays in the font*, GID and all, with no cmap
+    /// entry, exactly as `fontmake -g ... -i` leaves it.
+    ///
+    /// The axis maps design 40..200 onto user 100..900, so the bracket's
+    /// `min = 150` is user 650: `wght=900` is inside it and `wght=100` is not.
+    /// `yen` is a composite of `peso` (`uni20B1`) and has a bracket layer of
+    /// its own, so both swaps happen and the component references compose.
+    ///
+    /// Verified against `fontmake -g LibreFranklin-bracketlayer.glyphs -i`:
+    /// `glyf`, `cmap`, `hmtx`, `post` and `GDEF` byte-identical at both pins.
+    #[test]
+    fn instance_of_a_bracket_layer_source_keeps_the_alternate() {
+        let outside = compile_instance("glyphs3/LibreFranklin-bracketlayer.glyphs", "wght=100");
+        let inside = compile_instance("glyphs3/LibreFranklin-bracketlayer.glyphs", "wght=900");
+
+        for result in [&outside, &inside] {
+            assert_eq!(
+                result
+                    .fe_context
+                    .glyph_order
+                    .get()
+                    .names()
+                    .map(|name| name.to_string())
+                    .collect::<Vec<_>>(),
+                vec![
+                    ".notdef",
+                    "peso",
+                    "yen",
+                    "peso.BRACKET.varAlt01",
+                    "yen.BRACKET.varAlt01"
+                ],
+                "the alternate is never pruned"
+            );
+            assert_eq!(
+                cmap_names(result),
+                BTreeMap::from([(0xa5, "yen".to_string()), (0x20b1, "peso".to_string())]),
+                "and never gains a codepoint"
+            );
+        }
+
+        // masters: peso 750/786 (Thin/Bold), the bracket layer 780/746
+        assert_eq!(pinned(&outside, "peso").0, 750.0);
+        assert_eq!(pinned(&outside, "peso.BRACKET.varAlt01").0, 780.0);
+        assert_eq!(pinned(&inside, "peso").0, 746.0, "the bracket's width");
+        assert_eq!(pinned(&inside, "peso.BRACKET.varAlt01").0, 786.0);
+        // yen composes both swaps and still reads as a plain composite
+        assert_eq!(pinned(&inside, "yen").2, vec!["peso".to_string()]);
+        assert_eq!(
+            pinned(&inside, "yen.BRACKET.varAlt01").2,
+            vec!["peso.BRACKET.varAlt01".to_string()]
+        );
+        assert_eq!(pinned(&inside, "yen").0, 746.0);
+    }
+
+    /// `processing="last"` is a variable-font concern (it picks `rclt` over
+    /// `rvrn` for the feature variations table), so a pinned instance treats
+    /// it exactly like `processing="first"`.
+    #[test]
+    fn instance_rules_ignore_the_processing_attribute() {
+        // one rule, bar -> plus from Weight 550, the only difference being
+        // <rules processing="last">
+        let first = compile_instance("dspace_rules/CustomFeatures.designspace", "wght=600");
+        let last = compile_instance("dspace_rules/Last.designspace", "wght=600");
+
+        assert_eq!(pinned(&first, "bar"), pinned(&last, "bar"));
+        assert_eq!(pinned(&first, "plus"), pinned(&last, "plus"));
+        // and it really did swap
+        assert_eq!(pinned(&last, "bar").1.matches('L').count(), 12);
+    }
+
+    /// The instance has no feature variations of its own: the rules were
+    /// spent on the swap, and there are no axes left to condition them on.
+    #[test]
+    fn instance_has_no_feature_variations() {
+        let variable = TestCompile::compile_source("dspace_rules/Basic.designspace");
+        assert!(
+            variable
+                .font()
+                .gsub()
+                .unwrap()
+                .feature_variations()
+                .is_some(),
+            "the variable font has them"
+        );
+
+        let result = compile_instance("dspace_rules/Basic.designspace", "wght=550");
+        assert!(result.fe_context.static_metadata.get().variations.is_none());
+        assert!(result.font().gsub().unwrap().feature_variations().is_none());
     }
 
     // ---- --flavor otf --instance ----

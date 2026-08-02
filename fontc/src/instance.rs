@@ -30,16 +30,17 @@
 //! `KernInstance` has run — by which time `StaticMetadata` is already static,
 //! which is why the caller has to hand the original back.
 
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 
 use fontdrasil::{
-    coords::{NormalizedLocation, UserLocation},
+    coords::{DesignLocation, NormalizedLocation, UserLocation},
     orchestration::Access,
+    types::GlyphName,
 };
 use fontir::{
     instance::{self, InstanceSpec},
-    ir::{FeaturesSource, KerningLocations, StaticMetadata},
+    ir::{FeaturesSource, Glyph, GlyphAnchors, GlyphInstance, KerningLocations, StaticMetadata},
     orchestration::{Context, WorkId},
 };
 
@@ -55,6 +56,15 @@ pub(crate) struct Pin {
     pub(crate) source_metadata: Arc<StaticMetadata>,
     /// Where we pinned, in normalized space.
     pub(crate) location: NormalizedLocation,
+    /// The glyph swaps the source's feature variation rules asked for here,
+    /// in the order they were applied to glyphs.
+    ///
+    /// Phase 1 has already done them to glyphs, anchors and components; the
+    /// kerning they also touch does not exist until phase 2, which repeats
+    /// them there. `variations` is gone from the pinned metadata by then, and
+    /// so are the axes its conditions are written on, so the answer travels
+    /// rather than being recomputed.
+    pub(crate) swaps: Vec<(GlyphName, GlyphName)>,
 }
 
 /// Rewrite everything but kerning as the instance `spec` asks for.
@@ -63,13 +73,9 @@ pub(crate) struct Pin {
 pub(crate) fn pin_frontend(fe_root: &Context, spec: &InstanceSpec) -> Result<Pin, Error> {
     let context = fe_root.copy_for_work(Access::All, Access::All);
     let source_metadata = context.static_metadata.get();
-    let location = resolve(&source_metadata, spec)?;
+    let asked_for = resolve_user(&source_metadata, spec)?;
+    let location = normalize(&source_metadata, &asked_for)?;
 
-    // Rules would have to be applied here, before the axes they are expressed
-    // on disappear; until they are, refuse rather than silently drop them.
-    if source_metadata.variations.is_some() {
-        return Err(Error::InstanceOfSourceWithRules);
-    }
     if let Some(features) = context.features.try_get()
         && fea_declares_a_conditionset(&features)?
     {
@@ -78,9 +84,11 @@ pub(crate) fn pin_frontend(fe_root: &Context, spec: &InstanceSpec) -> Result<Pin
 
     log::info!("Pinning at {location:?}");
 
+    let mut glyph_names = HashSet::new();
     for (_, glyph) in context.glyphs.all() {
         let pinned = instance::pin_glyph(&source_metadata, &glyph, &location)
             .map_err(fontir::error::Error::from)?;
+        glyph_names.insert(pinned.name.clone());
         context.glyphs.set(pinned);
     }
     for (_, anchors) in context.anchors.all() {
@@ -96,6 +104,22 @@ pub(crate) fn pin_frontend(fe_root: &Context, spec: &InstanceSpec) -> Result<Pin
         )?);
     }
 
+    // Feature variation rules become plain glyph swaps in a static instance,
+    // and they run *after* interpolation — on the glyphs we just pinned — the
+    // way ufo2ft applies them to a finished instance. Before
+    // `pin_static_metadata`, which drops both the rules and the axes their
+    // conditions are written on.
+    let swaps = match source_metadata.variations.as_ref() {
+        Some(variations) => {
+            let design = design_pin(&source_metadata, &asked_for);
+            let swaps =
+                instance::rule_swaps(variations, &design, |name| glyph_names.contains(name));
+            apply_swaps(&context, &swaps)?;
+            swaps
+        }
+        None => Vec::new(),
+    };
+
     // last, because everything above reads the *source's* axes to interpolate
     let mut pinned = instance::pin_static_metadata(&source_metadata, &location)?;
     prune_variable_names(&mut pinned, &source_metadata);
@@ -104,7 +128,103 @@ pub(crate) fn pin_frontend(fe_root: &Context, spec: &InstanceSpec) -> Result<Pin
     Ok(Pin {
         source_metadata,
         location,
+        swaps,
     })
+}
+
+/// Do the rules' glyph swaps, in order, each on the result of the last.
+///
+/// Sequential by construction: `a -> b` then `b -> c` is the 3-cycle
+/// `(a b)(b c)`, not `a -> c`. See [`instance::rule_swaps`].
+fn apply_swaps(context: &Context, swaps: &[(GlyphName, GlyphName)]) -> Result<(), Error> {
+    for (old, new) in swaps {
+        swap_glyphs(context, old, new)?;
+    }
+    Ok(())
+}
+
+/// ufo2ft's `swap_glyph_names`, minus the kerning, which isn't built yet.
+///
+/// Both glyphs survive, with their own name, codepoints and place in glyph
+/// order; what moves is what they draw, how wide they are, their anchors, and
+/// which of them everyone else's components point at.
+fn swap_glyphs(context: &Context, old: &GlyphName, new: &GlyphName) -> Result<(), Error> {
+    let (Some(old_glyph), Some(new_glyph)) = (
+        context.try_get_glyph(old.clone()),
+        context.try_get_glyph(new.clone()),
+    ) else {
+        // `rule_swaps` has already checked the glyph being replaced, so it is
+        // the substitute that is missing. ufo2ft raises here too, deliberately
+        // rather than dropping the rule.
+        return Err(Error::InstanceRuleSubstituteMissing {
+            replace: old.to_string(),
+            with: new.to_string(),
+        });
+    };
+
+    // 1. what they draw, and how wide they are. Both glyphs are pinned by
+    //    now, so this is one instance each, at the same location.
+    let mut old_sources = old_glyph.sources().clone();
+    let mut new_sources = new_glyph.sources().clone();
+    for (at, old_instance) in old_sources.iter_mut() {
+        let Some(new_instance) = new_sources.get_mut(at) else {
+            continue;
+        };
+        instance::swap_geometry(old_instance, new_instance);
+    }
+    context.glyphs.set(republish(&old_glyph, old_sources)?);
+    context.glyphs.set(republish(&new_glyph, new_sources)?);
+
+    // 2. their anchors
+    let anchors_of = |name: &GlyphName| {
+        context
+            .anchors
+            .try_get(&WorkId::Anchor(name.clone()))
+            .map(|anchors| anchors.anchors.clone())
+            .unwrap_or_default()
+    };
+    let (old_anchors, new_anchors) = (anchors_of(old), anchors_of(new));
+    if !old_anchors.is_empty() || !new_anchors.is_empty() {
+        context
+            .anchors
+            .set(GlyphAnchors::new(old.clone(), new_anchors));
+        context
+            .anchors
+            .set(GlyphAnchors::new(new.clone(), old_anchors));
+    }
+
+    // 3. every component reference in the font, including the two glyphs we
+    //    just swapped, which now hold each other's components
+    for (_, glyph) in context.glyphs.all() {
+        let mut sources = glyph.sources().clone();
+        let mut changed = false;
+        for instance in sources.values_mut() {
+            // every source, so no short-circuiting the remapping
+            changed |= instance::swap_component_bases(instance, old, new);
+        }
+        if changed {
+            context.glyphs.set(republish(&glyph, sources)?);
+        }
+    }
+
+    Ok(())
+}
+
+/// `glyph` with new drawings, rebuilt rather than mutated.
+///
+/// [`Glyph`] caches whether its components' 2x2 transforms are consistent and
+/// whether any of them overflow, and a swap can change both answers.
+fn republish(
+    glyph: &Glyph,
+    sources: HashMap<NormalizedLocation, GlyphInstance>,
+) -> Result<Glyph, Error> {
+    Glyph::new(
+        glyph.name.clone(),
+        glyph.emit_to_binary,
+        glyph.codepoints.clone(),
+        sources,
+    )
+    .map_err(|e| fontir::error::Error::from(e).into())
 }
 
 /// Reduce every source's kerning to the one instance at the pin.
@@ -133,11 +253,17 @@ pub(crate) fn pin_kerning(fe_root: &Context, pin: &Pin) -> Result<(), Error> {
                 .try_get(&WorkId::KernInstance(at.clone()))
         })
         .collect();
-    let pinned = instance::pin_kerning(
+    let mut pinned = instance::pin_kerning(
         &pin.source_metadata,
         instances.iter().map(|instance| instance.as_ref()),
         &pin.location,
     )?;
+    // The other half of phase 1's glyph swaps. ufo2ft swaps kerning as part of
+    // the same operation, on a font whose kerning has already been
+    // interpolated, which is exactly here: interpolate, then swap.
+    for (old, new) in &pin.swaps {
+        instance::swap_kerning(&mut pinned, old, new);
+    }
 
     let locations = BTreeSet::from([pinned.location.clone()]);
     context.kerning_at.set(pinned);
@@ -147,16 +273,14 @@ pub(crate) fn pin_kerning(fe_root: &Context, pin: &Pin) -> Result<(), Error> {
     Ok(())
 }
 
-/// The normalized location `spec` names, or why it names none.
+/// The user-space location `spec` names, on every axis, or why it names none.
 ///
-/// User space in, normalized out: the conversion runs through the source's own
-/// axis mapping (what becomes `avar`), which is the same normalization
-/// `fontmake -i` applies to a designspace `<instance>`'s location for any
-/// strictly monotonic map.
-fn resolve(
+/// Axes the user didn't mention take their default, so the result is a
+/// complete location and not the subset that was asked for.
+fn resolve_user(
     static_metadata: &StaticMetadata,
     spec: &InstanceSpec,
-) -> Result<NormalizedLocation, Error> {
+) -> Result<UserLocation, Error> {
     // fontc's universal "this is static" test. Point axes are fine: fontmake
     // pins a single-master designspace without complaint, and only rejects
     // `-i` outright for bare UFO input.
@@ -206,13 +330,46 @@ fn resolve(
     };
 
     // an axis nobody mentioned sits at its default
-    let full: UserLocation = static_metadata
+    Ok(static_metadata
         .axes
         .iter()
         .map(|axis| (axis.tag, asked_for.get(axis.tag).unwrap_or(axis.default)))
-        .collect();
-    full.to_normalized(&static_metadata.axes)
+        .collect())
+}
+
+/// The pin in normalized space, which is how the IR keys everything.
+///
+/// The conversion runs through the source's own axis mapping (what becomes
+/// `avar`), which is the same normalization `fontmake -i` applies to a
+/// designspace `<instance>`'s location for any strictly monotonic map.
+fn normalize(
+    static_metadata: &StaticMetadata,
+    user: &UserLocation,
+) -> Result<NormalizedLocation, Error> {
+    user.to_normalized(&static_metadata.axes)
         .map_err(|e| Error::InstanceLocation(e.to_string()))
+}
+
+/// The pin in design space, which is the space rule conditions are written in.
+///
+/// Over *every* source axis, including point axes, because ufo2ft evaluates a
+/// rule against the instance's location merged over the whole default design
+/// location — a condition on an axis the instance doesn't mention still has to
+/// find a position there.
+///
+/// Straight from user space rather than back out of the normalized pin:
+/// normalizing and denormalizing is exact in real arithmetic but not
+/// necessarily in f64, and a rule's bounds are *inclusive*, so an answer one
+/// ulp under a boundary is a different font.
+fn design_pin(static_metadata: &StaticMetadata, user: &UserLocation) -> DesignLocation {
+    static_metadata
+        .all_source_axes
+        .iter()
+        .map(|axis| {
+            let pos = user.get(axis.tag).unwrap_or(axis.default);
+            (axis.tag, pos.to_design(&axis.converter))
+        })
+        .collect()
 }
 
 fn comma_separated(items: impl Iterator<Item = String>) -> String {
@@ -352,6 +509,14 @@ mod tests {
 
     fn spec(raw: &str) -> InstanceSpec {
         raw.parse().unwrap()
+    }
+
+    /// What the pin does with a `--instance` argument, in one step.
+    fn resolve(
+        static_metadata: &StaticMetadata,
+        spec: &InstanceSpec,
+    ) -> Result<NormalizedLocation, Error> {
+        normalize(static_metadata, &resolve_user(static_metadata, spec)?)
     }
 
     #[test]

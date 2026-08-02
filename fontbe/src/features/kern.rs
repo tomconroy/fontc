@@ -651,8 +651,15 @@ fn build_variable_kern_adjustments(
     }
 
     // all pairs defined in at least one master
-    let all_pairs = kern_by_pos
-        .values()
+    //
+    // `instances`, not every instance lying around: an instance at a location
+    // `KerningLocations` does not name is not a master, and a pair only it
+    // states would be resolved against the real masters -- where nothing
+    // covers it -- and emitted as an explicit zero. That is exactly what a
+    // `--instance` build leaves behind, since pinning replaces the kerning at
+    // the pin and lets the rest go unread.
+    let all_pairs = instances
+        .iter()
         .flat_map(|instance| instance.kerns.keys())
         .cloned()
         .collect::<HashSet<_>>();
@@ -2906,6 +2913,56 @@ mod tests {
             # lookupflag LookupFlag(8)
             W.i -40 [W.i,ijdotless]
             "#
+        );
+    }
+
+    /// A kerning instance at a location `KerningLocations` does not name is
+    /// not a master. That is what `--instance` leaves behind: the pin replaces
+    /// the kerning at one location and the rest go unread, and a rule swap can
+    /// make the pinned pair set differ from theirs. A pair only such a
+    /// leftover states would resolve to 0 against the real masters and be
+    /// emitted as an explicit zero adjustment.
+    #[test]
+    fn pairs_come_only_from_the_locations_that_kern() {
+        let pin = NormalizedLocation::for_pos(&[("wght", 0.0)]);
+        let leftover = NormalizedLocation::for_pos(&[("wght", 1.0)]);
+        let pair = |first: &str, second: &str| {
+            (
+                ir::KernSide::Glyph(first.into()),
+                ir::KernSide::Glyph(second.into()),
+            )
+        };
+        let at = |location: &NormalizedLocation,
+                  kerns: BTreeMap<ir::KernPair, OrderedFloat<f64>>| {
+            (
+                location.clone(),
+                KerningInstance {
+                    location: location.clone(),
+                    kerns,
+                    groups: Default::default(),
+                },
+            )
+        };
+
+        let kern_by_pos = HashMap::from([
+            at(
+                &pin,
+                BTreeMap::from([(pair("A", "V"), OrderedFloat(-10.0))]),
+            ),
+            at(
+                &leftover,
+                BTreeMap::from([(pair("X", "Y"), OrderedFloat(-20.0))]),
+            ),
+        ]);
+        let locations = KerningLocations {
+            locations: BTreeSet::from([pin]),
+        };
+
+        let (_, adjustments) = build_variable_kern_adjustments(&locations, &kern_by_pos);
+
+        assert_eq!(
+            adjustments.keys().collect::<Vec<_>>(),
+            vec![&pair("A", "V")]
         );
     }
 }

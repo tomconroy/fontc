@@ -49,8 +49,10 @@ pub enum Error {
     UnknownInstance { name: String, available: String },
     #[error("--instance cannot resolve that location: {0}")]
     InstanceLocation(String),
-    #[error("--instance does not yet support a source with feature variation rules")]
-    InstanceOfSourceWithRules,
+    #[error(
+        "--instance cannot apply the feature variation rule substituting '{replace}': there is no glyph '{with}' to swap it with"
+    )]
+    InstanceRuleSubstituteMissing { replace: String, with: String },
     #[error("--instance does not yet support a feature file with a conditionset")]
     InstanceOfSourceWithFeaConditionSet,
     #[error("Unable to interpolate the instance: {0}")]

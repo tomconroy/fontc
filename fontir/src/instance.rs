@@ -51,7 +51,7 @@ use std::{
 };
 
 use fontdrasil::{
-    coords::{NormalizedLocation, UserCoord, UserLocation},
+    coords::{DesignLocation, NormalizedLocation, UserCoord, UserLocation},
     types::{Axes, GlyphName},
     variations::{DeltaError, VariationModel},
 };
@@ -64,8 +64,9 @@ use write_fonts::types::{InvalidTag, Tag};
 use crate::{
     error::{BadGlyph, Error},
     ir::{
-        Anchor, GlobalMetrics, GlobalMetricsBuilder, Glyph, GlyphAnchors, GlyphInstance, KernGroup,
-        KernPair, KernSide, KerningInstance, PostscriptSettings, StaticMetadata,
+        Anchor, Condition, GlobalMetrics, GlobalMetricsBuilder, Glyph, GlyphAnchors, GlyphInstance,
+        KernGroup, KernPair, KernSide, KerningInstance, PostscriptSettings, Rule, StaticMetadata,
+        VariableFeature,
     },
 };
 
@@ -272,6 +273,155 @@ pub fn pin_anchors(
         .collect::<Result<Vec<_>, BadGlyph>>()?;
 
     Ok(GlyphAnchors::new(anchors.glyph_name.clone(), pinned))
+}
+
+/// The glyph swaps `variations`' rules ask for at `pin`, in the order to do them.
+///
+/// This is ufo2ft's `process_rules_swaps`: walk the rules in document order,
+/// and for each one whose conditions hold at the pin take every substitution,
+/// in order. The result is a *sequence of transpositions*, not a substitution
+/// map — each swap sees the previous swap's result, so rules `a -> b` then
+/// `b -> c` compose to the 3-cycle `(a b)(b c)`, in which `a` ends up with
+/// `b`'s content, `b` with `c`'s and `c` with `a`'s. Resolving the chain to
+/// `a -> c` first, or taking a fixed point, is a different font.
+///
+/// `pin` is in **design** space, because that is the space a rule's conditions
+/// are written in ([`Condition::min`]) and the space ufo2ft evaluates them in.
+///
+/// A rule's condition sets are OR-ed and the conditions within one are AND-ed,
+/// so a rule with *no* condition sets never applies while a condition set with
+/// no conditions always does. Both bounds of a condition are inclusive, and a
+/// condition may state only one of them.
+///
+/// `exists` filters the glyph being *replaced* only, deliberately: ufo2ft
+/// leaves a substitution whose target is missing to fail loudly in the swap
+/// rather than silently dropping the rule, so the caller should reject one.
+///
+/// The designspace `processing="first"/"last"` attribute plays no part.
+/// `rulesProcessingLast` is read in exactly one place in the whole toolchain —
+/// varLib choosing between the `rvrn` and `rclt` feature tags for a *variable*
+/// font's feature variations — and never by the instantiator. A static
+/// instance has no feature variations to tag, and its rules are always applied
+/// last (after every glyph is interpolated) and always in rule order.
+pub fn rule_swaps(
+    variations: &VariableFeature,
+    pin: &DesignLocation,
+    exists: impl Fn(&GlyphName) -> bool,
+) -> Vec<(GlyphName, GlyphName)> {
+    let mut swaps = Vec::new();
+    for rule in &variations.rules {
+        if !rule_applies(rule, pin) {
+            continue;
+        }
+        for sub in &rule.substitutions {
+            // ufo2ft skips a swap of a glyph with itself at the call site
+            if sub.replace != sub.with && exists(&sub.replace) {
+                swaps.push((sub.replace.clone(), sub.with.clone()));
+            }
+        }
+    }
+    swaps
+}
+
+/// Does any of `rule`'s condition sets hold at `pin`?
+fn rule_applies(rule: &Rule, pin: &DesignLocation) -> bool {
+    rule.conditions
+        .iter()
+        .any(|set| set.iter().all(|condition| condition_holds(condition, pin)))
+}
+
+/// `designspaceLib.evaluateConditions` for one condition: both bounds inclusive.
+///
+/// A condition on an axis the pin doesn't have cannot be met. ufo2ft raises a
+/// `KeyError` here instead, but it evaluates against a location it has already
+/// merged over every axis, which is what the caller hands us too — so this is
+/// unreachable for rules either frontend builds.
+fn condition_holds(condition: &Condition, pin: &DesignLocation) -> bool {
+    let Some(pos) = pin.get(condition.axis) else {
+        log::warn!(
+            "feature variation rule conditions on '{}', which the pin has no position for",
+            condition.axis
+        );
+        return false;
+    };
+    condition.min.is_none_or(|min| min <= pos) && condition.max.is_none_or(|max| pos <= max)
+}
+
+/// Exchange two glyphs' drawings, as ufo2ft's `swap_glyph_names` step 1 does.
+///
+/// Contours, components and the advance *width*, and nothing else: ufo2ft
+/// swaps what a point pen draws plus `width`, so `height` — and with it IR's
+/// `vertical_origin` — stays with the glyph it was written for. Nor does the
+/// caller swap codepoints, glyph order or `emit_to_binary`: "the rules
+/// mechanism is supposed to swap glyphs, not characters", and both glyphs keep
+/// their identity and their GID.
+pub fn swap_geometry(a: &mut GlyphInstance, b: &mut GlyphInstance) {
+    std::mem::swap(&mut a.width, &mut b.width);
+    std::mem::swap(&mut a.contours, &mut b.contours);
+    std::mem::swap(&mut a.components, &mut b.components);
+}
+
+/// Rewrite `old` <-> `new` wherever `instance` uses either as a component base.
+///
+/// ufo2ft's `swap_glyph_names` step 3, which walks every glyph in the font —
+/// including the two being swapped, which by then hold each other's
+/// components. Returns whether anything changed.
+pub fn swap_component_bases(
+    instance: &mut GlyphInstance,
+    old: &GlyphName,
+    new: &GlyphName,
+) -> bool {
+    let mut changed = false;
+    for component in instance.components.iter_mut() {
+        if component.base == *old {
+            component.base = new.clone();
+            changed = true;
+        } else if component.base == *new {
+            component.base = old.clone();
+            changed = true;
+        }
+    }
+    changed
+}
+
+/// Exchange every mention of `old` and `new` in pinned kerning.
+///
+/// ufo2ft's `swap_glyph_names` steps 4 and 5, applied — like the rest of the
+/// swap — to the *finished* instance, i.e. after interpolation: literal pair
+/// keys naming either glyph on either side, and kern *group membership*. Group
+/// names stay as they are, so a side1 group named for `A` can legitimately end
+/// up listing `B`; a group is just a set of glyphs that kern alike, and the
+/// swap is what makes that true.
+///
+/// Renaming the pair keys cannot collide: `old <-> new` is a bijection on
+/// glyph names, so it is a bijection on pairs.
+pub fn swap_kerning(kerning: &mut KerningInstance, old: &GlyphName, new: &GlyphName) {
+    let swap_side = |side: &KernSide| match side {
+        KernSide::Glyph(name) if name == old => KernSide::Glyph(new.clone()),
+        KernSide::Glyph(name) if name == new => KernSide::Glyph(old.clone()),
+        other => other.clone(),
+    };
+    kerning.kerns = kerning
+        .kerns
+        .iter()
+        .map(|((first, second), value)| ((swap_side(first), swap_side(second)), *value))
+        .collect();
+    for members in kerning.groups.values_mut() {
+        if members.contains(old) || members.contains(new) {
+            *members = members
+                .iter()
+                .map(|member| {
+                    if member == old {
+                        new.clone()
+                    } else if member == new {
+                        old.clone()
+                    } else {
+                        member.clone()
+                    }
+                })
+                .collect();
+        }
+    }
 }
 
 /// Every source's kerning reduced to one [`KerningInstance`] at `pin`.
@@ -716,7 +866,11 @@ mod tests {
     use kurbo::{Affine, BezPath};
     use write_fonts::types::Tag;
 
-    use crate::ir::{AnchorKind, Component, GlobalMetric, KernGroup, KernSide};
+    use fontdrasil::coords::DesignCoord;
+
+    use crate::ir::{
+        AnchorKind, Component, ConditionSet, GlobalMetric, KernGroup, KernSide, Substitution,
+    };
 
     use super::*;
 
@@ -1547,6 +1701,260 @@ mod tests {
         assert_eq!(
             pinned_meta.default_location(),
             &NormalizedLocation::for_pos(&[("wght", 0.0)]),
+        );
+    }
+
+    // ---- feature variation rules ----
+
+    fn design(pos: f64) -> DesignLocation {
+        vec![(WGHT, fontdrasil::coords::DesignCoord::new(pos))].into()
+    }
+
+    fn variations(rules: Vec<Rule>) -> VariableFeature {
+        VariableFeature {
+            features: vec![Tag::new(b"rvrn")],
+            rules,
+        }
+    }
+
+    fn swaps_at(variations: &VariableFeature, pos: f64) -> Vec<(String, String)> {
+        rule_swaps(variations, &design(pos), |_| true)
+            .into_iter()
+            .map(|(replace, with)| (replace.to_string(), with.to_string()))
+            .collect()
+    }
+
+    /// `designspaceLib.evaluateConditions` includes both bounds, and treats a
+    /// condition that states only one of them as unbounded on the other side.
+    #[test]
+    fn a_rule_range_includes_its_ends() {
+        let closed = variations(vec![Rule::for_test(
+            &[&[("wght", (550.0, 700.0))]],
+            &[("a", "b")],
+        )]);
+        assert_eq!(swaps_at(&closed, 549.999), Vec::new());
+        assert_eq!(
+            swaps_at(&closed, 550.0),
+            vec![("a".to_string(), "b".to_string())],
+            "the minimum is inside the range"
+        );
+        assert_eq!(
+            swaps_at(&closed, 700.0),
+            vec![("a".to_string(), "b".to_string())],
+            "and so is the maximum"
+        );
+        assert_eq!(swaps_at(&closed, 700.001), Vec::new());
+
+        let open = variations(vec![Rule {
+            conditions: vec![
+                [Condition::new(WGHT, Some(DesignCoord::new(550.0)), None)]
+                    .into_iter()
+                    .collect(),
+            ],
+            substitutions: vec![Substitution {
+                replace: "a".into(),
+                with: "b".into(),
+            }],
+        }]);
+        assert_eq!(swaps_at(&open, 549.0), Vec::new());
+        assert_eq!(swaps_at(&open, 550.0).len(), 1);
+        assert_eq!(swaps_at(&open, 10_000.0).len(), 1, "no maximum, no ceiling");
+    }
+
+    /// Condition sets are OR-ed, conditions within one AND-ed, which makes a
+    /// rule with no condition sets dead and a condition set with no conditions
+    /// unconditional.
+    #[test]
+    fn a_rule_needs_one_whole_condition_set() {
+        let two_sets = variations(vec![Rule::for_test(
+            &[&[("wght", (400.0, 450.0))], &[("wght", (650.0, 700.0))]],
+            &[("a", "b")],
+        )]);
+        assert_eq!(swaps_at(&two_sets, 425.0).len(), 1);
+        assert_eq!(swaps_at(&two_sets, 500.0).len(), 0);
+        assert_eq!(swaps_at(&two_sets, 675.0).len(), 1);
+
+        let no_sets = variations(vec![Rule {
+            conditions: Vec::new(),
+            substitutions: vec![Substitution {
+                replace: "a".into(),
+                with: "b".into(),
+            }],
+        }]);
+        assert_eq!(swaps_at(&no_sets, 500.0).len(), 0, "nothing to satisfy");
+
+        let empty_set = variations(vec![Rule {
+            conditions: vec![ConditionSet::from_iter([])],
+            substitutions: vec![Substitution {
+                replace: "a".into(),
+                with: "b".into(),
+            }],
+        }]);
+        assert_eq!(swaps_at(&empty_set, 500.0).len(), 1, "nothing to fail");
+    }
+
+    /// Rule order, then substitution order, and the list is not deduplicated
+    /// or resolved: `a -> b` then `b -> c` is two swaps, not one.
+    #[test]
+    fn swaps_come_out_in_rule_then_sub_order() {
+        let chain = variations(vec![
+            Rule::for_test(&[&[("wght", (550.0, 700.0))]], &[("a", "b"), ("x", "y")]),
+            Rule::for_test(&[&[("wght", (600.0, 700.0))]], &[("b", "c")]),
+        ]);
+        assert_eq!(
+            swaps_at(&chain, 550.0),
+            vec![
+                ("a".to_string(), "b".to_string()),
+                ("x".to_string(), "y".to_string())
+            ],
+            "only the first rule fires"
+        );
+        assert_eq!(
+            swaps_at(&chain, 650.0),
+            vec![
+                ("a".to_string(), "b".to_string()),
+                ("x".to_string(), "y".to_string()),
+                ("b".to_string(), "c".to_string())
+            ],
+        );
+    }
+
+    /// A rule naming a glyph the source hasn't got is a no-op, and a glyph
+    /// swapped with itself is nothing at all.
+    #[test]
+    fn a_rule_on_a_glyph_that_is_not_there_does_nothing() {
+        let rules = variations(vec![Rule::for_test(
+            &[&[("wght", (400.0, 700.0))]],
+            &[("missing", "b"), ("a", "a"), ("a", "b")],
+        )]);
+        let swaps = rule_swaps(&rules, &design(500.0), |name| name.as_str() != "missing");
+        assert_eq!(
+            swaps,
+            vec![(GlyphName::from("a"), GlyphName::from("b"))],
+            "the substitute is not filtered here: a missing one is the caller's error"
+        );
+    }
+
+    #[test]
+    fn a_swap_exchanges_drawings_and_widths_but_not_heights() {
+        let mut a = GlyphInstance {
+            width: 100.0,
+            height: Some(700.0),
+            vertical_origin: Some(800.0),
+            contours: vec![rect(0.0, 0.0, 10.0, 10.0)],
+            components: vec![Component {
+                base: "x".into(),
+                transform: Affine::IDENTITY,
+                anchor: None,
+            }],
+        };
+        let mut b = GlyphInstance {
+            width: 200.0,
+            height: Some(900.0),
+            vertical_origin: Some(1000.0),
+            contours: vec![rect(0.0, 0.0, 20.0, 20.0)],
+            components: Vec::new(),
+        };
+
+        swap_geometry(&mut a, &mut b);
+
+        assert_eq!((a.width, b.width), (200.0, 100.0));
+        assert_eq!(a.contours, vec![rect(0.0, 0.0, 20.0, 20.0)]);
+        assert_eq!(b.contours, vec![rect(0.0, 0.0, 10.0, 10.0)]);
+        assert!(a.components.is_empty());
+        assert_eq!(b.components.len(), 1);
+        // ufo2ft's swap is a point pen plus `width`; nothing else moves
+        assert_eq!((a.height, b.height), (Some(700.0), Some(900.0)));
+        assert_eq!(
+            (a.vertical_origin, b.vertical_origin),
+            (Some(800.0), Some(1000.0))
+        );
+    }
+
+    #[test]
+    fn a_swap_remaps_component_references_both_ways() {
+        let mut glyph = instance(
+            100.0,
+            Vec::new(),
+            ["a", "b", "c"]
+                .into_iter()
+                .map(|base| Component {
+                    base: base.into(),
+                    transform: Affine::IDENTITY,
+                    anchor: None,
+                })
+                .collect(),
+        );
+
+        assert!(swap_component_bases(&mut glyph, &"a".into(), &"b".into()));
+        assert_eq!(
+            glyph
+                .components
+                .iter()
+                .map(|c| c.base.as_str())
+                .collect::<Vec<_>>(),
+            ["b", "a", "c"]
+        );
+        assert!(
+            !swap_component_bases(&mut glyph, &"y".into(), &"z".into()),
+            "a swap of glyphs nobody references changes nothing"
+        );
+    }
+
+    /// The kerning half of a swap: literal pair keys on either side, and group
+    /// *membership* — never the group's name.
+    ///
+    /// Numbers from `fontmake -m Chain.designspace -i`: a pair `('A','C')` and
+    /// groups `kern1.A = [A]`, `kern2.C = [C]` come out of the swaps
+    /// `A <-> B` then `B <-> C` as `('C','B')`, `kern1.A = [C]`,
+    /// `kern2.C = [B]`.
+    #[test]
+    fn a_swap_renames_kern_pairs_and_group_members() {
+        let mut kerning = KerningInstance {
+            location: regular(),
+            kerns: kerns(&[(kern_pair("A", "C"), -60.0)]),
+            groups: kern_groups(&[
+                (KernGroup::Side1("A".into()), &["A"]),
+                (KernGroup::Side2("C".into()), &["C"]),
+            ]),
+        };
+
+        swap_kerning(&mut kerning, &"A".into(), &"B".into());
+        swap_kerning(&mut kerning, &"B".into(), &"C".into());
+
+        assert_eq!(kerning.kerns, kerns(&[(kern_pair("C", "B"), -60.0)]));
+        assert_eq!(
+            kerning.groups,
+            kern_groups(&[
+                (KernGroup::Side1("A".into()), &["C"]),
+                (KernGroup::Side2("C".into()), &["B"]),
+            ]),
+        );
+    }
+
+    #[test]
+    fn a_swap_leaves_group_sides_alone() {
+        let mut kerning = KerningInstance {
+            location: regular(),
+            kerns: kerns(&[(
+                (
+                    KernSide::Group(KernGroup::Side1("A".into())),
+                    KernSide::Glyph("A".into()),
+                ),
+                -10.0,
+            )]),
+            groups: Default::default(),
+        };
+
+        swap_kerning(&mut kerning, &"A".into(), &"B".into());
+
+        assert_eq!(
+            kerning.kerns.keys().next(),
+            Some(&(
+                KernSide::Group(KernGroup::Side1("A".into())),
+                KernSide::Glyph("B".into()),
+            )),
+            "the group named for A is still named for A"
         );
     }
 }
