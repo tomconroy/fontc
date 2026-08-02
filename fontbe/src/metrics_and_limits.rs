@@ -9,7 +9,7 @@ use std::{
 };
 
 use fontdrasil::orchestration::{Access, AccessBuilder, Work};
-use fontir::orchestration::WorkId as FeWorkId;
+use fontir::orchestration::{Flags, WorkId as FeWorkId};
 use write_fonts::{
     OtRound, dump_table,
     tables::{
@@ -24,6 +24,7 @@ use write_fonts::{
 };
 
 use crate::{
+    cff::bbox_from_cff,
     error::Error,
     orchestration::{AnyWorkId, BeWork, Context, Glyph, WorkId},
 };
@@ -290,6 +291,9 @@ impl Work<Context, AnyWorkId, Error> for MetricAndLimitWork {
             .variant(WorkId::ALL_GLYF_FRAGMENTS)
             // We need composite bboxes to be calculated:
             .variant(WorkId::Glyf)
+            // For CFF flavor builds bounds come from the CFF work instead;
+            // whichever isn't scheduled is trivially fulfilled
+            .variant(WorkId::Cff)
             .variant(WorkId::ExtraFeaTables)
             .build()
     }
@@ -323,30 +327,68 @@ impl Work<Context, AnyWorkId, Error> for MetricAndLimitWork {
             .get()
             .at(static_metadata.default_location());
 
-        // Collate horizontal metrics
-        let builder =
-            glyph_order
-                .iter()
-                .fold(MetricsBuilder::default(), |mut builder, (_gid, gn)| {
-                    // https://github.com/googlefonts/ufo2ft/blob/2f11b0ff/Lib/ufo2ft/outlineCompiler.py#L741-L747
-                    let advance: u16 = context
-                        .ir
-                        .get_glyph(gn.clone())
-                        .default_instance()
-                        .width
-                        .ot_round();
-
-                    let glyph = context.glyphs.get(&WorkId::GlyfFragment(gn.clone()).into());
-
-                    let side_bearing = glyph.data.bbox().map(|bbox| bbox.x_min).unwrap_or_default();
-                    let bounds_advance = glyph
+        // In a CFF build bounds come from the CFF work; there are no glyf fragments
+        let cff = context
+            .flags
+            .contains(Flags::CFF_OUTLINES)
+            .then(|| context.cff.get());
+        let bounds_for =
+            |gid: GlyphId16, gn: &fontdrasil::types::GlyphName| -> Result<Option<Bbox>, Error> {
+                match &cff {
+                    Some(cff) => cff
+                        .glyph_bounds
+                        .get(gid.to_u16() as usize)
+                        .copied()
+                        .flatten()
+                        .map(|bounds| bbox_from_cff(gn, bounds))
+                        .transpose(),
+                    None => Ok(context
+                        .glyphs
+                        .get(&WorkId::GlyfFragment(gn.clone()).into())
                         .data
-                        .bbox()
-                        .map(|bbox| bbox.x_max as i32 - bbox.x_min as i32);
+                        .bbox()),
+                }
+            };
+        // The bounds hhea and head are built from. For glyf these are the same
+        // integers, but fontTools recalculates a CFF font's hhea and head from
+        // the charstrings when it writes them out, and it grows the bounds
+        // *outward* to integers rather than rounding them.
+        let outer_bounds_for =
+            |gid: GlyphId16, gn: &fontdrasil::types::GlyphName| -> Result<Option<Bbox>, Error> {
+                match &cff {
+                    Some(cff) => cff
+                        .glyph_outer_bounds
+                        .get(gid.to_u16() as usize)
+                        .copied()
+                        .flatten()
+                        .map(|bounds| bbox_from_cff(gn, bounds))
+                        .transpose(),
+                    None => bounds_for(gid, gn),
+                }
+            };
 
-                    builder.update(advance, side_bearing, bounds_advance);
-                    builder
-                });
+        // Collate horizontal metrics
+        let mut builder = MetricsBuilder::default();
+        for (gid, gn) in glyph_order.iter() {
+            // https://github.com/googlefonts/ufo2ft/blob/2f11b0ff/Lib/ufo2ft/outlineCompiler.py#L741-L747
+            let advance: u16 = context
+                .ir
+                .get_glyph(gn.clone())
+                .default_instance()
+                .width
+                .ot_round();
+
+            // the side bearing is the rounded box's, but the width it spans —
+            // and so the extent and the right side bearing — is the outer
+            // box's, exactly as fontTools' `hhea.recalc` computes it
+            let side_bearing = bounds_for(gid, gn)?
+                .map(|bbox| bbox.x_min)
+                .unwrap_or_default();
+            let bounds_advance =
+                outer_bounds_for(gid, gn)?.map(|bbox| bbox.x_max as i32 - bbox.x_min as i32);
+
+            builder.update(advance, side_bearing, bounds_advance);
+        }
 
         let metrics = builder.build();
 
@@ -390,40 +432,58 @@ impl Work<Context, AnyWorkId, Error> for MetricAndLimitWork {
             .into();
         context.hmtx.set(raw_hmtx);
 
-        let mut max_builder =
-            glyph_order
-                .iter()
-                .fold(MaxBuilder::default(), |mut builder, (gid, gn)| {
-                    let glyph = context.glyphs.get(&WorkId::GlyfFragment(gn.clone()).into());
-                    builder.update(gid, &glyph);
-                    builder
-                });
+        let (maxp, font_bbox) = if cff.is_some() {
+            // CFF fonts use maxp 0.5: numGlyphs only, no glyf statistics
+            let maxp = Maxp {
+                num_glyphs: glyph_order.len().try_into().unwrap(),
+                ..Default::default()
+            };
+            // head's box is a copy of the CFF FontBBox, which fontTools
+            // recalculates as the enclosing integer box of the union
+            let mut font_bbox: Option<Bbox> = None;
+            for (gid, gn) in glyph_order.iter() {
+                if let Some(bbox) = outer_bounds_for(gid, gn)? {
+                    font_bbox = Some(font_bbox.map_or(bbox, |acc: Bbox| acc.union(bbox)));
+                }
+            }
+            (maxp, font_bbox)
+        } else {
+            let mut max_builder =
+                glyph_order
+                    .iter()
+                    .fold(MaxBuilder::default(), |mut builder, (gid, gn)| {
+                        let glyph = context.glyphs.get(&WorkId::GlyfFragment(gn.clone()).into());
+                        builder.update(gid, &glyph);
+                        builder
+                    });
 
-        // Might as well do maxp while we're here
-        let composite_limits = max_builder.update_composite_limits();
-        let maxp = Maxp {
-            num_glyphs: glyph_order.len().try_into().unwrap(),
-            // maxp computes it's version based on whether fields are set
-            // if you fail to set any of them it gets angry with you so set all of them
-            max_points: Some(max_builder.max_points),
-            max_contours: Some(max_builder.max_contours),
-            max_composite_points: Some(composite_limits.max_points),
-            max_composite_contours: Some(composite_limits.max_contours),
-            max_zones: Some(1),
-            max_twilight_points: Some(0),
-            max_storage: Some(0),
-            max_function_defs: Some(0),
-            max_instruction_defs: Some(0),
-            max_stack_elements: Some(0),
-            max_size_of_instructions: Some(0),
-            max_component_elements: Some(max_builder.max_component_elements),
-            max_component_depth: Some(composite_limits.max_depth),
+            // Might as well do maxp while we're here
+            let composite_limits = max_builder.update_composite_limits();
+            let maxp = Maxp {
+                num_glyphs: glyph_order.len().try_into().unwrap(),
+                // maxp computes it's version based on whether fields are set
+                // if you fail to set any of them it gets angry with you so set all of them
+                max_points: Some(max_builder.max_points),
+                max_contours: Some(max_builder.max_contours),
+                max_composite_points: Some(composite_limits.max_points),
+                max_composite_contours: Some(composite_limits.max_contours),
+                max_zones: Some(1),
+                max_twilight_points: Some(0),
+                max_storage: Some(0),
+                max_function_defs: Some(0),
+                max_instruction_defs: Some(0),
+                max_stack_elements: Some(0),
+                max_size_of_instructions: Some(0),
+                max_component_elements: Some(max_builder.max_component_elements),
+                max_component_depth: Some(composite_limits.max_depth),
+            };
+            (maxp, max_builder.bbox)
         };
         context.maxp.set(maxp);
 
         // Set x/y min/max in head
         let mut head = Arc::unwrap_or_clone(context.head.get());
-        let bbox = max_builder.bbox.unwrap_or_default();
+        let bbox = font_bbox.unwrap_or_default();
         head.x_min = bbox.x_min;
         head.y_min = bbox.y_min;
         head.x_max = bbox.x_max;
@@ -433,7 +493,12 @@ impl Work<Context, AnyWorkId, Error> for MetricAndLimitWork {
         // Since we never set lsb to anything other than x_min it would appear we can *always* set this
         // It's set by default so the only way it gets unset is when source explicitly sets head flags
         // Ref <https://github.com/fonttools/fonttools/blob/7e374c53da9a7443d32b31138a0e5be478bcbab9/Lib/fontTools/ttLib/tables/_m_a_x_p.py#L81C9-L122>
-        head.flags |= head::Flags::LSB_AT_X_0;
+        // fontTools only does this in maxp 1.0's recalc(), which walks glyf. A
+        // CFF font has maxp 0.5 and no glyf, so recalc never runs and whatever
+        // the source asked for in head.flags stands.
+        if cff.is_none() {
+            head.flags |= head::Flags::LSB_AT_X_0;
+        }
 
         context.head.set(head);
 

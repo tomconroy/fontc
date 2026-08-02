@@ -7,6 +7,9 @@ from ttx_diff import core
 _COMPARE_DEFAULTS = "default"
 _COMPARE_GFTOOLS = "gftools"
 
+_FLAVOR_TTF = "ttf"
+_FLAVOR_OTF = "otf"
+
 # Flag definitions (moved from core.py so they appear in --help)
 flags.DEFINE_boolean(
     "version", False, "Show application version and exit.", short_name="V"
@@ -31,6 +34,15 @@ flags.DEFINE_enum(
     "default",
     [_COMPARE_DEFAULTS, _COMPARE_GFTOOLS],
     "Compare results using either a default build or a build managed by gftools. Note that as of 5/21/2023 defaults still sets flags for fontmake to match fontc behavior.",
+)
+flags.DEFINE_enum(
+    "flavor",
+    _FLAVOR_TTF,
+    [_FLAVOR_TTF, _FLAVOR_OTF],
+    "Which outline flavor to build and compare: 'ttf' (quadratic outlines in "
+    "glyf) or 'otf' (cubic outlines in CFF). 'otf' requires a static source "
+    "and --compare default; fontmake is run with --optimize-cff 1 so that "
+    "charstrings are specialized but not subroutinized, matching fontc.",
 )
 flags.DEFINE_enum(
     "rebuild",

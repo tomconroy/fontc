@@ -40,6 +40,7 @@ impl Paths {
             WorkId::GlyfFragment(name) => Paths::glyph_glyf_file(dir, name.as_str()),
             WorkId::GvarFragment(name) => Paths::glyph_gvar_file(dir, name.as_str()),
             WorkId::Avar => dir.join("avar.table"),
+            WorkId::Cff => dir.join("cff.bin"),
             WorkId::Colr => dir.join("colr.table"),
             WorkId::Cpal => dir.join("cpal.table"),
             WorkId::Gasp => dir.join("gasp.table"),

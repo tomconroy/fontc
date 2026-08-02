@@ -1,7 +1,10 @@
 //! Generates a [post](https://learn.microsoft.com/en-us/typography/opentype/spec/post) table.
 
 use fontdrasil::orchestration::{Access, AccessBuilder, Work};
-use fontir::orchestration::WorkId as FeWorkId;
+use fontir::{
+    ir::{GlyphOrder, PostscriptNames},
+    orchestration::{Flags, WorkId as FeWorkId},
+};
 use std::collections::HashMap;
 use write_fonts::{
     OtRound,
@@ -21,6 +24,46 @@ pub fn create_post_work() -> Box<BeWork> {
     Box::new(PostWork {})
 }
 
+/// Glyph names as they appear in the final font (post 2.0 or CFF charset).
+///
+/// When a rename map is present, production names are applied, scrubbed of
+/// characters the Adobe Glyph List spec forbids, and deduplicated, matching
+/// ufo2ft.
+pub(crate) fn final_glyph_names(
+    glyph_order: &GlyphOrder,
+    rename_map: Option<&PostscriptNames>,
+) -> Vec<String> {
+    let Some(rename_map) = rename_map else {
+        // use the original glyph names as-is
+        return glyph_order.names().map(|g| g.to_string()).collect();
+    };
+    let mut seen = HashMap::new();
+    glyph_order
+        .names()
+        .map(|g| {
+            let mut name = rename_map.get(g).unwrap_or(g).to_string();
+            // Adobe Glyph List spec forbids any characters not in [A-Za-z0-9._];
+            // it also says glyphs must not start with a digit or period (except
+            // .notdef) and shouldn't exceed 63 chars, but ufo2ft only enforces
+            // the first rule so we simply follow that.
+            // https://github.com/googlefonts/ufo2ft/blob/2f11b0f/Lib/ufo2ft/postProcessor.py#L220-L233
+            // https://github.com/adobe-type-tools/agl-specification
+            name.retain(|c| c.is_ascii_alphanumeric() || c == '.' || c == '_');
+            // make duplicates unique by adding a .N number suffix to match ufo2ft:
+            if let Some(n) = seen.get(&name) {
+                let mut n = *n;
+                while seen.contains_key(&format!("{name}.{n}")) {
+                    n += 1;
+                }
+                seen.insert(name.clone(), n + 1);
+                name = format!("{name}.{n}");
+            }
+            seen.insert(name.clone(), 1);
+            name
+        })
+        .collect()
+}
+
 impl Work<Context, AnyWorkId, Error> for PostWork {
     fn id(&self) -> AnyWorkId {
         WorkId::Post.into()
@@ -36,8 +79,6 @@ impl Work<Context, AnyWorkId, Error> for PostWork {
 
     /// Generate [post](https://learn.microsoft.com/en-us/typography/opentype/spec/post)
     fn exec(&self, context: &Context) -> Result<(), Error> {
-        // For now we build a v2 table by default, like fontmake does.
-        // TODO optionally drop glyph names with format 3.0.
         // TODO a more serious post
         let static_metadata = context.ir.static_metadata.get();
         let metrics = context
@@ -47,38 +88,15 @@ impl Work<Context, AnyWorkId, Error> for PostWork {
             .at(static_metadata.default_location());
         let glyph_order = context.ir.glyph_order.get();
 
-        let mut post = if let Some(rename_map) = &static_metadata.postscript_names {
-            // rename glyphs for 'production' using the provided rename map
-            let mut seen = HashMap::new();
-            let final_glyph_names: Vec<_> = glyph_order
-                .names()
-                .map(|g| {
-                    let mut name = rename_map.get(g).unwrap_or(g).to_string();
-                    // Adobe Glyph List spec forbids any characters not in [A-Za-z0-9._];
-                    // it also says glyphs must not start with a digit or period (except
-                    // .notdef) and shouldn't exceed 63 chars, but ufo2ft only enforces
-                    // the first rule so we simply follow that.
-                    // https://github.com/googlefonts/ufo2ft/blob/2f11b0f/Lib/ufo2ft/postProcessor.py#L220-L233
-                    // https://github.com/adobe-type-tools/agl-specification
-                    name.retain(|c| c.is_ascii_alphanumeric() || c == '.' || c == '_');
-                    // make duplicates unique by adding a .N number suffix to match ufo2ft:
-                    if let Some(n) = seen.get(&name) {
-                        let mut n = *n;
-                        while seen.contains_key(&format!("{name}.{n}")) {
-                            n += 1;
-                        }
-                        seen.insert(name.clone(), n + 1);
-                        name = format!("{name}.{n}");
-                    }
-                    seen.insert(name.clone(), 1);
-                    name
-                })
-                .collect();
-
-            Post::new_v2(final_glyph_names.iter().map(|g| g.as_str()))
+        let mut post = if context.flags.contains(Flags::CFF_OUTLINES) {
+            // CFF fonts carry glyph names in the CFF charset; like ufo2ft we
+            // emit a nameless format 3.0 post
+            Post::new_v3()
         } else {
-            // use the original glyph names as-is
-            Post::new_v2(glyph_order.names().map(|g| g.as_str()))
+            // For TrueType we build a v2 table by default, like fontmake does.
+            let final_glyph_names =
+                final_glyph_names(&glyph_order, static_metadata.postscript_names.as_ref());
+            Post::new_v2(final_glyph_names.iter().map(|g| g.as_str()))
         };
 
         post.is_fixed_pitch = static_metadata.misc.is_fixed_pitch.unwrap_or_default() as u32;

@@ -18,7 +18,7 @@ use serde::de::DeserializeOwned;
 
 use crate::{
     BuildType, Results, Target,
-    args::CiArgs,
+    args::{CiArgs, Flavor},
     error::Error,
     ttx_diff_runner::{DiffError, DiffOutput},
 };
@@ -47,6 +47,8 @@ struct RunSummary {
     // it is intended that when this list is updated, the filename is changed.
     #[serde(alias = "input_file")]
     input_file_sha: String,
+    #[serde(default)]
+    flavor: Flavor,
     stats: super::ttx_diff_runner::Summary,
 }
 
@@ -124,14 +126,24 @@ fn run_crater_and_save_results(args: &CiArgs) -> Result<(), Error> {
     let input_file_sha = super::get_input_sha(&args.to_run);
 
     let cache_dir = args.cache_dir();
-    inputs.update_fonts_repo(&cache_dir)?;
+    // the google/fonts clone is only needed to resolve external configs
+    if inputs
+        .sources
+        .iter()
+        .any(|source| source.config_is_external())
+    {
+        inputs.update_fonts_repo(&cache_dir)?;
+    } else {
+        log::info!("no external configs, skipping google/fonts update");
+    }
     log::info!("using cache dir {}", cache_dir.display());
-    let results_cache = ResultsCache::in_dir(&cache_dir);
+    let results_cache = ResultsCache::in_dir(&cache_dir, args.flavor);
 
     if let Some(last_run) = prev_runs.last() {
         if last_run.fontc_rev == fontc_rev
             && input_file_sha == last_run.input_file_sha
             && pip_freeze_sha == last_run.pip_freeze_sha
+            && last_run.flavor == args.flavor
         {
             log::info!("no changes since last run, skipping");
             return Ok(());
@@ -159,7 +171,10 @@ fn run_crater_and_save_results(args: &CiArgs) -> Result<(), Error> {
         failures,
     } = make_targets(&cache_dir, &inputs.sources);
 
-    if !args.gftools {
+    if !args.gftools || args.flavor == Flavor::Otf {
+        if args.gftools && args.flavor == Flavor::Otf {
+            log::info!("--flavor otf only runs default builds, ignoring gftools targets");
+        }
         targets.retain(|t| t.build == BuildType::Default);
     }
 
@@ -170,6 +185,7 @@ fn run_crater_and_save_results(args: &CiArgs) -> Result<(), Error> {
         normalizer_path,
         source_cache: cache_dir,
         results_cache,
+        flavor: args.flavor,
     };
 
     let began = Utc::now();
@@ -199,6 +215,7 @@ fn run_crater_and_save_results(args: &CiArgs) -> Result<(), Error> {
         pip_freeze_sha,
         results_file,
         input_file_sha,
+        flavor: args.flavor,
         stats: summary,
     };
 

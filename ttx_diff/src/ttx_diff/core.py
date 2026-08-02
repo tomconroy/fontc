@@ -17,6 +17,9 @@ Usage:
     # compare two precompiled fonts directly (no compilation from source)
     python resources/scripts/ttx_diff.py --fontc_font path/to/fontc.ttf --fontmake_font path/to/fontmake.ttf
 
+    # compare CFF (.otf) output instead of glyf (.ttf); static sources only
+    python resources/scripts/ttx_diff.py --flavor otf ../resources/testdata/Static-Regular.ufo
+
 JSON:
     If the `--json` flag is passed, this tool will output JSON.
 
@@ -72,6 +75,10 @@ FLAGS = flags.FLAGS
 # used instead of a tag for the normalized mark/kern output
 MARK_KERN_NAME = "(mark/kern)"
 LIG_CARET_NAME = "ligcaret"
+# outline flavors we can compare; the value doubles as the file extension
+# and as fontmake's `-o` build type for a static source
+FLAVOR_TTF = "ttf"
+FLAVOR_OTF = "otf"
 # maximum chars of stderr to include when reporting errors; prevents
 # too much bloat when run in CI
 MAX_ERR_LEN = 1000
@@ -223,8 +230,18 @@ def build(cmd: Sequence, build_dir: Optional[Path], **kwargs):
         raise BuildFail(cmd, output.stderr or output.stdout)
 
 
+def font_suffix() -> str:
+    """The file extension for the outline flavor we're comparing, e.g. '.otf'."""
+    return "." + FLAGS.flavor
+
+
+def output_font_path(build_dir: Path, compiler: str) -> Path:
+    """Where a given compiler's binary lands, e.g. build_dir/'fontc.otf'."""
+    return build_dir / (compiler + font_suffix())
+
+
 def build_fontc(source: Path, fontc_bin: Path, build_dir: Path):
-    out_file = build_dir / "fontc.ttf"
+    out_file = output_font_path(build_dir, "fontc")
     if out_file.exists():
         eprint(f"reusing {rel_user(out_file)}")
         return
@@ -237,6 +254,8 @@ def build_fontc(source: Path, fontc_bin: Path, build_dir: Path):
         source,
         "--emit-debug",
     ]
+    if FLAGS.flavor != FLAVOR_TTF:
+        cmd += ["--flavor", FLAGS.flavor]
     if FLAGS.keep_direction:
         cmd.append("--keep-direction")
     if not FLAGS.production_names:
@@ -245,13 +264,19 @@ def build_fontc(source: Path, fontc_bin: Path, build_dir: Path):
 
 
 def build_fontmake(source: Path, build_dir: Path):
-    out_file = build_dir / "fontmake.ttf"
+    out_file = output_font_path(build_dir, "fontmake")
     if out_file.exists():
         eprint(f"reusing {rel_user(out_file)}")
         return
     variable = source_is_variable(source)
-    buildtype = "variable"
-    if not variable:
+    if FLAGS.flavor == FLAVOR_OTF:
+        # guarded in main(), but this is the only place that knows the
+        # buildtype so be explicit rather than silently building something else
+        assert not variable, "otf flavor requires a static source"
+        buildtype = "otf"
+    elif variable:
+        buildtype = "variable"
+    else:
         buildtype = "ttf"
     cmd = [
         "fontmake",
@@ -264,6 +289,13 @@ def build_fontmake(source: Path, build_dir: Path):
         "--debug-feature-file",
         "debug.fea",
     ]
+    if FLAGS.flavor == FLAVOR_OTF:
+        # 1 = specialize the charstring operators but do not subroutinize.
+        # fontc's CFF writer specializes too; subroutinization (the default, 2)
+        # rewrites the whole table via cffsubr/compreffor purely to save space,
+        # so leaving it on would make every charstring differ for reasons that
+        # have nothing to do with correctness.
+        cmd += ["--optimize-cff", "1"]
     if FLAGS.keep_direction:
         cmd.append("--keep-direction")
     if not FLAGS.production_names:
@@ -343,8 +375,7 @@ def run_gftools(
 ):
     config_path = Path(config)
     tool = "fontmake" if fontc_bin is None else "fontc"
-    filename = tool + ".ttf"
-    out_file = build_dir / filename
+    out_file = output_font_path(build_dir, tool)
     if out_file.exists():
         eprint(f"reusing {rel_user(out_file)}")
         return
@@ -1043,12 +1074,12 @@ def reorder_contextual_class_based_rules(
 
 def fill_in_gvar_deltas(
     fontc: etree.ElementTree,
-    fontc_ttf: Path,
+    fontc_path: Path,
     fontmake: etree.ElementTree,
-    fontmake_ttf: Path,
+    fontmake_path: Path,
 ):
-    fontc_font = TTFont(fontc_ttf)
-    fontmake_font = TTFont(fontmake_ttf)
+    fontc_font = TTFont(fontc_path)
+    fontmake_font = TTFont(fontmake_path)
     dense_fontc_count = densify_gvar(fontc_font, fontc)
     dense_fontmake_count = densify_gvar(fontmake_font, fontmake)
 
@@ -1275,10 +1306,10 @@ def get_table_sizes(fontfile: Path) -> dict[str, int]:
 
 # return a dict of table tag  -> size difference
 # only when size difference exceeds some threshold
-def check_sizes(fontmake_ttf: Path, fontc_ttf: Path):
+def check_sizes(fontmake_font: Path, fontc_font: Path):
     THRESHOLD = 1 / 10
-    fontmake = get_table_sizes(fontmake_ttf)
-    fontc = get_table_sizes(fontc_ttf)
+    fontmake = get_table_sizes(fontmake_font)
+    fontc = get_table_sizes(fontc_font)
 
     output = dict()
     shared_keys = set(fontmake.keys() & fontc.keys())
@@ -1298,25 +1329,25 @@ def check_sizes(fontmake_ttf: Path, fontc_ttf: Path):
 
 # returns a dictionary of {"compiler_name":  {"tag": "xml_text"}}
 def generate_output(
-    build_dir: Path, otl_norm_bin: Path, fontmake_ttf: Path, fontc_ttf: Path
+    build_dir: Path, otl_norm_bin: Path, fontmake_font: Path, fontc_font: Path
 ):
     with timed("ttx fontc"):
-        fontc_ttx = run_ttx(fontc_ttf)
+        fontc_ttx = run_ttx(fontc_font)
     with timed("ttx fontmake"):
-        fontmake_ttx = run_ttx(fontmake_ttf)
+        fontmake_ttx = run_ttx(fontmake_font)
     with timed("normalize fontc gpos"):
-        fontc_gpos = run_normalizer(otl_norm_bin, fontc_ttf, "gpos")
+        fontc_gpos = run_normalizer(otl_norm_bin, fontc_font, "gpos")
     with timed("normalize fontmake gpos"):
-        fontmake_gpos = run_normalizer(otl_norm_bin, fontmake_ttf, "gpos")
+        fontmake_gpos = run_normalizer(otl_norm_bin, fontmake_font, "gpos")
     with timed("normalize fontc gdef"):
-        fontc_gdef = run_normalizer(otl_norm_bin, fontc_ttf, "gdef")
+        fontc_gdef = run_normalizer(otl_norm_bin, fontc_font, "gdef")
     with timed("normalize fontmake gdef"):
-        fontmake_gdef = run_normalizer(otl_norm_bin, fontmake_ttf, "gdef")
+        fontmake_gdef = run_normalizer(otl_norm_bin, fontmake_font, "gdef")
 
     fontc = etree.parse(fontc_ttx)
     fontmake = etree.parse(fontmake_ttx)
     with timed("fill_in_gvar_deltas"):
-        fill_in_gvar_deltas(fontc, fontc_ttf, fontmake, fontmake_ttf)
+        fill_in_gvar_deltas(fontc, fontc_font, fontmake, fontmake_font)
     with timed("reduce_diff_noise"):
         reduce_diff_noise(fontc, fontmake)
 
@@ -1325,7 +1356,7 @@ def generate_output(
     with timed("extract_comparables fontmake"):
         fontmake = extract_comparables(fontmake, build_dir, "fontmake")
     with timed("check_sizes"):
-        size_diffs = check_sizes(fontmake_ttf, fontc_ttf)
+        size_diffs = check_sizes(fontmake_font, fontc_font)
     fontc[MARK_KERN_NAME] = fontc_gpos
     fontmake[MARK_KERN_NAME] = fontmake_gpos
     if len(fontc_gdef):
@@ -1492,20 +1523,21 @@ def resolve_source(source: str) -> Path:
 
 
 def delete_things_we_must_rebuild(
-    rebuild: str, fontmake_ttf: Path, fontc_ttf: Path, skip_fonts: bool = False
+    rebuild: str, fontmake_font: Path, fontc_font: Path, skip_fonts: bool = False
 ):
     # we delete all resources that we have to rebuild. The rest of the script
     # will assume it can reuse anything that still exists.
-    for tool, ttf_path in [("fontmake", fontmake_ttf), ("fontc", fontc_ttf)]:
+    # (with_suffix() carries the flavor through: fontc.otf -> fontc.ttx etc.)
+    for tool, font_path in [("fontmake", fontmake_font), ("fontc", fontc_font)]:
         must_rebuild = rebuild in [tool, "both"]
         if must_rebuild:
             paths = [
-                ttf_path.with_suffix(".ttx"),
-                ttf_path.with_suffix(".markkern.txt"),
-                ttf_path.with_suffix(".ligcaret.txt"),
+                font_path.with_suffix(".ttx"),
+                font_path.with_suffix(".markkern.txt"),
+                font_path.with_suffix(".ligcaret.txt"),
             ]
             if not skip_fonts:
-                paths.append(ttf_path)
+                paths.append(font_path)
             for path in paths:
                 if path.exists():
                     os.remove(path)
@@ -1609,6 +1641,20 @@ def main(argv):
 
     source = resolve_source(argv[1]).resolve() if has_source else None
 
+    if FLAGS.flavor == FLAVOR_OTF:
+        # CFF (flavor otf) is static-only on both sides for now: fontc has no
+        # CFF2 writer, so there is nothing to compare a variable build against.
+        if source is not None and source_is_variable(source):
+            sys.exit(
+                f"--flavor otf requires a static source, but '{rel_user(source)}' is "
+                "variable (fontc cannot write CFF2 yet)"
+            )
+        if FLAGS.compare != "default":
+            sys.exit(
+                f"--flavor otf is only supported with --compare default, not "
+                f"'{FLAGS.compare}'"
+            )
+
     # Check if we're in the fontc repository (optional - allows building binaries)
     cwd = Path(".").resolve()
     fontc_repo_root = None
@@ -1651,8 +1697,8 @@ def main(argv):
 
     failures = dict()
 
-    fontmake_ttf = build_dir / "fontmake.ttf"
-    fontc_ttf = build_dir / "fontc.ttf"
+    fontmake_out = output_font_path(build_dir, "fontmake")
+    fontc_out = output_font_path(build_dir, "fontc")
 
     total_start = time.time()
 
@@ -1674,14 +1720,14 @@ def main(argv):
             eprint(
                 "WARN: --rebuild flag ignored with precompiled fonts (always rebuilds derived files)"
             )
-        delete_things_we_must_rebuild("both", fontmake_ttf, fontc_ttf, skip_fonts=True)
+        delete_things_we_must_rebuild("both", fontmake_out, fontc_out, skip_fonts=True)
 
-        if fontc_input != fontc_ttf:
-            copy(fontc_input, fontc_ttf)
-        if fontmake_input != fontmake_ttf:
-            copy(fontmake_input, fontmake_ttf)
+        if fontc_input != fontc_out:
+            copy(fontc_input, fontc_out)
+        if fontmake_input != fontmake_out:
+            copy(fontmake_input, fontmake_out)
     else:
-        delete_things_we_must_rebuild(FLAGS.rebuild, fontmake_ttf, fontc_ttf)
+        delete_things_we_must_rebuild(FLAGS.rebuild, fontmake_out, fontc_out)
 
         with timed("build fontc"):
             try:
@@ -1711,10 +1757,10 @@ def main(argv):
     report_errors_and_exit_if_there_were_any(failures)
 
     # if compilation completed, these exist
-    assert fontmake_ttf.is_file(), fontmake_ttf
-    assert fontc_ttf.is_file(), fontc_ttf
+    assert fontmake_out.is_file(), fontmake_out
+    assert fontc_out.is_file(), fontc_out
 
-    output = generate_output(build_dir, otl_bin_path, fontmake_ttf, fontc_ttf)
+    output = generate_output(build_dir, otl_bin_path, fontmake_out, fontc_out)
     if output["fontc"] == output["fontmake"]:
         eprint("output is identical")
     else:

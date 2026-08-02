@@ -5,6 +5,7 @@ use fontir::orchestration::WorkId as FeWorkId;
 use log::debug;
 use write_fonts::{
     FontBuilder,
+    ps::cff::v1::Cff,
     read::TopLevelTable,
     tables::{
         avar::Avar, cmap::Cmap, colr::Colr, cpal::Cpal, fvar::Fvar, gasp::Gasp, gdef::Gdef,
@@ -42,6 +43,7 @@ fn is_variable_only(workid: &WorkId) -> bool {
 
 const TABLES_TO_MERGE: &[(WorkId, Tag)] = &[
     (WorkId::Avar, Avar::TAG),
+    (WorkId::Cff, Cff::TAG),
     (WorkId::Cmap, Cmap::TAG),
     (WorkId::Colr, Colr::TAG),
     (WorkId::Cpal, Cpal::TAG),
@@ -72,6 +74,7 @@ const TABLES_TO_MERGE: &[(WorkId, Tag)] = &[
 fn has(context: &Context, id: WorkId) -> bool {
     match id {
         WorkId::Avar => context.avar.try_get().is_some(),
+        WorkId::Cff => context.cff.try_get().is_some(),
         WorkId::Cmap => context.cmap.try_get().is_some(),
         WorkId::Colr => context.colr.try_get().is_some(),
         WorkId::Cpal => context.cpal.try_get().is_some(),
@@ -105,6 +108,7 @@ fn bytes_for(context: &Context, id: WorkId) -> Result<Option<Vec<u8>>, Error> {
     // TODO: to_vec copies :(
     let bytes = match id {
         WorkId::Avar => context.avar.get().as_ref().as_ref().and_then(to_bytes),
+        WorkId::Cff => Some(context.cff.get().table.clone()),
         WorkId::Cmap => to_bytes(context.cmap.get().as_ref()),
         WorkId::Colr => to_bytes(context.colr.get().as_ref()),
         WorkId::Cpal => to_bytes(context.cpal.get().as_ref()),
@@ -143,6 +147,7 @@ impl Work<Context, AnyWorkId, Error> for FontWork {
     fn read_access(&self) -> Access<AnyWorkId> {
         AccessBuilder::new()
             .variant(WorkId::Avar)
+            .variant(WorkId::Cff)
             .variant(WorkId::Cmap)
             .variant(WorkId::Colr)
             .variant(WorkId::Cpal)

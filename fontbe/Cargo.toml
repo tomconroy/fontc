@@ -17,6 +17,7 @@ fea-rs = { version = "0.22.0", path = "../fea-rs", features = ["serde"] }
 tinystr = {version = "0.8.0", features = ["serde"] }
 
 icu_properties.workspace = true
+unicode-normalization.workspace = true
 serde.workspace = true
 bincode.workspace = true
 

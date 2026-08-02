@@ -1,0 +1,73 @@
+{
+.formatVersion = 3;
+familyName = DuplicateMetrics;
+metrics = (
+{
+type = ascender;
+},
+{
+type = baseline;
+},
+{
+name = "Alef Height";
+},
+{
+filter = "script == \"latin\"";
+type = "x-height";
+},
+{
+type = "x-height";
+},
+{
+},
+{
+}
+);
+fontMaster = (
+{
+id = m01;
+name = Regular;
+metricValues = (
+{
+over = 20;
+pos = 800;
+},
+{
+over = -20;
+},
+{
+over = 20;
+pos = 700;
+},
+{
+over = 20;
+pos = 300;
+},
+{
+over = 20;
+pos = 300;
+},
+{
+over = 20;
+pos = 600;
+},
+{
+over = 20;
+pos = 600;
+}
+);
+}
+);
+glyphs = (
+{
+glyphname = space;
+layers = (
+{
+layerId = m01;
+width = 200;
+}
+);
+}
+);
+unitsPerEm = 1000;
+}

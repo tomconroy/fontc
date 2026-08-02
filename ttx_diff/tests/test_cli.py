@@ -3,7 +3,9 @@
 import subprocess
 import sys
 
-from ttx_diff.core import source_is_variable
+import pytest
+
+from ttx_diff.core import output_font_path, source_is_variable
 
 
 def _write_designspace(tmp_path, axes, sources):
@@ -148,3 +150,64 @@ class TestSourceIsVariable:
         # 1 master at wght=400, virtual master at wght=700
         path = _write_glyphs(tmp_path, masters=[400], virtual_masters=[700])
         assert source_is_variable(path)
+
+
+@pytest.fixture
+def flavor():
+    """Set --flavor for the duration of a test, then put it back."""
+    from absl import flags
+
+    import ttx_diff.__main__  # noqa: F401  (defines the flag)
+
+    if not flags.FLAGS.is_parsed():
+        flags.FLAGS.mark_as_parsed()
+    previous = flags.FLAGS.flavor
+
+    def setter(value):
+        flags.FLAGS.flavor = value
+
+    yield setter
+    flags.FLAGS.flavor = previous
+
+
+class TestFlavor:
+    def test_ttf_is_the_default(self, tmp_path, flavor):
+        assert output_font_path(tmp_path, "fontc") == tmp_path / "fontc.ttf"
+        assert output_font_path(tmp_path, "fontmake") == tmp_path / "fontmake.ttf"
+
+    def test_otf_names(self, tmp_path, flavor):
+        flavor("otf")
+        assert output_font_path(tmp_path, "fontc") == tmp_path / "fontc.otf"
+        assert output_font_path(tmp_path, "fontmake") == tmp_path / "fontmake.otf"
+
+    def test_otf_rejects_variable_source(self, tmp_path):
+        # fontc has no CFF2 writer, so there is nothing to compare
+        path = _write_glyphs(tmp_path, masters=[400, 700])
+        result = subprocess.run(
+            [sys.executable, "-m", "ttx_diff", "--flavor", "otf", str(path)],
+            capture_output=True,
+            text=True,
+        )
+        assert result.returncode != 0
+        assert "--flavor otf requires a static source" in result.stderr
+
+    def test_otf_rejects_gftools_compare(self, tmp_path):
+        ufo = tmp_path / "test.ufo"
+        ufo.mkdir()
+        (ufo / "metainfo.plist").write_text("")
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "ttx_diff",
+                "--flavor",
+                "otf",
+                "--compare",
+                "gftools",
+                str(ufo),
+            ],
+            capture_output=True,
+            text=True,
+        )
+        assert result.returncode != 0
+        assert "--flavor otf is only supported with --compare default" in result.stderr

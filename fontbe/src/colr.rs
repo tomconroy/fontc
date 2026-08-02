@@ -10,7 +10,7 @@ use fontdrasil::{
 };
 use fontir::{
     ir::{self, ColorPalettes, GlyphOrder},
-    orchestration::WorkId as FeWorkId,
+    orchestration::{Flags, WorkId as FeWorkId},
 };
 use write_fonts::{
     OtRound,
@@ -354,6 +354,11 @@ impl Work<Context, AnyWorkId, Error> for ColrWork {
         let Some(paint_graph) = context.ir.paint_graph.try_get() else {
             return Ok(());
         };
+        // COLR clip boxes are computed from glyf fragments, which a CFF build
+        // never produces
+        if context.flags.contains(Flags::CFF_OUTLINES) {
+            return Err(Error::ColrNotSupportedForCff);
+        }
         let palette = context.ir.colors.try_get().unwrap_or_default();
         let glyph_order = context.ir.glyph_order.get();
         let static_metadata = context.ir.static_metadata.get();

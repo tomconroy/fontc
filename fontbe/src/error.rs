@@ -55,6 +55,14 @@ pub enum Error {
     },
     #[error("{what} out of bounds: {value}")]
     OutOfBounds { what: String, value: String },
+    #[error("CFF output is only supported for static fonts; this font has variable axes")]
+    CffNotStatic,
+    #[error("'{0}' has components; CFF glyphs must be decomposed first")]
+    CffGlyphHasComponents(GlyphName),
+    #[error("Unable to build the CFF table: {0}")]
+    CffBuildError(#[from] write_fonts::ps::cff::v1::CffBuildError),
+    #[error("COLR is not yet supported with CFF outlines (--flavor otf)")]
+    ColrNotSupportedForCff,
     #[error("Unable to compute deltas for {0}: {1}")]
     GlyphDeltaError(GlyphName, DeltaError),
     #[error("Unable to compute deltas for MVAR {0}: {1}")]

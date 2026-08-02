@@ -419,6 +419,11 @@ fn collect_component_locations_nested(
 /// At time of writing we only support this if every instance uses the same set of components.
 ///
 /// <https://github.com/googlefonts/ufo2ft/blob/dd738cdcd/Lib/ufo2ft/util.py#L165>
+/// The order matters: ufo2ft decomposes with a recursive point pen, so a
+/// component's own contours arrive before the contours of anything it
+/// references, and a nested composite is fully drawn before its next sibling.
+/// That is a depth-first walk, which is why the frontier below is used as a
+/// stack of runs rather than a queue.
 fn convert_components_to_contours(context: &Context, original: &Glyph) -> Result<(), BadGlyph> {
     let original = ensure_composite_defined_at_component_locations(context, original)?;
     // Component until you can't component no more
@@ -447,12 +452,17 @@ fn convert_components_to_contours(context: &Context, original: &Glyph) -> Result
         // ensure referenced glyph has any required intermediate locations
         let referenced_glyph =
             ensure_component_has_consistent_layers(&original, &referenced_glyph, context)?;
-        frontier.extend(
-            components(&referenced_glyph, component_affine)
-                .iter()
-                .filter(|(component_loc, _)| *component_loc == loc)
-                .cloned(),
-        );
+        // Descend into this component before moving on to its siblings, so
+        // its subtree's contours stay together and in source order — pushing
+        // them onto the back instead would emit every sibling's contours
+        // first, which is what ufo2ft's recursive pen never does.
+        for nested in components(&referenced_glyph, component_affine)
+            .iter()
+            .filter(|(component_loc, _)| *component_loc == loc)
+            .rev()
+        {
+            frontier.push_front(nested.clone());
+        }
 
         trace!(
             "'{}' retains {} {component_affine:?} at {loc:?}",
@@ -629,6 +639,41 @@ fn flatten_glyph(context: &Context, glyph: &Glyph) -> Result<(), BadGlyph> {
     Ok(())
 }
 
+/// The glyphs of `glyph_order`, deepest composites first.
+///
+/// ufo2ft's filters run in this order for a reason it spells out: *"process
+/// composite glyphs in decreasing component depth order ... to avoid
+/// order-dependent interferences while filtering glyphs with nested
+/// components"* (`filters/base.py`, ufo2ft#621).
+///
+/// Take `oopenmod -> oopen -> c` in Questrial. Decomposing `oopen` first
+/// leaves contours with its component's transform already baked in, and
+/// `oopenmod` then applies its own transform to *those* — two roundings of the
+/// same point instead of one. Deepest first, `oopen` is still a composite when
+/// `oopenmod` is decomposed, so the two transforms compose into one matrix,
+/// which is what fontmake measures.
+///
+/// Glyphs whose depth is indeterminate (component cycles or bad references)
+/// come last; they are broken either way, but they still get processed.
+fn deepest_composites_first(context: &Context, glyph_order: &GlyphOrder) -> Vec<GlyphName> {
+    let glyphs = context.glyphs.all();
+    let by_name = glyphs
+        .iter()
+        .map(|(_, glyph)| (glyph.name.clone().into_inner(), glyph.as_ref()))
+        .collect();
+    let shallowest_first = fontdrasil::util::depth_sorted_composite_glyphs(&by_name);
+
+    let mut ordered: Vec<GlyphName> = shallowest_first
+        .iter()
+        .rev()
+        .map(GlyphName::from)
+        .filter(|name| glyph_order.contains(name))
+        .collect();
+    let seen: HashSet<_> = ordered.iter().cloned().collect();
+    ordered.extend(glyph_order.names().filter(|n| !seen.contains(*n)).cloned());
+    ordered
+}
+
 /// Run some optional transformations on the glyphs listed.
 ///
 /// This includes decomposing all components, or only those with non-identity
@@ -638,9 +683,12 @@ fn apply_optional_transformations(
     context: &Context,
     glyph_order: &GlyphOrder,
 ) -> Result<(), BadGlyph> {
+    // like ufo2ft's filters, deepest composites first
+    let ordered = deepest_composites_first(context, glyph_order);
+
     // If we are decomposing all components, the rest of the flags can be ignored
     if context.flags.contains(Flags::DECOMPOSE_COMPONENTS) {
-        for glyph_name in glyph_order.names() {
+        for glyph_name in ordered.iter() {
             let glyph = context.get_glyph(glyph_name.clone());
             if !glyph.default_instance().components.is_empty() {
                 convert_components_to_contours(context, &glyph)?;
@@ -658,7 +706,7 @@ fn apply_optional_transformations(
         .flags
         .contains(Flags::DECOMPOSE_TRANSFORMED_COMPONENTS)
     {
-        for glyph_name in glyph_order.names() {
+        for glyph_name in ordered.iter() {
             let glyph = context.get_glyph(glyph_name.clone());
             if glyph.has_nonidentity_2x2() {
                 convert_components_to_contours(context, &glyph)?;
@@ -667,7 +715,7 @@ fn apply_optional_transformations(
     }
 
     if context.flags.contains(Flags::FLATTEN_COMPONENTS) {
-        for glyph_name in glyph_order.names() {
+        for glyph_name in ordered.iter() {
             let glyph = context.get_glyph(glyph_name.clone());
             flatten_glyph(context, &glyph)?;
         }
@@ -1390,6 +1438,119 @@ mod tests {
                 .iter()
                 .map(|bez| bez.to_svg())
                 .collect::<Vec<_>>(),
+        );
+    }
+
+    /// ufo2ft decomposes through a recursive point pen, so a nested composite
+    /// is drawn out completely before the next sibling component starts.
+    /// Walking the components breadth-first instead emits every shallow
+    /// sibling ahead of anything nested, which reversed the contours of the
+    /// NotoSerifDivesAkuru conjuncts (`ka_aiVowel-divesakuru` is a plain
+    /// component plus a component that is itself a composite).
+    #[test]
+    fn components_to_contours_is_depth_first() {
+        let test_data = deep_component();
+        let context = test_context();
+        test_data.write_to(&context);
+
+        // c2 -> c1 -> shape, then a bare shape as its sibling: the two
+        // components sit at different depths, which is what tells a
+        // depth-first walk apart from a breadth-first one
+        let mut mixed_depth = TestGlyph::new("g");
+        mixed_depth
+            .add_component(test_data.deep_component.name.as_str(), Affine::IDENTITY)
+            .add_component(
+                test_data.simple_glyph.name.as_str(),
+                Affine::translate((0.0, 9.0)),
+            );
+
+        convert_components_to_contours(&context, &mixed_depth.0).unwrap();
+        let simple = context.get_glyph("g");
+        assert_simple(&simple);
+
+        assert_eq!(
+            vec![
+                // c2's subtree resolves first, all the way down to shape
+                "M6,-1 L6,-2 L7,-2 Z",
+                // and only then the shallow sibling
+                "M1,10 L2,10 L2,11 Z",
+            ],
+            simple
+                .default_instance()
+                .contours
+                .iter()
+                .map(|bez| bez.to_svg())
+                .collect::<Vec<_>>(),
+        );
+    }
+
+    /// Decomposing a shallow composite before a deeper one that uses it bakes
+    /// the inner transform into contours, and the outer transform is then
+    /// applied to *those* — two multiplications where fontmake does one, which
+    /// can land on the other side of a rounding boundary. ufo2ft's filters
+    /// order glyphs deepest-first to avoid exactly this.
+    ///
+    /// The numbers are Questrial's `oopenmod -> oopen -> c`: the point at
+    /// x=109 reaches 304.49999999999994 composed (rounds to 304, which is what
+    /// fontmake wrote) but exactly 304.5 in two steps (rounds to 305).
+    #[test]
+    fn decompose_composes_transforms_rather_than_stacking_them() {
+        let inner_to_mid = Affine::new([-1.0, 0.0, 0.0, 1.0, 544.0, 0.0]);
+        let mid_to_outer = Affine::new([0.7, 0.0, 0.0, 0.65, 0.0, 290.0]);
+
+        let mut inner = TestGlyph::new("inner");
+        let mut path = BezPath::new();
+        path.move_to((109.0, 157.0));
+        path.line_to((200.0, 157.0));
+        path.line_to((200.0, 250.0));
+        path.close_path();
+        inner.add_contour(path);
+
+        let mut mid = TestGlyph::new("mid");
+        mid.add_component("inner", inner_to_mid);
+        let mut outer = TestGlyph::new("outer");
+        outer.add_component("mid", mid_to_outer);
+
+        let context = Context::new_root(Flags::DECOMPOSE_COMPONENTS, None)
+            .copy_for_work(Access::All, Access::All);
+        context
+            .static_metadata
+            .set(test_context().static_metadata.get().as_ref().clone());
+        for glyph in [&inner.0, &mid.0, &outer.0] {
+            context.glyphs.set(glyph.clone());
+        }
+        // glyph order puts the shallow composite first, which is the order
+        // that used to decide the answer
+        let mut glyph_order = GlyphOrder::new();
+        for name in ["inner", "mid", "outer"] {
+            glyph_order.insert(name.into());
+        }
+
+        apply_optional_transformations(&context, &glyph_order).unwrap();
+
+        let outer = context.get_glyph("outer");
+        let corner = kurbo::Point::new(109.0, 157.0);
+        // the flip in inner_to_mid reverses the contour, so look at the
+        // whole contour rather than assuming where the corner landed
+        let xs: Vec<f64> = outer.default_instance().contours[0]
+            .elements()
+            .iter()
+            .filter_map(|el| match el {
+                kurbo::PathEl::MoveTo(p) | kurbo::PathEl::LineTo(p) => Some(p.x),
+                _ => None,
+            })
+            .collect();
+        let composed = ((mid_to_outer * inner_to_mid) * corner).x;
+        let stacked = 0.7 * (inner_to_mid * corner).x;
+        assert_eq!(composed, 304.49999999999994);
+        assert_eq!(stacked, 304.5);
+        assert!(
+            xs.contains(&composed),
+            "the two transforms must be composed before they are applied, got {xs:?}"
+        );
+        assert!(
+            !xs.contains(&stacked),
+            "applying them one after the other lands on 304.5, which rounds up"
         );
     }
 

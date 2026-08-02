@@ -74,6 +74,20 @@ impl GlyphPathBuilder {
         self.first_oncurve.is_none() && self.leading_offcurve.is_empty()
     }
 
+    /// The point of a contour that was given exactly one point, of any type.
+    ///
+    /// Only a one-point contour can reach [`Self::end_path`] with a lone
+    /// `MoveTo` and nothing pending: a second on-curve point would have pushed
+    /// a second element, and an off-curve point is either still pending or was
+    /// consumed by an on-curve point that pushed one.
+    fn lone_point(&self) -> Option<Point> {
+        match (self.path.as_slice(), self.leading_offcurve.as_slice()) {
+            ([PathEl::MoveTo(p)], []) if self.offcurve.is_empty() => Some(*p),
+            ([], [p]) if self.offcurve.is_empty() => Some(*p),
+            _ => None,
+        }
+    }
+
     fn begin_path(&mut self, oncurve: OnCurve) -> Result<(), PathConversionError> {
         assert!(self.first_oncurve.is_none());
         self.path.push(PathEl::MoveTo(*oncurve.point()));
@@ -189,6 +203,19 @@ impl GlyphPathBuilder {
     /// omitted when building one BezPath per contour, but can be called manually in
     /// order to build multiple contours into a single BezPath.
     fn end_path(&mut self) -> Result<(), PathConversionError> {
+        // A contour of a single point is a lone point, whatever the point's
+        // type says: fontTools' PointToSegmentPen emits just a move for it and
+        // never closes it ("not much more we can do than output a single move
+        // segment"). Closing it instead would draw a zero-length segment back
+        // to itself — for a stray off-curve point, a degenerate quadratic.
+        if let Some(lone) = self.lone_point() {
+            self.path = vec![PathEl::MoveTo(lone)];
+            self.leading_offcurve.clear();
+            self.offcurve.clear();
+            self.first_oncurve = None;
+            return Ok(());
+        }
+
         // a contour that does *not* start with a move is assumed to be closed
         // https://unifiedfontobject.org/versions/ufo3/glyphs/glif/#point-types
         if !self.first_oncurve.is_some_and(|on| on.is_move()) {
@@ -262,6 +289,40 @@ impl GlyphPathBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// fontTools' `PointToSegmentPen.endPath` short-circuits any contour with
+    /// a single point to one "move" segment, whatever the point's type. NotoSansUgaritic's
+    /// `u10397` has a stray off-curve point, which used to become a
+    /// zero-length quadratic back to itself; that survived as an extra
+    /// `rmoveto` in the charstring, because the specializer only merges
+    /// adjacent moves and by then the degenerate curve was still between them.
+    #[test]
+    fn a_lone_point_is_a_bare_move_whatever_its_type() {
+        fn built(add: impl Fn(&mut GlyphPathBuilder) -> Result<(), PathConversionError>) -> String {
+            let mut builder = GlyphPathBuilder::new(1);
+            add(&mut builder).unwrap();
+            builder.build().unwrap().to_svg()
+        }
+        assert_eq!("M2,2", built(|b| b.move_to((2.0, 2.0))));
+        assert_eq!("M2,2", built(|b| b.line_to((2.0, 2.0))));
+        assert_eq!("M2,2", built(|b| b.curve_to((2.0, 2.0))));
+        assert_eq!("M2,2", built(|b| b.qcurve_to((2.0, 2.0))));
+        // the one that mattered: a contour holding nothing but an off-curve
+        assert_eq!("M2,2", built(|b| b.offcurve((2.0, 2.0))));
+    }
+
+    /// Two off-curve points and no on-curve is still the TrueType
+    /// implied-on-curve case, which does close.
+    #[test]
+    fn two_offcurves_and_no_oncurve_still_closes() {
+        let mut builder = GlyphPathBuilder::new(2);
+        builder.offcurve((0.0, 0.0)).unwrap();
+        builder.offcurve((10.0, 0.0)).unwrap();
+        assert_eq!(
+            "M5,0 Q0,0 5,0 Q10,0 5,0 Z",
+            builder.build().unwrap().to_svg()
+        );
+    }
 
     #[test]
     fn a_qcurve_with_no_offcurve_is_a_line_open_contour() {

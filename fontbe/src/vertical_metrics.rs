@@ -2,15 +2,16 @@
 //! and [vhea](https://learn.microsoft.com/en-us/typography/opentype/spec/vhea) tables.
 
 use fontdrasil::orchestration::{Access, AccessBuilder, Work};
-use fontir::orchestration::WorkId as FeWorkId;
+use fontir::orchestration::{Flags, WorkId as FeWorkId};
 use log::trace;
 use write_fonts::{
     OtRound, dump_table,
     tables::{vhea::Vhea, vmtx::Vmtx},
-    types::FWord,
+    types::{FWord, Version16Dot16},
 };
 
 use crate::{
+    cff::bbox_from_cff,
     error::Error,
     metrics_and_limits::MetricsBuilder,
     orchestration::{AnyWorkId, BeWork, Context, WorkId},
@@ -36,6 +37,9 @@ impl Work<Context, AnyWorkId, Error> for VerticalMetricsWork {
             .variant(WorkId::ALL_GLYF_FRAGMENTS)
             // We need composite bboxes to be calculated:
             .variant(WorkId::Glyf)
+            // For CFF flavor builds bounds come from the CFF work instead;
+            // whichever isn't scheduled is trivially fulfilled
+            .variant(WorkId::Cff)
             .variant(WorkId::ExtraFeaTables)
             .build()
     }
@@ -70,35 +74,60 @@ impl Work<Context, AnyWorkId, Error> for VerticalMetricsWork {
             .get()
             .at(static_metadata.default_location());
 
+        // In a CFF build bounds come from the CFF work; there are no glyf fragments
+        let cff = context
+            .flags
+            .contains(Flags::CFF_OUTLINES)
+            .then(|| context.cff.get());
+
         // Collate vertical metrics
-        let builder =
-            glyph_order
-                .iter()
-                .fold(MetricsBuilder::default(), |mut builder, (_gid, gn)| {
-                    let glyph = context.ir.get_glyph(gn.clone());
-                    let instance = glyph.default_instance();
+        let mut builder = MetricsBuilder::default();
+        for (gid, gn) in glyph_order.iter() {
+            let glyph = context.ir.get_glyph(gn.clone());
+            let instance = glyph.default_instance();
 
-                    // https://github.com/googlefonts/ufo2ft/blob/2f11b0ff/Lib/ufo2ft/outlineCompiler.py#L882-L890
-                    let advance = instance.height(&default_metrics);
-                    let vertical_origin = instance.vertical_origin(&default_metrics);
+            // https://github.com/googlefonts/ufo2ft/blob/2f11b0ff/Lib/ufo2ft/outlineCompiler.py#L882-L890
+            let advance = instance.height(&default_metrics);
+            let vertical_origin = instance.vertical_origin(&default_metrics);
 
-                    let glyph = context.glyphs.get(&WorkId::GlyfFragment(gn.clone()).into());
+            let glyf_bbox = || {
+                context
+                    .glyphs
+                    .get(&WorkId::GlyfFragment(gn.clone()).into())
+                    .data
+                    .bbox()
+            };
+            let cff_bbox = |bounds: &[Option<[i32; 4]>]| {
+                bounds
+                    .get(gid.to_u16() as usize)
+                    .copied()
+                    .flatten()
+                    .map(|bounds| bbox_from_cff(gn, bounds))
+                    .transpose()
+            };
+            let bbox = match &cff {
+                Some(cff) => cff_bbox(&cff.glyph_bounds)?,
+                None => glyf_bbox(),
+            };
+            // like hhea: the side bearing comes from the rounded box, but the
+            // height it spans comes from the outer one, because fontTools
+            // recalculates vhea from the charstrings with `ceil(yMax)` and
+            // `floor(yMin)`
+            let outer_bbox = match &cff {
+                Some(cff) => cff_bbox(&cff.glyph_outer_bounds)?,
+                None => bbox,
+            };
+            let side_bearing = vertical_origin - bbox.map(|bbox| bbox.y_max).unwrap_or_default();
+            let bounds_advance = outer_bbox.map(|bbox| bbox.y_max as i32 - bbox.y_min as i32);
 
-                    let side_bearing = vertical_origin
-                        - glyph.data.bbox().map(|bbox| bbox.y_max).unwrap_or_default();
-                    let bounds_advance = glyph
-                        .data
-                        .bbox()
-                        .map(|bbox| bbox.y_max as i32 - bbox.y_min as i32);
-
-                    builder.update(advance, side_bearing, bounds_advance);
-                    builder
-                });
+            builder.update(advance, side_bearing, bounds_advance);
+        }
 
         let metrics = builder.build();
 
         // Build and send vertical metrics tables out into the world
         let mut vhea = Vhea {
+            version: Version16Dot16::VERSION_1_1,
             ascender: FWord::new(default_metrics.vhea_ascender.into_inner().ot_round()),
             descender: FWord::new(default_metrics.vhea_descender.into_inner().ot_round()),
             line_gap: FWord::new(default_metrics.vhea_line_gap.into_inner().ot_round()),

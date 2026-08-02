@@ -18,7 +18,11 @@ use fontdrasil::{
     types::GlyphName,
 };
 use parking_lot::RwLock;
-use write_fonts::{FontWrite, read::FontRead, validate::Validate};
+use write_fonts::{
+    FontWrite,
+    read::{FontRead, ReadArgs},
+    validate::Validate,
+};
 
 bitflags! {
     #[derive(Clone, Copy, Debug)]
@@ -39,6 +43,9 @@ bitflags! {
         const ERASE_OPEN_CORNERS = 0b1000000000;
         // If set, anchors will be propagated from components to composites
         const PROPAGATE_ANCHORS = 0b10000000000;
+        // If set, glyphs are compiled to a CFF table (PostScript/cubic outlines)
+        // instead of glyf/loca
+        const CFF_OUTLINES = 0b100000000000;
     }
 }
 
@@ -394,6 +401,7 @@ impl PersistentStorage<WorkId> for IrPersistentStorage {
 impl<T> Persistable for T
 where
     for<'a> T: FontRead<'a> + FontWrite + Validate,
+    T: ReadArgs<Args = ()>,
 {
     fn read(from: &mut dyn Read) -> Self {
         let mut buf = Vec::new();
