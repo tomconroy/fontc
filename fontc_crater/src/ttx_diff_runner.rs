@@ -1,6 +1,6 @@
 use std::{collections::BTreeMap, path::PathBuf, process::Command};
 
-use crate::{BuildType, Results, RunResult, Target, ci::ResultsCache};
+use crate::{BuildType, Results, RunResult, Target, args::Flavor, ci::ResultsCache};
 
 // Run ttx-diff via python -m to ensure we use the venv's installed version
 static TTX_DIFF_MODULE: &str = "ttx_diff";
@@ -10,6 +10,7 @@ pub(super) struct TtxContext {
     pub normalizer_path: PathBuf,
     pub source_cache: PathBuf,
     pub results_cache: ResultsCache,
+    pub flavor: Flavor,
 }
 
 pub(super) fn run_ttx_diff(ctx: &TtxContext, target: &Target) -> RunResult<DiffOutput, DiffError> {
@@ -35,6 +36,9 @@ pub(super) fn run_ttx_diff(ctx: &TtxContext, target: &Target) -> RunResult<DiffO
     .arg("--normalizer_path")
     .arg(&ctx.normalizer_path)
     .args(["--rebuild", "fontc"]);
+    if ctx.flavor != Flavor::Ttf {
+        cmd.args(["--flavor", "otf"]);
+    }
     if target.build == BuildType::GfTools {
         cmd.arg("--config")
             .arg(target.config_path(&ctx.source_cache));
@@ -68,6 +72,12 @@ pub(super) fn run_ttx_diff(ctx: &TtxContext, target: &Target) -> RunResult<DiffO
             Ok(RawDiffOutput::Error(error)) => RunResult::Fail(DiffError::CompileFailed(error)),
         },
         Some(124) => RunResult::Fail(DiffError::Other("ttx_diff timed out".to_string())),
+        // ttx_diff refuses sources it can't compare in the requested flavor
+        // (e.g. a variable source with --flavor otf); report that distinctly
+        // from a crash so it reads as a skip, not a failure
+        Some(1) if stderr.contains("requires a static source") => RunResult::Fail(
+            DiffError::Other("skipped: variable source (fontc cannot write CFF2)".to_string()),
+        ),
         Some(other) => RunResult::Fail(DiffError::Other(format!(
             "unknown error (status {other}): '{stderr}'"
         ))),
