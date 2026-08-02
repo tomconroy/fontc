@@ -379,6 +379,102 @@ impl VariationModel {
         Ok(seqs)
     }
 
+    /// Multipliers for each master at `location`, in [`Self::locations`] order.
+    ///
+    /// Where [`Self::deltas`] plus [`Self::interpolate_from_deltas`] reach a
+    /// value by piling regional deltas onto the default, these scalars reach
+    /// the same value by combining the *masters* directly:
+    /// `sum(scalar_i * master_i)`. That is the arithmetic fontTools' instancer
+    /// performs — `MathInfo`, `MathKerning` and `MathGlyph` all go through
+    /// `VariationModel.interpolateFromMasters` — and it is not merely a
+    /// different route to the same number. A master whose scalar is exactly
+    /// zero contributes *nothing at all*, which for a keyed attribute like
+    /// kerning decides which keys the result even has.
+    ///
+    /// Rust version of `getMasterScalars`,
+    /// <https://github.com/fonttools/fonttools/blob/4ad6b0db/Lib/fontTools/varLib/models.py#L481-L500>.
+    /// fontTools returns them in the caller's master order; we have no such
+    /// order, so ours come back in model order, which is what
+    /// [`Self::locations`] yields.
+    pub fn master_scalars(&self, location: &NormalizedLocation) -> Vec<f64> {
+        let mut scalars: Vec<f64> = self
+            .influence
+            .iter()
+            .map(|region| {
+                region
+                    .scalar_at_with_args(location, self.axis_ranges_for_extrapolation.as_ref())
+                    .into_inner()
+            })
+            .collect();
+        // A master's support was computed against the masters that influence
+        // it, so its own scalar has to be peeled back out of theirs. Walking in
+        // reverse means every master is corrected before it is used to correct
+        // anyone else. delta_weights[i] only ever names j < i, so scalars[i] is
+        // fixed for the whole inner loop.
+        #[allow(clippy::indexing_slicing)] // delta_weights and influence are the same length
+        for i in (0..scalars.len()).rev() {
+            let scalar = scalars[i];
+            for (j, weight) in self.delta_weights[i].iter() {
+                scalars[*j] -= scalar * weight.into_inner();
+            }
+        }
+        scalars
+    }
+
+    /// Interpolate absolute master values at `location`, fontmake-style.
+    ///
+    /// fontTools' `interpolateFromMasters` / `interpolateFromValuesAndScalars`:
+    /// `sum(scalar_i * master_i)`, accumulated left to right in model order,
+    /// **skipping any master whose scalar is zero**.
+    ///
+    /// This equals [`Self::deltas_with_rounding`] with
+    /// [`RoundingBehaviour::None`] followed by [`Self::interpolate_from_deltas`]
+    /// whenever every model location has a value — but not bit-for-bit in f64,
+    /// and only this one skips zero-scalar masters. Prefer it when the goal is
+    /// to match what `fontmake -i` produced. A model location with no value in
+    /// `master_seqs` simply contributes nothing.
+    ///
+    /// <https://github.com/fonttools/fonttools/blob/4ad6b0db/Lib/fontTools/varLib/models.py#L502-L521>
+    pub fn interpolate_from_masters<P, V>(
+        &self,
+        location: &NormalizedLocation,
+        master_seqs: &HashMap<NormalizedLocation, Vec<P>>,
+    ) -> Result<Vec<V>, DeltaError>
+    where
+        P: Copy + Default + Sub<P, Output = V>,
+        V: Copy + Mul<f64, Output = V> + Add<V, Output = V>,
+    {
+        if master_seqs.is_empty() {
+            return Ok(Vec::new());
+        }
+        let master_seqs = self.fit_to_axes(master_seqs)?;
+
+        #[allow(clippy::unwrap_used)] // we know master_seqs is non-empty
+        let seq_len = master_seqs.values().next().unwrap().len();
+        if master_seqs.values().any(|values| values.len() != seq_len) {
+            return Err(DeltaError::InconsistentNumbersOfPoints);
+        }
+
+        let mut result: Option<Vec<V>> = None;
+        for (loc, scalar) in self.locations.iter().zip(self.master_scalars(location)) {
+            if scalar == 0.0 {
+                continue;
+            }
+            let Some(values) = master_seqs.get(loc) else {
+                continue;
+            };
+            let contribution = values.iter().map(|v| (*v - Default::default()) * scalar);
+            match &mut result {
+                None => result = Some(contribution.collect()),
+                Some(acc) => acc
+                    .iter_mut()
+                    .zip(contribution)
+                    .for_each(|(acc, value)| *acc = *acc + value),
+            }
+        }
+        Ok(result.unwrap_or_default())
+    }
+
     /// Convert relative deltas to absolute values at the given location.
     ///
     /// Rust version of <https://github.com/fonttools/fonttools/blob/4ad6b0db/Lib/fontTools/varLib/models.py#L514-L545>
@@ -1860,5 +1956,169 @@ mod tests {
                 "Failed at location {loc:?}",
             );
         }
+    }
+
+    /// The scalars a model reports, keyed by location so the test needn't know
+    /// the model's internal sort order.
+    fn scalars_by_location(
+        model: &VariationModel,
+        loc: &NormalizedLocation,
+    ) -> HashMap<NormalizedLocation, f64> {
+        model
+            .locations()
+            .cloned()
+            .zip(model.master_scalars(loc))
+            .collect()
+    }
+
+    fn loc1(pos: f64) -> NormalizedLocation {
+        NormalizedLocation::for_pos(&[("wght", pos)])
+    }
+
+    fn loc2(wght: f64, wdth: f64) -> NormalizedLocation {
+        NormalizedLocation::for_pos(&[("wght", wght), ("wdth", wdth)])
+    }
+
+    /// Reference values from fontTools 4.63.0:
+    ///
+    /// ```text
+    /// >>> m = VariationModel([{"wght":0.0},{"wght":0.5},{"wght":1.0}], ["wght"])
+    /// >>> m.getMasterScalars({"wght": 0.6})
+    /// [0.0, 0.8, 0.19999999999999996]
+    /// ```
+    #[test]
+    fn master_scalars_match_fonttools_sparse_3_master() {
+        let model = VariationModel::new(
+            HashSet::from([loc1(0.0), loc1(0.5), loc1(1.0)]),
+            axis_order(&["wght"]),
+        );
+
+        assert_eq!(
+            scalars_by_location(&model, &loc1(0.25)),
+            HashMap::from([(loc1(0.0), 0.5), (loc1(0.5), 0.5), (loc1(1.0), 0.0)])
+        );
+        assert_eq!(
+            scalars_by_location(&model, &loc1(0.6)),
+            HashMap::from([
+                (loc1(0.0), 0.0),
+                (loc1(0.5), 0.8),
+                (loc1(1.0), 0.19999999999999996)
+            ])
+        );
+        // at a master, that master and nothing else
+        assert_eq!(
+            scalars_by_location(&model, &loc1(0.5)),
+            HashMap::from([(loc1(0.0), 0.0), (loc1(0.5), 1.0), (loc1(1.0), 0.0)])
+        );
+    }
+
+    /// Reference values from fontTools 4.63.0; the negative scalar is the point,
+    /// it only appears once a fixup master forces the correction loop to bite:
+    ///
+    /// ```text
+    /// >>> locs = [{"wght":0.0,"wdth":0.0},{"wght":1.0,"wdth":0.0},{"wght":0.0,"wdth":1.0},
+    /// ...         {"wght":1.0,"wdth":1.0},{"wght":0.5,"wdth":0.0}]
+    /// >>> m = VariationModel(locs, ["wght","wdth"])
+    /// >>> m.getMasterScalars({"wght": 0.25, "wdth": 0.5})
+    /// [0.125, -0.125, 0.375, 0.125, 0.5]
+    /// ```
+    #[test]
+    fn master_scalars_match_fonttools_with_a_fixup_master() {
+        let model = VariationModel::new(
+            HashSet::from([
+                loc2(0.0, 0.0),
+                loc2(1.0, 0.0),
+                loc2(0.0, 1.0),
+                loc2(1.0, 1.0),
+                loc2(0.5, 0.0),
+            ]),
+            axis_order(&["wght", "wdth"]),
+        );
+
+        assert_eq!(
+            scalars_by_location(&model, &loc2(0.25, 0.5)),
+            HashMap::from([
+                (loc2(0.0, 0.0), 0.125),
+                (loc2(1.0, 0.0), -0.125),
+                (loc2(0.0, 1.0), 0.375),
+                (loc2(1.0, 1.0), 0.125),
+                (loc2(0.5, 0.0), 0.5),
+            ])
+        );
+        assert_eq!(
+            scalars_by_location(&model, &loc2(0.75, 0.0)),
+            HashMap::from([
+                (loc2(0.0, 0.0), 0.0),
+                (loc2(1.0, 0.0), 0.5),
+                (loc2(0.0, 1.0), 0.0),
+                (loc2(1.0, 1.0), 0.0),
+                (loc2(0.5, 0.0), 0.5),
+            ])
+        );
+    }
+
+    /// The two routes only differ in f64 noise and in what they do with a
+    /// zero-scalar master, so on dense inputs they must agree.
+    #[test]
+    fn interpolate_from_masters_equals_the_delta_path() {
+        let locations = [
+            loc2(0.0, 0.0),
+            loc2(1.0, 0.0),
+            loc2(0.0, 1.0),
+            loc2(1.0, 1.0),
+            loc2(0.5, 0.0),
+        ];
+        let model = VariationModel::new(
+            locations.iter().cloned().collect(),
+            axis_order(&["wght", "wdth"]),
+        );
+        let master_seqs: HashMap<_, _> = locations
+            .iter()
+            .zip([
+                vec![10.0, -3.0],
+                vec![90.0, 11.0],
+                vec![20.0, -7.0],
+                vec![70.0, 40.0],
+                vec![55.0, 2.5],
+            ])
+            .map(|(loc, values)| (loc.clone(), values))
+            .collect();
+
+        let deltas: ModelDeltas<f64> = model
+            .deltas_with_rounding(&master_seqs, RoundingBehaviour::None)
+            .unwrap();
+
+        for pin in [
+            loc2(0.25, 0.5),
+            loc2(0.75, 0.0),
+            loc2(0.5, 0.0),
+            loc2(1.0, 1.0),
+            loc2(0.0, 0.0),
+            loc2(0.1, 0.9),
+        ] {
+            let from_deltas = model.interpolate_from_deltas(&pin, &deltas);
+            let from_masters: Vec<f64> =
+                model.interpolate_from_masters(&pin, &master_seqs).unwrap();
+            assert_eq!(from_deltas.len(), from_masters.len(), "at {pin:?}");
+            for (a, b) in from_deltas.iter().zip(&from_masters) {
+                assert!((a - b).abs() < 1e-9, "{a} != {b} at {pin:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn interpolate_from_masters_handles_2d() {
+        let model =
+            VariationModel::new(HashSet::from([loc1(0.0), loc1(1.0)]), axis_order(&["wght"]));
+        let master_seqs = HashMap::from([
+            (loc1(0.0), vec![Point::new(0.0, 10.0)]),
+            (loc1(1.0), vec![Point::new(100.0, 11.0)]),
+        ]);
+
+        let at_mid: Vec<Vec2> = model
+            .interpolate_from_masters(&loc1(0.5), &master_seqs)
+            .unwrap();
+
+        assert_eq!(at_mid, vec![Vec2::new(50.0, 10.5)]);
     }
 }
