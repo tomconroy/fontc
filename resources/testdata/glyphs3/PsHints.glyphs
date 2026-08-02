@@ -1,0 +1,101 @@
+{
+.formatVersion = 3;
+familyName = PsHints;
+customParameters = (
+{
+name = blueScale;
+value = 0.04;
+},
+{
+name = postscriptWeightName;
+value = Book;
+},
+{
+name = postscriptFamilyBlues;
+value = (
+-12,
+0
+);
+}
+);
+metrics = (
+{
+type = ascender;
+},
+{
+type = baseline;
+},
+{
+type = descender;
+},
+{
+type = "x-height";
+}
+);
+stems = (
+{
+horizontal = 1;
+name = hstem;
+},
+{
+name = vstem1;
+},
+{
+name = vstem2;
+}
+);
+fontMaster = (
+{
+id = m01;
+name = Regular;
+metricValues = (
+{
+over = 16;
+pos = 800;
+},
+{
+over = -18;
+},
+{
+over = -17;
+pos = -200;
+},
+{
+over = 12;
+pos = 500;
+}
+);
+stemValues = (
+24,
+80,
+90
+);
+customParameters = (
+{
+name = blueScale;
+value = 0.05;
+},
+{
+name = postscriptBlueFuzz;
+value = 2;
+},
+{
+name = postscriptForceBold;
+value = 1;
+}
+);
+}
+);
+glyphs = (
+{
+glyphname = space;
+layers = (
+{
+layerId = m01;
+width = 200;
+}
+);
+}
+);
+unitsPerEm = 1000;
+}

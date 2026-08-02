@@ -126,6 +126,18 @@ pub struct CustomParameters {
     pub codepage_range_bits: Option<BTreeSet<u32>>,
     pub panose: Option<Vec<i64>>,
 
+    // PostScript hinting parameters, as in the UFO fontinfo keys glyphsLib
+    // writes them to
+    pub blue_scale: Option<OrderedFloat<f64>>,
+    pub blue_shift: Option<OrderedFloat<f64>>,
+    pub blue_fuzz: Option<OrderedFloat<f64>>,
+    pub force_bold: Option<bool>,
+    pub family_blues: Option<Vec<OrderedFloat<f64>>>,
+    pub family_other_blues: Option<Vec<OrderedFloat<f64>>>,
+    pub postscript_weight_name: Option<SmolStr>,
+    pub postscript_default_width_x: Option<OrderedFloat<f64>>,
+    pub postscript_nominal_width_x: Option<OrderedFloat<f64>>,
+
     pub head_flags: Option<Vec<i64>>,
     pub lowest_rec_ppem: Option<i64>,
     pub hhea_caret_slope_run: Option<i64>,
@@ -833,6 +845,7 @@ struct RawFont {
     format_version: FormatVersion,
     units_per_em: Option<i64>,
     metrics: Vec<RawMetric>,
+    stems: Vec<RawStem>, // v3; masters carry the values
     family_name: String,
     date: Option<String>,
     copyright: Option<String>,
@@ -929,6 +942,7 @@ trait PlistParamsExt {
     fn as_bool(&self) -> Option<bool>;
     fn as_ordered_f64(&self) -> Option<OrderedFloat<f64>>;
     fn as_vec_of_ints(&self) -> Option<Vec<i64>>;
+    fn as_vec_of_floats(&self) -> Option<Vec<OrderedFloat<f64>>>;
     fn as_axis_locations(&self) -> Option<Vec<AxisLocation>>;
     fn as_vec_of_string(&self) -> Option<Vec<SmolStr>>;
     fn as_axes(&self) -> Option<Vec<Axis>>;
@@ -957,6 +971,18 @@ impl PlistParamsExt for Plist {
         self.as_array()?
             .iter()
             .map(|val| val.as_str().and_then(|s| s.parse::<i64>().ok()))
+            .collect()
+    }
+
+    fn as_vec_of_floats(&self) -> Option<Vec<OrderedFloat<f64>>> {
+        // like as_vec_of_ints, tolerate values serialized as strings
+        self.as_array()?
+            .iter()
+            .map(|val| {
+                val.as_f64()
+                    .or_else(|| val.as_str().and_then(|s| s.parse::<f64>().ok()))
+                    .map(OrderedFloat)
+            })
             .collect()
     }
 
@@ -1184,6 +1210,33 @@ impl RawCustomParameters {
                 }
                 "underlinePosition" => {
                     add_and_report_issues!(underline_position, Plist::as_ordered_f64)
+                }
+                // PostScript hinting: like PANOSE, blueScale/blueShift have a
+                // short and a long name; the others are long-name only
+                // <https://github.com/googlefonts/glyphsLib/blob/050ef62c/Lib/glyphsLib/builder/custom_params.py#L353-L358>
+                // <https://github.com/googlefonts/glyphsLib/blob/050ef62c/Lib/glyphsLib/builder/custom_params.py#L420-L462>
+                "blueScale" | "postscriptBlueScale" => {
+                    add_and_report_issues!(blue_scale, Plist::as_ordered_f64)
+                }
+                "blueShift" | "postscriptBlueShift" => {
+                    add_and_report_issues!(blue_shift, Plist::as_ordered_f64)
+                }
+                "postscriptBlueFuzz" => add_and_report_issues!(blue_fuzz, Plist::as_ordered_f64),
+                "postscriptForceBold" => add_and_report_issues!(force_bold, Plist::as_bool),
+                "postscriptFamilyBlues" => {
+                    add_and_report_issues!(family_blues, Plist::as_vec_of_floats)
+                }
+                "postscriptFamilyOtherBlues" => {
+                    add_and_report_issues!(family_other_blues, Plist::as_vec_of_floats)
+                }
+                "postscriptWeightName" => {
+                    add_and_report_issues!(postscript_weight_name, Plist::as_str, into)
+                }
+                "postscriptDefaultWidthX" => {
+                    add_and_report_issues!(postscript_default_width_x, Plist::as_ordered_f64)
+                }
+                "postscriptNominalWidthX" => {
+                    add_and_report_issues!(postscript_nominal_width_x, Plist::as_ordered_f64)
                 }
                 // Glyphs uses short names (e.g. "subscriptXSize") but some fonts use the
                 // long UFO names (e.g. "openTypeOS2SubscriptXSize"). Both are accepted.
@@ -1765,6 +1818,10 @@ pub struct FontMaster {
     pub custom_parameters: CustomParameters,
     pub user_data: BTreeMap<SmolStr, Plist>,
     pub metrics_source_id: Option<String>,
+    /// Horizontal stem widths, in the source's order (not sorted).
+    pub horizontal_stems: Vec<OrderedFloat<f64>>,
+    /// Vertical stem widths, in the source's order (not sorted).
+    pub vertical_stems: Vec<OrderedFloat<f64>>,
 }
 
 impl FontMaster {
@@ -1792,6 +1849,21 @@ impl FontMaster {
 
     pub fn italic_angle(&self) -> Option<f64> {
         self.read_metric("italic angle")
+    }
+
+    /// The master's alignment zones, as (position, size) pairs.
+    ///
+    /// Like glyphsLib's `GSFontMaster.alignmentZones` when no explicit zones
+    /// exist: one zone per metric with a nonzero overshoot, skipping the
+    /// italic angle. (Glyphs 2 zones were already folded into metric
+    /// overshoots at parse time.) Order is not meaningful; callers that care
+    /// (blue values) sort by (position, size) as glyphsLib does.
+    pub fn alignment_zones(&self) -> Vec<(OrderedFloat<f64>, OrderedFloat<f64>)> {
+        self.metric_values
+            .iter()
+            .filter(|(name, value)| name.as_str() != "italic angle" && value.over != 0.0)
+            .map(|(_, value)| (value.pos, value.over))
+            .collect()
     }
 }
 
@@ -1861,6 +1933,10 @@ struct RawFontMaster {
 
     alignment_zones: Vec<String>, // v2
 
+    horizontal_stems: Vec<OrderedFloat<f64>>, // v2
+    vertical_stems: Vec<OrderedFloat<f64>>,   // v2
+    stem_values: Vec<OrderedFloat<f64>>,      // v3, indexed against the font's stems
+
     custom_parameters: RawCustomParameters,
     number_values: Vec<OrderedFloat<f64>>,
     user_data: BTreeMap<SmolStr, Plist>,
@@ -1873,6 +1949,13 @@ struct RawFontMaster {
 struct RawMetricValue {
     pos: Option<OrderedFloat<f64>>,
     over: Option<OrderedFloat<f64>>,
+}
+
+/// A font-level stem definition (Glyphs 3); the values live on each master.
+#[derive(Default, Debug, Clone, PartialEq, Eq, Hash, FromPlist)]
+struct RawStem {
+    name: Option<SmolStr>,
+    horizontal: Option<i64>,
 }
 
 #[derive(Default, Debug, Clone, PartialEq, Eq, Hash)]
@@ -3743,6 +3826,24 @@ impl TryFrom<RawFont> for Font {
                 let custom_parameters = m.custom_parameters.to_custom_params()?;
                 let metrics_source_id =
                     resolve_metrics_source_id(&custom_parameters, &master_ids_to_names);
+                // v2 masters carry stems directly; in v3 the font defines
+                // named stems and each master carries values for them, like
+                // glyphsLib's GSFontMaster.horizontalStems/verticalStems
+                let (horizontal_stems, vertical_stems) =
+                    if !m.horizontal_stems.is_empty() || !m.vertical_stems.is_empty() {
+                        (m.horizontal_stems, m.vertical_stems)
+                    } else {
+                        let mut h = Vec::new();
+                        let mut v = Vec::new();
+                        for (stem, value) in from.stems.iter().zip(m.stem_values.iter()) {
+                            if stem.horizontal == Some(1) {
+                                h.push(*value);
+                            } else {
+                                v.push(*value);
+                            }
+                        }
+                        (h, v)
+                    };
                 Ok(FontMaster {
                     id: m.id,
                     name: m.name.unwrap_or_default(),
@@ -3770,6 +3871,8 @@ impl TryFrom<RawFont> for Font {
                     custom_parameters,
                     user_data: m.user_data,
                     metrics_source_id,
+                    horizontal_stems,
+                    vertical_stems,
                 })
             })
             .collect::<Result<Vec<_>, Error>>()?;

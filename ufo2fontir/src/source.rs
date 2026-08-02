@@ -24,9 +24,9 @@ use fontir::{
         DEFAULT_VENDOR_ID, FEATURE_WRITERS_LIB_KEY, FeatureWriterOptionValue, FeatureWriterSpec,
         FeaturesSource, GlobalMetric, GlobalMetricsBuilder, GlyphOrder, KernGroup, KernSide,
         KerningInstance, KerningLocations, MetaTableValues, NameBuilder, NameKey, NamedInstance,
-        Paint, PaintGlyph, PaintSolid, Panose, PostscriptNames, PreliminaryGdefCategories, Rule,
-        StaticMetadata, Substitution, VariableFeature, reject_duplicate_writers,
-        validate_feature_writer,
+        Paint, PaintGlyph, PaintSolid, Panose, PostscriptNames, PostscriptSettings,
+        PreliminaryGdefCategories, Rule, StaticMetadata, Substitution, VariableFeature,
+        reject_duplicate_writers, validate_feature_writer,
     },
     orchestration::{Context, Flags, IrWork, WorkId},
     source::Source,
@@ -37,6 +37,7 @@ use norad::{
     designspace::{self, DesignSpaceDocument},
     fontinfo::StyleMapStyle,
 };
+use ordered_float::OrderedFloat;
 use plist::{Dictionary, Value};
 use write_fonts::{
     OtRound,
@@ -1277,6 +1278,32 @@ impl Work<Context, WorkId, Error> for StaticMetadataWork {
                 .collect();
         }
         static_metadata.variations = variations;
+
+        let float_list = |values: &Option<Vec<f64>>| -> Vec<OrderedFloat<f64>> {
+            values
+                .as_ref()
+                .map(|values| values.iter().copied().map(OrderedFloat).collect())
+                .unwrap_or_default()
+        };
+        static_metadata.misc.postscript = PostscriptSettings {
+            blue_values: float_list(&font_info_at_default.postscript_blue_values),
+            other_blues: float_list(&font_info_at_default.postscript_other_blues),
+            family_blues: float_list(&font_info_at_default.postscript_family_blues),
+            family_other_blues: float_list(&font_info_at_default.postscript_family_other_blues),
+            blue_scale: font_info_at_default.postscript_blue_scale.map(OrderedFloat),
+            blue_shift: font_info_at_default.postscript_blue_shift.map(OrderedFloat),
+            blue_fuzz: font_info_at_default.postscript_blue_fuzz.map(OrderedFloat),
+            stem_snap_h: float_list(&font_info_at_default.postscript_stem_snap_h),
+            stem_snap_v: float_list(&font_info_at_default.postscript_stem_snap_v),
+            force_bold: font_info_at_default.postscript_force_bold,
+            weight_name: font_info_at_default.postscript_weight_name.clone(),
+            default_width_x: font_info_at_default
+                .postscript_default_width_x
+                .map(OrderedFloat),
+            nominal_width_x: font_info_at_default
+                .postscript_nominal_width_x
+                .map(OrderedFloat),
+        };
 
         context.preliminary_glyph_order.set(glyph_order);
         context.static_metadata.set(static_metadata);

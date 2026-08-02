@@ -21,15 +21,15 @@ use fontir::{
         DEFAULT_VENDOR_ID, FEATURE_WRITERS_LIB_KEY, FeatureWriterOptionValue, FeatureWriterSpec,
         GlobalMetric, GlobalMetrics, GlobalMetricsBuilder, GlyphAnchors, GlyphInstance, GlyphOrder,
         KernGroup, KernSide, KerningInstance, KerningLocations, MetaTableValues, NameBuilder,
-        NameKey, NamedInstance, Paint, PaintGlyph, PostscriptNames, PreliminaryGdefCategories,
-        Rule, StaticMetadata, Substitution, VariableFeature, reject_duplicate_writers,
-        validate_feature_writer,
+        NameKey, NamedInstance, Paint, PaintGlyph, PostscriptNames, PostscriptSettings,
+        PreliminaryGdefCategories, Rule, StaticMetadata, Substitution, VariableFeature,
+        reject_duplicate_writers, validate_feature_writer,
     },
     orchestration::{Context, Flags, IrWork, WorkId},
     source::Source,
 };
 use glyphs_reader::{
-    Font, InstanceType, Layer, Plist,
+    Font, FontMaster, InstanceType, Layer, Plist,
     glyphdata::{Category, Subcategory},
 };
 use indexmap::IndexMap;
@@ -653,6 +653,8 @@ impl Work<Context, WorkId, Error> for StaticMetadataWork {
             });
         }
 
+        static_metadata.misc.postscript = postscript_settings(font, default_master);
+
         if let Some(gasp) = &font.custom_parameters.gasp_table {
             for (max_ppem, behavior) in gasp.iter() {
                 let Ok(range_max_ppem) = (*max_ppem).try_into() else {
@@ -695,6 +697,66 @@ impl Work<Context, WorkId, Error> for StaticMetadataWork {
             .preliminary_gdef_categories
             .set(preliminary_gdef_categories);
         Ok(())
+    }
+}
+
+/// PostScript hinting values, derived the way glyphsLib fills UFO fontinfo.
+///
+/// Blues follow glyphsLib's `to_ufo_blue_values`: zones sorted by
+/// (position, size); a zone at position 0 or with non-negative size is a
+/// blue zone, other negative zones are "other" blues; each zone contributes
+/// its [min, max]. Stems are copied verbatim (ufo2ft does the sorting and
+/// Std derivation later). Custom parameters prefer the master's value over
+/// the font's, like glyphsLib applying master params after font params.
+fn postscript_settings(font: &Font, master: &FontMaster) -> PostscriptSettings {
+    let mut zones = master.alignment_zones();
+    zones.sort();
+    let mut blue_values = Vec::new();
+    let mut other_blues = Vec::new();
+    for (pos, size) in zones {
+        let list = if pos.into_inner() == 0.0 || size.into_inner() >= 0.0 {
+            &mut blue_values
+        } else {
+            &mut other_blues
+        };
+        list.push(pos.min(pos + size));
+        list.push(pos.max(pos + size));
+    }
+
+    let master_params = &master.custom_parameters;
+    let font_params = &font.custom_parameters;
+    PostscriptSettings {
+        blue_values,
+        other_blues,
+        family_blues: master_params
+            .family_blues
+            .as_ref()
+            .or(font_params.family_blues.as_ref())
+            .cloned()
+            .unwrap_or_default(),
+        family_other_blues: master_params
+            .family_other_blues
+            .as_ref()
+            .or(font_params.family_other_blues.as_ref())
+            .cloned()
+            .unwrap_or_default(),
+        blue_scale: master_params.blue_scale.or(font_params.blue_scale),
+        blue_shift: master_params.blue_shift.or(font_params.blue_shift),
+        blue_fuzz: master_params.blue_fuzz.or(font_params.blue_fuzz),
+        stem_snap_h: master.horizontal_stems.clone(),
+        stem_snap_v: master.vertical_stems.clone(),
+        force_bold: master_params.force_bold.or(font_params.force_bold),
+        weight_name: master_params
+            .postscript_weight_name
+            .as_ref()
+            .or(font_params.postscript_weight_name.as_ref())
+            .map(|name| name.to_string()),
+        default_width_x: master_params
+            .postscript_default_width_x
+            .or(font_params.postscript_default_width_x),
+        nominal_width_x: master_params
+            .postscript_nominal_width_x
+            .or(font_params.postscript_nominal_width_x),
     }
 }
 
@@ -2369,6 +2431,48 @@ mod tests {
             work.exec(&task_context)?;
         }
         Ok(())
+    }
+
+    #[test]
+    fn v2_alignment_zones_to_blue_values() {
+        let (_, context) = build_static_metadata(glyphs2_dir().join("alignment_zones_v2.glyphs"));
+        let postscript = &context.static_metadata.get().misc.postscript;
+        // zones sorted by position; the baseline zone (0, -16) is a blue
+        // zone despite its negative size, like glyphsLib's to_ufo_blue_values
+        assert_eq!(
+            postscript.blue_values,
+            [
+                -16.0, 0.0, 500.0, 515.0, 700.0, 716.0, 800.0, 817.0, 1000.0, 1020.0
+            ]
+            .map(OrderedFloat)
+        );
+        assert_eq!(
+            postscript.other_blues,
+            [-217.0, -200.0, -115.0, -100.0].map(OrderedFloat)
+        );
+        assert!(postscript.stem_snap_h.is_empty());
+        assert!(postscript.weight_name.is_none());
+    }
+
+    #[test]
+    fn v3_postscript_hints() {
+        let (_, context) = build_static_metadata(glyphs3_dir().join("PsHints.glyphs"));
+        let postscript = &context.static_metadata.get().misc.postscript;
+        assert_eq!(
+            postscript.blue_values,
+            [-18.0, 0.0, 500.0, 512.0, 800.0, 816.0].map(OrderedFloat)
+        );
+        assert_eq!(postscript.other_blues, [-217.0, -200.0].map(OrderedFloat));
+        assert_eq!(postscript.family_blues, [-12.0, 0.0].map(OrderedFloat));
+        // the font's stems definitions route each master value by direction
+        assert_eq!(postscript.stem_snap_h, [24.0].map(OrderedFloat));
+        assert_eq!(postscript.stem_snap_v, [80.0, 90.0].map(OrderedFloat));
+        // the master's blueScale wins over the font's
+        assert_eq!(postscript.blue_scale, Some(0.05.into()));
+        assert_eq!(postscript.blue_fuzz, Some(2.0.into()));
+        assert_eq!(postscript.blue_shift, None);
+        assert_eq!(postscript.force_bold, Some(true));
+        assert_eq!(postscript.weight_name.as_deref(), Some("Book"));
     }
 
     #[test]
