@@ -805,11 +805,10 @@ fn unicode_variation_sequences(font: &Font) -> BTreeMap<u32, BTreeMap<u32, Glyph
 /// Std derivation later). Custom parameters prefer the master's value over
 /// the font's, like glyphsLib applying master params after font params.
 fn postscript_settings(font: &Font, master: &FontMaster) -> PostscriptSettings {
-    let mut zones = master.alignment_zones();
-    zones.sort();
+    // already sorted by (position, size), like glyphsLib's `sorted(alignment_zones)`
     let mut blue_values = Vec::new();
     let mut other_blues = Vec::new();
-    for (pos, size) in zones {
+    for &(pos, size) in master.alignment_zones() {
         let list = if pos.into_inner() == 0.0 || size.into_inner() >= 0.0 {
             &mut blue_values
         } else {
@@ -847,6 +846,12 @@ fn postscript_settings(font: &Font, master: &FontMaster) -> PostscriptSettings {
             .as_ref()
             .or(font_params.postscript_weight_name.as_ref())
             .map(|name| name.to_string()),
+        // a font-level property/parameter, normalized into the name bag for
+        // both Glyphs 2 and 3; deliberately not a name table entry, since
+        // ufo2ft reads it only when it builds the CFF Top DICT
+        full_name: font
+            .get_default_name("postscriptFullName")
+            .map(str::to_string),
         default_width_x: master_params
             .postscript_default_width_x
             .or(font_params.postscript_default_width_x),
@@ -2637,11 +2642,16 @@ mod tests {
     fn v3_postscript_hints() {
         let (_, context) = build_static_metadata(glyphs3_dir().join("PsHints.glyphs"));
         let postscript = &context.static_metadata.get().misc.postscript;
+        // "custom high" and "custom low" are metrics the designer named rather
+        // than typed; each still has to contribute its own zone
         assert_eq!(
             postscript.blue_values,
-            [-18.0, 0.0, 500.0, 512.0, 800.0, 816.0].map(OrderedFloat)
+            [-18.0, 0.0, 500.0, 512.0, 620.0, 634.0, 800.0, 816.0].map(OrderedFloat)
         );
-        assert_eq!(postscript.other_blues, [-217.0, -200.0].map(OrderedFloat));
+        assert_eq!(
+            postscript.other_blues,
+            [-320.0, -300.0, -217.0, -200.0].map(OrderedFloat)
+        );
         assert_eq!(postscript.family_blues, [-12.0, 0.0].map(OrderedFloat));
         // the font's stems definitions route each master value by direction
         assert_eq!(postscript.stem_snap_h, [24.0].map(OrderedFloat));
@@ -2652,6 +2662,9 @@ mod tests {
         assert_eq!(postscript.blue_shift, None);
         assert_eq!(postscript.force_bold, Some(true));
         assert_eq!(postscript.weight_name.as_deref(), Some("Book"));
+        // postscriptFullName is a property, not a name table entry: ufo2ft
+        // reads it only when it builds the CFF Top DICT
+        assert_eq!(postscript.full_name.as_deref(), Some("PsHints-Regular"));
     }
 
     #[test]
