@@ -8,6 +8,7 @@ use write_fonts::{
     OffsetMarker,
     tables::name::{Name, NameRecord},
     types::NameId,
+    validate::Validate,
 };
 
 use crate::{
@@ -68,7 +69,18 @@ impl Work<Context, AnyWorkId, Error> for NameWork {
             stamp_compiler_version(&mut name_records, version);
         }
 
-        context.name.set(Name::new(name_records));
+        let name = Name::new(name_records);
+        // Validate here rather than at assembly time: `font.rs` turns a table
+        // into bytes with `dump_table(..).ok()`, so a table that fails
+        // validation is silently *dropped* from the font. The most likely
+        // failure is a name record whose platform/encoding pair we cannot
+        // encode — Mac platform with a non-Roman encoding, which a Glyphs
+        // "Name Table Entry" custom parameter can ask for. fontmake writes
+        // those through fontTools' legacy codecs; we cannot yet, and losing the
+        // whole name table without a word would be far worse than saying so.
+        name.validate()
+            .map_err(|report| Error::UnencodableNames(report.to_string()))?;
+        context.name.set(name);
         Ok(())
     }
 }
