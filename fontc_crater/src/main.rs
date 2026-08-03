@@ -28,6 +28,16 @@ use target::{BuildType, Target};
 fn main() {
     env_logger::init();
     let args = Args::parse();
+    // clap cannot express "this flavor rules out this flag", so check it here
+    // and report it the way clap reports its own conflicts: a usage error, not
+    // a run that quietly does nothing
+    let Commands::Ci(ci_args) = &args.command;
+    if let Err(problem) = ci_args.validate() {
+        use clap::CommandFactory;
+        Args::command()
+            .error(clap::error::ErrorKind::ArgumentConflict, problem)
+            .exit();
+    }
     if let Err(e) = run(&args) {
         eprintln!("{e}");
     }

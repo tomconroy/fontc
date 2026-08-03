@@ -95,6 +95,11 @@ fn make_html(
     repo_failures: &BTreeMap<String, String>,
     annotations: &BTreeMap<Target, Vec<Annotation>>,
 ) -> Result<String, Error> {
+    // every repro command has to ask for the mode the current run built
+    let mode_flags = summary
+        .last()
+        .map(|run| crate::args::mode_flags(run.flavor, run.instance.as_deref()))
+        .unwrap_or_default();
     let table_body = make_table_body(summary);
     let css = include_str!("../../resources/style.css");
     let table = html! {
@@ -117,7 +122,7 @@ fn make_html(
         }
     };
     let detailed_report = match prev {
-        Some(prev) => make_detailed_report(current, prev, sources, annotations),
+        Some(prev) => make_detailed_report(current, prev, sources, annotations, &mode_flags),
 
         _ => html!(),
     };
@@ -402,11 +407,12 @@ fn make_detailed_report(
     prev: &DiffResults,
     sources: &BTreeMap<PathBuf, String>,
     annotations: &BTreeMap<Target, Vec<Annotation>>,
+    mode_flags: &str,
 ) -> Markup {
     let reports = [
-        make_diff_report(current, prev, sources, annotations),
+        make_diff_report(current, prev, sources, annotations, mode_flags),
         make_summary_report(current),
-        make_error_report(current, prev, sources, annotations),
+        make_error_report(current, prev, sources, annotations, mode_flags),
     ];
     html! {
         @for report in reports {
@@ -517,6 +523,7 @@ fn make_diff_report(
     prev: &DiffResults,
     sources: &BTreeMap<PathBuf, String>,
     annotations: &BTreeMap<Target, Vec<Annotation>>,
+    mode_flags: &str,
 ) -> Markup {
     fn get_total_diff_ratios(results: &DiffResults) -> BTreeMap<&Target, f32> {
         results
@@ -576,7 +583,7 @@ fn make_diff_report(
         }
 
         let repo_url = get_repo_url(target);
-        let ttx_command = target.repro_command(repo_url);
+        let ttx_command = target.repro_command(repo_url, mode_flags);
         let onclick = format!("event.preventDefault(); copyText(\"{ttx_command}\");",);
         let decoration = make_delta_decoration(*ratio, prev_ratio, More::IsBetter);
         let changed_tag_list = list_different_tables(diff_details).unwrap_or_default();
@@ -697,6 +704,7 @@ fn make_error_report(
     prev: &DiffResults,
     sources: &BTreeMap<PathBuf, String>,
     annotations: &BTreeMap<Target, Vec<Annotation>>,
+    mode_flags: &str,
 ) -> Markup {
     let current_fontc = get_compiler_failures(current, "fontc");
     let prev_fontc = get_compiler_failures(prev, "fontc");
@@ -734,6 +742,7 @@ fn make_error_report(
             },
             sources,
             annotations,
+            mode_flags,
         )
     } else {
         Default::default()
@@ -756,6 +765,7 @@ fn make_error_report(
             },
             sources,
             annotations,
+            mode_flags,
         )
     } else {
         Default::default()
@@ -789,6 +799,7 @@ fn make_error_report(
             },
             sources,
             annotations,
+            mode_flags,
         )
     } else {
         Default::default()
@@ -811,6 +822,7 @@ fn make_error_report(
             },
             sources,
             annotations,
+            mode_flags,
         )
     } else {
         Default::default()
@@ -947,9 +959,15 @@ fn make_error_report_group<'a>(
     details: impl Fn(&Target) -> Markup,
     sources: &BTreeMap<PathBuf, String>,
     annotations: &BTreeMap<Target, Vec<Annotation>>,
+    mode_flags: &str,
 ) -> Markup {
-    let items =
-        make_error_report_group_items(paths_and_if_is_new_error, details, sources, annotations);
+    let items = make_error_report_group_items(
+        paths_and_if_is_new_error,
+        details,
+        sources,
+        annotations,
+        mode_flags,
+    );
 
     let elem_id = format!("{group_name}-failures");
     html! {
@@ -967,6 +985,7 @@ fn make_error_report_group_items<'a>(
     details: impl Fn(&Target) -> Markup,
     sources: &BTreeMap<PathBuf, String>,
     annotations: &BTreeMap<Target, Vec<Annotation>>,
+    mode_flags: &str,
 ) -> Markup {
     let get_repo_url = |id: &Target| {
         sources
@@ -976,7 +995,7 @@ fn make_error_report_group_items<'a>(
     };
     let make_repro_command = |target: &Target| {
         let url = get_repo_url(target);
-        let ttx_command = target.repro_command(url);
+        let ttx_command = target.repro_command(url, mode_flags);
         format!("event.preventDefault(); copyText(\"{ttx_command}\");",)
     };
     html! {
