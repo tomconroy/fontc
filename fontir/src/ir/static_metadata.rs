@@ -510,6 +510,19 @@ pub struct PostscriptSettings {
     pub force_bold: Option<bool>,
     /// Becomes the CFF TopDict `Weight`; not necessarily a wght axis name.
     pub weight_name: Option<String>,
+    /// This master's `openTypeOS2WeightClass`, kept only so that an
+    /// interpolated instance can derive [`Self::weight_name`] from it.
+    ///
+    /// It is *not* the class that reaches OS/2 — for an instance that comes
+    /// from the axis, and the two legitimately disagree — but fontMath's
+    /// `_processPostscriptWeightName` runs on the interpolated value, so the
+    /// per-master values have to survive to the pin. `None` for a `.glyphs`
+    /// source: a glyphsLib master UFO states no weight class at all (verified
+    /// with `glyphsLib.to_ufos`), so fontMath's answer there is genuinely
+    /// absent.
+    ///
+    /// <https://github.com/robotools/fontMath/blob/0.10.0/Lib/fontMath/mathInfo.py#L154-L169>
+    pub os2_weight_class: Option<OrderedFloat<f64>>,
     /// Becomes the CFF TopDict `FullName`.
     ///
     /// This is the source's `postscriptFullName`, which is neither the name

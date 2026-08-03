@@ -948,6 +948,9 @@ fn postscript_settings(font_info: &norad::FontInfo) -> PostscriptSettings {
         stem_snap_v: float_list(&font_info.postscript_stem_snap_v),
         force_bold: font_info.postscript_force_bold,
         weight_name: font_info.postscript_weight_name.clone(),
+        os2_weight_class: font_info
+            .open_type_os2_weight_class
+            .map(|v| OrderedFloat(v as f64)),
         full_name: font_info.postscript_full_name.clone(),
         default_width_x: font_info.postscript_default_width_x.map(OrderedFloat),
         nominal_width_x: font_info.postscript_nominal_width_x.map(OrderedFloat),

@@ -901,7 +901,7 @@ pub fn pin_postscript(
         return only.clone();
     }
 
-    let model = VariationModel::new(by_location.keys().cloned().collect(), axis_order);
+    let model = VariationModel::new(by_location.keys().cloned().collect(), axis_order.clone());
 
     let contributors: Vec<(&PostscriptSettings, f64)> = model
         .locations()
@@ -930,6 +930,24 @@ pub fn pin_postscript(
             .map(OrderedFloat)
     };
 
+    // fontMath's math ops derive postscriptWeightName from the accumulated
+    // openTypeOS2WeightClass, *unrounded*: `MathInfo.round()` would re-derive
+    // it from the rounded value, but fontmake's `round_instances` defaults to
+    // False and neither ttx_diff nor gftools passes `--round-instances`.
+    let os2_weight_class = number(|ps| ps.os2_weight_class);
+    // ...but only when there is arithmetic to do. `Variator.instance_at`
+    // short-circuits a location that *is* a master to a deepcopy of that
+    // master's MathInfo, so no math op runs, and `MathInfo.__init__` copies
+    // only `_infoAttrs` — postscriptWeightName is a "special attribute" and is
+    // not among them. The copy therefore has no such attribute at all,
+    // `extractInfo`'s `hasattr` guard skips it, and the instance gets no CFF
+    // `Weight`. Measured: a two-master designspace with weight classes 100/900
+    // emits `Weight` at wght 550 but none at wght 400 or 700.
+    //
+    // <https://github.com/googlefonts/ufo2ft/blob/main/Lib/ufo2ft/instantiator.py#L1219-L1237>
+    // <https://github.com/robotools/fontMath/blob/0.10.0/Lib/fontMath/mathInfo.py#L11-L14>
+    let interpolated = !by_location.contains_key(&fit(pin, &axis_order));
+
     PostscriptSettings {
         blue_values: list(|ps| &ps.blue_values),
         other_blues: list(|ps| &ps.other_blues),
@@ -943,29 +961,23 @@ pub fn pin_postscript(
         // copied from the default master, not interpolated
         force_bold: static_metadata.postscript_default().force_bold,
         // Past the single-master short circuit above there is more than one
-        // info master, so `extractInfo` runs and these two are lost.
+        // info master, so `extractInfo` runs.
         //
-        // fontMath derives `postscriptWeightName` — the CFF `Weight` operator —
-        // from the *interpolated* `openTypeOS2WeightClass`, which is not the
-        // one that reaches OS/2: glyphsLib overwrites that from the axis
-        // afterwards, so the two legitimately disagree. IR keeps one
-        // `misc.us_weight_class`, the default master's, and no per-master
-        // weight classes, so there is nothing here to interpolate — and
-        // deriving from the default master's class would be *wrong* wherever
-        // the masters disagree, which for a weight axis is always. A glyphsLib
-        // master UFO doesn't state `openTypeOS2WeightClass` at all (the axis
-        // mapping sets it later), so for a `.glyphs` source fontMath's answer
-        // is genuinely `None` and absent is exactly right; a multi-master
-        // `.designspace` whose masters *do* state one loses a CFF operator, and
-        // fixing that needs per-master OS/2 weight classes in IR.
-        //
-        // `postscriptFullName` is not a `MathInfo` attribute and not on the
-        // copy whitelist either, so it is lost the same way — but the
-        // *instance's* own is replayed over the top, see
-        // [`pin_instance_overrides`].
+        // fontMath does not interpolate `postscriptWeightName`; it derives it
+        // from the interpolated `openTypeOS2WeightClass`, which is not the
+        // class that reaches OS/2 — for an instance that comes from the axis,
+        // so the two legitimately disagree. A `.glyphs` source states no
+        // per-master class, so this stays `None` there and no `Weight` is
+        // written, which is what fontmake does too.
         //
         // <https://github.com/robotools/fontMath/blob/0.10.0/Lib/fontMath/mathInfo.py#L154-L169>
-        weight_name: None,
+        weight_name: interpolated
+            .then(|| postscript_weight_name(os2_weight_class))
+            .flatten(),
+        os2_weight_class,
+        // `postscriptFullName` is not a `MathInfo` attribute and not on the
+        // copy whitelist either, so it is lost — but the *instance's* own is
+        // replayed over the top, see [`pin_instance_overrides`].
         full_name: None,
         default_width_x: number(|ps| ps.default_width_x),
         nominal_width_x: number(|ps| ps.nominal_width_x),
@@ -991,6 +1003,33 @@ fn single_master_at_default<'a>(
     (fit(pin, &axis_order) == fit(static_metadata.default_location(), &axis_order))
         .then(|| by_location.values().next().copied())
         .flatten()
+}
+
+/// The CFF `Weight` an interpolated OS/2 weight class implies.
+///
+/// fontMath's `_processPostscriptWeightName`: round to the nearest 100 the
+/// Python 2 way — halves away from zero, so 250 becomes 300 and not the 200
+/// Python 3's banker's rounding would give — clamp to 100..=900, then look the
+/// result up in the OS/2 weight-class names.
+///
+/// <https://github.com/robotools/fontMath/blob/0.10.0/Lib/fontMath/mathInfo.py#L154-L169>
+fn postscript_weight_name(os2_weight_class: Option<OrderedFloat<f64>>) -> Option<String> {
+    let v = os2_weight_class?.into_inner();
+    // round2(v, -2): f64::round is already half-away-from-zero
+    let hundreds = (v / 100.0).round() as i32;
+    let name = match hundreds.clamp(1, 9) {
+        1 => "Thin",
+        2 => "Extra-light",
+        3 => "Light",
+        4 => "Normal",
+        5 => "Medium",
+        6 => "Semi-bold",
+        7 => "Bold",
+        8 => "Extra-bold",
+        9 => "Black",
+        _ => unreachable!("clamped to 1..=9"),
+    };
+    Some(name.to_string())
 }
 
 /// fontMath's `_processMathOne` for one number, pre-scaled by `scalar`.
@@ -2932,9 +2971,98 @@ mod tests {
         assert_eq!(pinned.nominal_width_x, Some(OrderedFloat(250.5)));
         // copied from the default master, never interpolated
         assert_eq!(pinned.force_bold, Some(false));
-        // both masters name themselves; the instance gets neither
+        // both masters name themselves; the instance gets neither, because
+        // fontMath derives the weight name and neither master states a class
         assert_eq!(pinned.weight_name, None);
         assert_eq!(pinned.full_name, None);
+    }
+
+    /// fontMath derives the CFF `Weight` from the *interpolated*
+    /// `openTypeOS2WeightClass`, not from either master's `postscriptWeightName`.
+    ///
+    /// Every expectation below is from `fontmake -o otf -i <instance>
+    /// --keep-overlaps --optimize-cff 1` on a two-master designspace whose
+    /// masters state weight classes 100 and 900 over wght 400..700:
+    ///
+    /// | user wght | interpolated class | fontmake `Weight` |
+    /// |---|---|---|
+    /// | 550    | 500   | Medium      |
+    /// | 475    | 300   | Light       |
+    /// | 418.75 | 150   | Extra-light |
+    /// | 456.25 | 250   | Light       |
+    /// | 418.6  | 149.6 | Thin        |
+    ///
+    /// The last two are the interesting ones: 250 -> "Light" is Python 2
+    /// rounding (Python 3 would say 200, "Extra-light"), and 149.6 -> "Thin"
+    /// shows the *unrounded* class is what gets rounded to the nearest 100 —
+    /// `MathInfo.round()` would have made it 150 and then "Extra-light", but
+    /// fontmake's `round_instances` defaults to False.
+    #[test]
+    fn pin_postscript_derives_the_weight_name_from_the_interpolated_class() {
+        let mut meta = test_static_metadata();
+        meta.postscript = HashMap::from([
+            (
+                regular(),
+                PostscriptSettings {
+                    weight_name: Some("Thin".to_string()),
+                    os2_weight_class: Some(OrderedFloat(100.0)),
+                    ..Default::default()
+                },
+            ),
+            (
+                bold(),
+                PostscriptSettings {
+                    weight_name: Some("Black".to_string()),
+                    os2_weight_class: Some(OrderedFloat(900.0)),
+                    ..Default::default()
+                },
+            ),
+        ]);
+
+        let at = |t: f64| pin_postscript(&meta, &NormalizedLocation::for_pos(&[("wght", t)]));
+        // wght 400..700, so these are (user - 400) / 300
+        assert_eq!(at(0.5).os2_weight_class, Some(OrderedFloat(500.0)));
+        assert_eq!(at(0.5).weight_name.as_deref(), Some("Medium"));
+        assert_eq!(at(0.25).weight_name.as_deref(), Some("Light"));
+        assert_eq!(
+            at(18.75 / 300.0).weight_name.as_deref(),
+            Some("Extra-light")
+        );
+        assert_eq!(at(56.25 / 300.0).weight_name.as_deref(), Some("Light"));
+        assert_eq!(at(18.6 / 300.0).weight_name.as_deref(), Some("Thin"));
+        // a pin that *is* a master does no math at all, so fontMath never
+        // derives a name and fontmake writes no `Weight`: measured at wght 400
+        // and wght 700 on the same designspace
+        assert_eq!(at(0.0).weight_name, None);
+        assert_eq!(at(1.0).weight_name, None);
+    }
+
+    /// A `.glyphs` source states no per-master weight class, so there is
+    /// nothing to derive from and the instance gets no CFF `Weight` — which is
+    /// what fontmake does too.
+    #[test]
+    fn pin_postscript_without_weight_classes_writes_no_weight() {
+        let mut meta = test_static_metadata();
+        meta.postscript = HashMap::from([
+            (
+                regular(),
+                PostscriptSettings {
+                    weight_name: Some("Thin".to_string()),
+                    ..Default::default()
+                },
+            ),
+            (
+                bold(),
+                PostscriptSettings {
+                    weight_name: Some("Black".to_string()),
+                    ..Default::default()
+                },
+            ),
+        ]);
+
+        let pinned = pin_postscript(&meta, &mid());
+        assert_eq!(pinned.os2_weight_class, None);
+        assert_eq!(pinned.weight_name, None);
     }
 
     /// `BlueMismatch`: blues 4 vs 6, stems 2 vs 3. fontmake's instance UFO has
