@@ -3319,11 +3319,16 @@ mod tests {
         );
     }
 
+    /// A source that states no version is 1.000, matching glyphsLib's
+    /// `GSFont.versionMajor = 1` default.
+    ///
+    /// Oracle: `fontmake -o ttf --keep-overlaps infinity.glyphs` writes
+    /// `head.fontRevision = 1.0` and name id 5 "Version 1.000".
     #[test]
     fn version_default() {
         let font = Font::load(&glyphs3_dir().join("infinity.glyphs")).unwrap();
         assert_eq!(
-            "Version 0.000",
+            "Version 1.000",
             names(&font, SelectionFlags::empty())
                 .get(&NameKey::new_bmp_only(NameId::VERSION_STRING))
                 .unwrap()

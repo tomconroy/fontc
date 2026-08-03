@@ -4166,7 +4166,13 @@ impl TryFrom<RawFont> for Font {
             features,
             all_names,
             instances,
-            version_major: from.versionMajor.unwrap_or_default() as i32,
+            // glyphsLib's GSFont.__init__ seeds versionMajor with 1 and only
+            // the plist overwrites it, so a source that says nothing is 1.0,
+            // not 0.0 (versionMinor really is 0).
+            // https://github.com/googlefonts/glyphsLib/blob/c4db6b981d577f4/Lib/glyphsLib/classes.py#L4585-L4615
+            // Measured: `fontmake -o variable` on a .glyphs with both keys
+            // deleted writes head.fontRevision 1.0.
+            version_major: from.versionMajor.unwrap_or(1) as i32,
             version_minor: from.versionMinor.unwrap_or_default() as u32,
             date: from.date,
             kerning_ltr: from.kerning_LTR,
@@ -7186,6 +7192,31 @@ name = _corner.hi;
                 ))
                 .collect::<Vec<_>>()
         );
+    }
+
+    /// A `.glyphs` that states no version is 1.0, not 0.0.
+    ///
+    /// glyphsLib's `GSFont.__init__` sets `versionMajor = 1` before parsing
+    /// (classes.py:4615) and `_versionMinor = 0` (classes.py:4585); the plist
+    /// only overwrites what it mentions. Oracle: `fontmake -o variable` on
+    /// `glyphs3/WghtVar.glyphs` with both keys deleted writes
+    /// `head.fontRevision = 1.0`.
+    #[test]
+    fn absent_version_is_one_point_zero() {
+        let font = Font::load_from_string(
+            r#"{
+.formatVersion = 3;
+familyName = "No Version";
+fontMaster = (
+{
+id = "m01";
+}
+);
+unitsPerEm = 1000;
+}"#,
+        )
+        .unwrap();
+        assert_eq!((font.version_major, font.version_minor), (1, 0));
     }
 
     #[test]
