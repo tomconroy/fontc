@@ -58,7 +58,7 @@ members = [
 # Local fontations override while CFF writing is unreleased; drop once
 # write-fonts with ps::cff::v1 is published.
 [patch.crates-io]
-font-types = { path = "../fontations/font-types" }
-read-fonts = { path = "../fontations/read-fonts" }
-write-fonts = { path = "../fontations/write-fonts" }
-skrifa = { path = "../fontations/skrifa" }
+font-types = { git = "https://github.com/tomconroy/fontations.git", rev = "668202b5" }
+read-fonts = { git = "https://github.com/tomconroy/fontations.git", rev = "668202b5" }
+write-fonts = { git = "https://github.com/tomconroy/fontations.git", rev = "668202b5" }
+skrifa = { git = "https://github.com/tomconroy/fontations.git", rev = "668202b5" }
