@@ -300,6 +300,85 @@ fn droppable_closing_lines<'a>(paths: impl Iterator<Item = &'a BezPath>) -> Vec<
     droppable.unwrap_or_default()
 }
 
+/// The endpoint of a path element, if it has one.
+fn end_point(el: &PathEl) -> Option<Point> {
+    match el {
+        PathEl::MoveTo(p) | PathEl::LineTo(p) | PathEl::QuadTo(_, p) | PathEl::CurveTo(_, _, p) => {
+            Some(*p)
+        }
+        PathEl::ClosePath => None,
+    }
+}
+
+/// Which of a master's closed contours were drawn with an explicit closing line.
+///
+/// One flag per contour, in contour order. Port of ufo2ft's
+/// `_has_explicit_closing_line`, which asks of the *source point list* whether
+/// the contour's first on-curve point is a `line` that repeats the point before
+/// it — i.e. the designer drew the closing segment too, collapsing it to zero
+/// length.
+/// <https://github.com/googlefonts/ufo2ft/blob/2f11b0ff/Lib/ufo2ft/filters/explicitClosingLine.py#L86-L98>
+///
+/// fontir always spells the closing segment out (its `close_path` is
+/// `PointToSegmentPen(outputImpliedClosingLine=True)`), so here that reads as:
+/// the element before `ClosePath` is a `LineTo` landing exactly on the endpoint
+/// of the element before *that*. Coordinates are compared unrounded, as ufo2ft
+/// compares the source points.
+fn explicit_closing_lines(path: &BezPath) -> Vec<bool> {
+    let els = path.elements();
+    els.iter()
+        .enumerate()
+        .filter(|(_, el)| matches!(el, PathEl::ClosePath))
+        .map(|(idx, _)| {
+            let closing = idx.checked_sub(1).and_then(|i| els.get(i));
+            let before = idx.checked_sub(2).and_then(|i| els.get(i));
+            match (closing, before) {
+                (Some(PathEl::LineTo(p)), Some(before)) => end_point(before) == Some(*p),
+                _ => false,
+            }
+        })
+        .collect()
+}
+
+/// Does this glyph need its closing lines made explicit in every master?
+///
+/// Port of ufo2ft's `ExplicitClosingLineIFilter`, which only the CFF
+/// *interpolatable* pre-processor runs — hence this only ever fires for CFF2:
+/// if some masters drew a contour's closing line and others left it implied, the
+/// whole glyph is marked and every master's charstring gets it written out.
+/// <https://github.com/googlefonts/ufo2ft/blob/2f11b0ff/Lib/ufo2ft/filters/explicitClosingLine.py#L34-L59>
+///
+/// The masters are interpolation compatible by this point, so ufo2ft's "do the
+/// point types agree" precondition is already met. A single master cannot
+/// disagree with itself, so this is a no-op for CFF1, which fontc only writes
+/// for a font with no axes and hence one master.
+fn needs_explicit_closing_lines<'a>(paths: impl Iterator<Item = &'a BezPath>) -> bool {
+    let mut flags: Option<(Vec<bool>, Vec<bool>)> = None; // (any master, every master)
+    let mut num_masters = 0;
+    for path in paths {
+        num_masters += 1;
+        let mine = explicit_closing_lines(path);
+        let Some((any, all)) = flags.as_mut() else {
+            flags = Some((mine.clone(), mine));
+            continue;
+        };
+        if any.len() != mine.len() {
+            return false;
+        }
+        for (i, explicit) in mine.into_iter().enumerate() {
+            #[allow(clippy::indexing_slicing)] // lengths just checked equal
+            {
+                any[i] |= explicit;
+                all[i] &= explicit;
+            }
+        }
+    }
+    if num_masters < 2 {
+        return false;
+    }
+    flags.is_some_and(|(any, all)| any.into_iter().zip(all).any(|(any, all)| any && !all))
+}
+
 /// Apply [`droppable_closing_lines`] to one master's path.
 fn without_closing_lines(path: &BezPath, droppable: &[bool]) -> BezPath {
     path.elements()
@@ -319,7 +398,9 @@ fn without_closing_lines(path: &BezPath, droppable: &[bool]) -> BezPath {
 ///
 /// `keep_closing_lines` is for the `.notdef` fontir synthesizes: like ufo2ft's
 /// stub it draws the closing line of each box explicitly, and ufo2ft keeps
-/// those (its `explicitClosingLine` glyph lib key), so we do too.
+/// those (its `explicitClosingLine` glyph lib key), so we do too. A glyph whose
+/// masters disagree about their closing lines keeps them for the same reason,
+/// see [`needs_explicit_closing_lines`].
 pub(crate) fn postscript_outlines(
     glyph: &ir::Glyph,
     keep_closing_lines: bool,
@@ -334,7 +415,7 @@ pub(crate) fn postscript_outlines(
     let CheckedGlyph::Contour { paths, .. } = CheckedGlyph::new(glyph)? else {
         return Err(Error::CffGlyphHasComponents(glyph.name.clone()));
     };
-    if keep_closing_lines {
+    if keep_closing_lines || needs_explicit_closing_lines(paths.values()) {
         return Ok(paths);
     }
     let droppable = droppable_closing_lines(paths.values());
@@ -595,6 +676,64 @@ mod tests {
             droppable_closing_lines([&two].into_iter()),
             vec![false, false, true, false, false, false, false]
         );
+    }
+
+    /// A master that drew its own closing line has the contour's last two
+    /// points in the same place; one that left it implied does not.
+    #[test]
+    fn an_explicit_closing_line_is_a_repeated_point() {
+        // "M0,0 L100,0 L100,100 L0,0 Z": the source's last point is (100,100),
+        // and fontir added the L0,0 — the closing line is implied
+        assert_eq!(
+            explicit_closing_lines(&path("M0,0 L100,0 L100,100 L0,0 Z")),
+            vec![false]
+        );
+        // "…L0,0 L0,0 Z": the source's last point is the contour start too, so
+        // the closing line fontir added is zero length — drawn by the designer
+        assert_eq!(
+            explicit_closing_lines(&path("M0,0 L100,0 L0,0 L0,0 Z")),
+            vec![true]
+        );
+        // a contour closed by a curve has no closing *line* whatever it does
+        assert_eq!(
+            explicit_closing_lines(&path("M0,0 L100,0 C50,50 20,20 0,0 Z")),
+            vec![false]
+        );
+        // one flag per closed contour, in contour order; an open one has none
+        assert_eq!(
+            explicit_closing_lines(&path("M0,0 L10,0 L0,0 L0,0 Z M5,5 L6,5 L5,5 Z M9,9 L8,8")),
+            vec![true, false]
+        );
+    }
+
+    /// ufo2ft's `ExplicitClosingLineIFilter`: masters that disagree about a
+    /// closing line make it explicit everywhere, so nothing is dropped.
+    #[test]
+    fn masters_that_disagree_keep_every_closing_line() {
+        let implied = path("M0,0 L100,0 L100,100 L0,0 Z");
+        let explicit = path("M0,0 L100,0 L0,0 L0,0 Z");
+        assert!(needs_explicit_closing_lines(
+            [&implied, &explicit].into_iter()
+        ));
+        // all masters agreeing either way is not a disagreement
+        assert!(!needs_explicit_closing_lines(
+            [&implied, &implied].into_iter()
+        ));
+        assert!(!needs_explicit_closing_lines(
+            [&explicit, &explicit].into_iter()
+        ));
+        // and a lone master cannot disagree with itself: this is why the CFF1
+        // path, which fontc only takes for a font with no axes, never sees it
+        assert!(!needs_explicit_closing_lines([&explicit].into_iter()));
+    }
+
+    /// The filter is per glyph, not per contour: one contour's disagreement
+    /// keeps the closing lines of all of them.
+    #[test]
+    fn one_disagreeing_contour_flags_the_whole_glyph() {
+        let a = path("M0,0 L10,0 L0,0 L0,0 Z M50,0 L60,0 L60,10 L50,0 Z");
+        let b = path("M0,0 L10,0 L0,0 L0,0 Z M50,0 L60,0 L50,0 L50,0 Z");
+        assert!(needs_explicit_closing_lines([&a, &b].into_iter()));
     }
 
     #[test]
