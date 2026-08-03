@@ -36,7 +36,9 @@ impl ResultsCache {
         }
         Self {
             base_results_cache_dir,
-            font_file: format!("fontmake.{flavor}"),
+            // the file name follows the *extension*, not the mode: a variable
+            // CFF2 build is still an .otf
+            font_file: format!("fontmake.{}", flavor.font_extension()),
         }
     }
 
@@ -114,6 +116,9 @@ mod tests {
         // the pre-existing variable ttf cache stays exactly where it was
         assert_eq!(dir(Flavor::Ttf, None), "/cache/crater_cached_results");
         assert_eq!(dir(Flavor::Otf, None), "/cache/crater_cached_results/otf");
+        // the whole point of the cff2 mode: it cannot read the static
+        // PostScript corpus's cached fontmake output, or vice versa
+        assert_eq!(dir(Flavor::Cff2, None), "/cache/crater_cached_results/cff2");
         assert_eq!(
             dir(Flavor::Ttf, Some("@default")),
             "/cache/crater_cached_results/instance@default"

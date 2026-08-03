@@ -178,9 +178,12 @@ fn run_crater_and_save_results(args: &CiArgs) -> Result<(), Error> {
 
     // gftools decides its own build type and output set from the config file,
     // so neither a CFF build nor an instanced build can be expressed through it
-    if !args.gftools || args.flavor == Flavor::Otf || args.instance.is_some() {
-        if args.gftools && args.flavor == Flavor::Otf {
-            log::info!("--flavor otf only runs default builds, ignoring gftools targets");
+    if !args.gftools || args.flavor != Flavor::Ttf || args.instance.is_some() {
+        if args.gftools && args.flavor != Flavor::Ttf {
+            log::info!(
+                "--flavor {} only runs default builds, ignoring gftools targets",
+                args.flavor
+            );
         }
         if args.gftools && args.instance.is_some() {
             log::info!("--instance only runs default builds, ignoring gftools targets");
