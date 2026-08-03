@@ -239,6 +239,15 @@ pub struct InstanceOverrides {
     /// override the computed records and never feed them, which is the order
     /// `outlineCompiler.setupTable_name` uses.
     pub name_records: BTreeMap<NameKey, String>,
+    /// `postscriptFullName`, i.e. the CFF `FullName` operator.
+    ///
+    /// Not a name-table record: ufo2ft reads `postscriptFullName` only when it
+    /// builds the CFF Top DICT. An interpolated instance never inherits the
+    /// masters' — it is neither a `MathInfo` attribute nor on ufo2ft's copy
+    /// whitelist — so the instance's own is the only one that can reach a
+    /// `--flavor otf` build.
+    #[serde(default)]
+    pub postscript_full_name: Option<String>,
 }
 
 /// The four style-linking styles, i.e. UFO `styleMapStyleName`.
