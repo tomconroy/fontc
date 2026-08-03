@@ -627,6 +627,7 @@ mod tests {
             BeWorkIdentifier::Stat.into(),
             BeWorkIdentifier::Vhea.into(),
             BeWorkIdentifier::Vmtx.into(),
+            BeWorkIdentifier::Vorg.into(),
             BeWorkIdentifier::Vvar.into(),
         ];
 
@@ -6439,6 +6440,48 @@ mod tests {
                 .unwrap();
         }
         assert!(pen.0 > 0, "at least one CFF glyph should have an outline");
+    }
+
+    /// VORG is a CFF-only table: ufo2ft lists it only in `OutlineOTFCompiler.tables`
+    /// and only writes it when the font is vertical.
+    ///
+    /// Expectations checked against `fontmake -o otf --keep-overlaps --optimize-cff 1
+    /// Vertical.ufo`: defaultVertOriginY 2345 (the OS/2 typo ascender, used by
+    /// .notdef/b/c/d) and one record, 'a' -> 2500.
+    #[rstest]
+    #[case("glyphs2/Vertical.glyphs")]
+    #[case("Vertical.ufo")]
+    fn cff_flavor_builds_vorg(#[case] source: &str) {
+        let result = compile_cff(source);
+        let font = result.font();
+        let vorg = font.vorg().expect("vertical CFF font should have VORG");
+
+        assert_eq!(vorg.default_vert_origin_y(), 2345);
+        assert_eq!(
+            vorg.vert_origin_y_metrics()
+                .iter()
+                .map(|m| (m.glyph_index(), m.vert_origin_y()))
+                .collect::<Vec<_>>(),
+            vec![(result.get_gid("a"), 2500)]
+        );
+    }
+
+    /// The same source in the default (glyf) flavor gets no VORG at all.
+    #[test]
+    fn ttf_flavor_has_no_vorg() {
+        let result = TestCompile::compile_source("Vertical.ufo");
+        let font = result.font();
+        assert!(font.vhea().is_ok(), "should still be a vertical font");
+        assert!(font.table_data(Tag::new(b"VORG")).is_none());
+    }
+
+    /// ... and neither does a CFF font that isn't vertical.
+    #[test]
+    fn cff_flavor_without_vertical_metrics_has_no_vorg() {
+        let result = compile_cff("static.designspace");
+        let font = result.font();
+        assert!(font.vhea().is_err(), "should not be a vertical font");
+        assert!(font.table_data(Tag::new(b"VORG")).is_none());
     }
 
     // ---- --instance: pinning a variable source at one location ----
