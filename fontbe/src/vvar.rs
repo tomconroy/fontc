@@ -6,13 +6,13 @@ use fontdrasil::{
     orchestration::{Access, Work},
     types::GlyphName,
 };
-use fontir::orchestration::WorkId as FeWorkId;
+use fontir::orchestration::{Flags, WorkId as FeWorkId};
 use write_fonts::tables::{
     variations::{DeltaSetIndexMap, ivs_builder::VariationStoreBuilder},
     vvar::Vvar,
 };
 
-use crate::metric_variations::{AdvanceDeltas, DeltaDirection, table_size};
+use crate::metric_variations::{AdvanceDeltas, DeltaDirection, VerticalOriginDeltas, table_size};
 use crate::{
     error::Error,
     orchestration::{AnyWorkId, BeWork, Context, WorkId},
@@ -68,14 +68,27 @@ impl Work<Context, AnyWorkId, Error> for VvarWork {
             &metrics,
             DeltaDirection::Vertical,
         );
-        for glyph in glyphs.into_iter() {
+        for glyph in glyphs.iter() {
             glyph_deltas.add(glyph.as_ref())?;
         }
 
+        // A CFF flavored vertical font writes a VORG, and fontTools reads the vertical
+        // origins back out of it to add a VOrgMap to VVAR. A glyf flavored one has no
+        // VORG so it gets no VOrgMap, and neither does HVAR ever.
+        // https://github.com/fonttools/fonttools/blob/03a3c8ed/Lib/fontTools/varLib/__init__.py#L692-L697
+        let vorg_deltas = context
+            .flags
+            .contains(Flags::CFF_OUTLINES)
+            .then(|| VerticalOriginDeltas::new(&static_metadata, &metrics, &glyphs))
+            .transpose()?;
+
         // if we have a single model, we can try to build a VariationStore with implicit variation
         // indices (a single ItemVariationData, outer index 0, inner index => gid).
+        // Vertical origins take that option away: they make the store carry two rows per
+        // glyph, so there is no gid => row identity to exploit, and fontTools likewise
+        // forces the indirect store whenever it has them.
         let mut var_idxes = Vec::new();
-        let direct_store = if glyph_deltas.is_single_model() {
+        let direct_store = if vorg_deltas.is_none() && glyph_deltas.is_single_model() {
             let mut direct_builder = VariationStoreBuilder::new_with_implicit_indices(axis_count);
             for deltas in glyph_deltas.iter() {
                 var_idxes.push(direct_builder.add_deltas(deltas.clone()));
@@ -94,15 +107,29 @@ impl Work<Context, AnyWorkId, Error> for VvarWork {
             None
         };
 
-        // also build an indirect VariationStore with a DeltaSetIndexMap to map gid => varidx
+        // also build an indirect VariationStore with a DeltaSetIndexMap to map gid => varidx.
+        // Every advance goes in before any vertical origin does, matching the order
+        // fontTools adds them, because that is what decides the region ordering.
         let mut indirect_builder = VariationStoreBuilder::new(axis_count);
         for deltas in glyph_deltas.iter() {
             var_idxes.push(indirect_builder.add_deltas(deltas.clone()));
+        }
+        let mut vorg_var_idxes = Vec::new();
+        if let Some(vorg_deltas) = vorg_deltas.as_ref() {
+            for deltas in vorg_deltas.iter() {
+                vorg_var_idxes.push(indirect_builder.add_deltas(deltas.clone()));
+            }
         }
         let (indirect_store, varidx_map) = indirect_builder.build();
 
         // unwrap since VariationStoreBuilder guarantees that any temporary index returned by
         // add_deltas will exist in the returned map
+        let vorg_map: Option<DeltaSetIndexMap> = vorg_deltas.is_some().then(|| {
+            vorg_var_idxes
+                .into_iter()
+                .map(|idx| varidx_map.get(idx).unwrap())
+                .collect()
+        });
         let varidx_map: DeltaSetIndexMap = var_idxes
             .into_iter()
             .map(|idx| varidx_map.get(idx).unwrap())
@@ -121,7 +148,7 @@ impl Work<Context, AnyWorkId, Error> for VvarWork {
             }
         }
 
-        let vvar = Vvar::new(varstore, varidx_map, None, None, None);
+        let vvar = Vvar::new(varstore, varidx_map, None, None, vorg_map);
         context.vvar.set(vvar);
 
         Ok(())

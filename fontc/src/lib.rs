@@ -6466,6 +6466,47 @@ mod tests {
         );
     }
 
+    /// A CFF flavored vertical font has a VORG, and fontTools reads the vertical
+    /// origins back out of it to give VVAR a `VOrgMap` — which also costs it the
+    /// direct VarStore, since that has room for one row per glyph and this needs
+    /// two. Compare `compile_vvar_single_model_direct_varstore`, which is the
+    /// same source in the default flavor and does take the direct store.
+    ///
+    /// <https://github.com/fonttools/fonttools/blob/03a3c8ed/Lib/fontTools/varLib/__init__.py#L607-L609>
+    #[test]
+    fn cff_flavor_vvar_maps_vertical_origins() {
+        let result = compile_cff("HVVAR/SingleModel_Direct/SingleModelDirect.designspace");
+        let font = result.font();
+        let vvar = font.vvar().unwrap();
+
+        let varstore = vvar.item_variation_store().unwrap();
+        let vardata = varstore.item_variation_data().get(0).unwrap().unwrap();
+        // 50 is the advance height delta the glyf flavor already had; 20 is new,
+        // the letters' vertical origin going 880 -> 900. The marks have no
+        // vertical origin of their own, so they follow the typo ascender, which
+        // doesn't vary, and stay on the zero row.
+        assert_eq!(vec![vec![0], vec![20], vec![50]], delta_sets(&vardata));
+
+        assert!(
+            vvar.advance_height_mapping().is_some(),
+            "a VOrgMap forces the indirect store, so advances need a map too"
+        );
+        let Some(Ok(vorg_map)) = vvar.v_org_mapping() else {
+            panic!("a CFF flavored vertical font should have a VOrgMap");
+        };
+        let inner = |name: &str| vorg_map.get(result.get_gid(name).to_u32()).unwrap().inner;
+        assert_eq!((inner("A"), inner("acutecomb")), (1, 0));
+    }
+
+    /// The same source in the default (glyf) flavor has no VORG, so no VOrgMap.
+    #[test]
+    fn ttf_flavor_vvar_does_not_map_vertical_origins() {
+        let result =
+            TestCompile::compile_source("HVVAR/SingleModel_Direct/SingleModelDirect.designspace");
+        let font = result.font();
+        assert!(font.vvar().unwrap().v_org_mapping().is_none());
+    }
+
     /// The same source in the default (glyf) flavor gets no VORG at all.
     #[test]
     fn ttf_flavor_has_no_vorg() {
