@@ -470,6 +470,7 @@ fn instance_overrides(inst: &Instance) -> InstanceOverrides {
         metrics,
         names,
         name_records,
+        postscript_full_name: inst.postscript_full_name().map(str::to_string),
     }
 }
 

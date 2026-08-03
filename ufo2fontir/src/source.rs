@@ -1543,6 +1543,10 @@ fn instance_overrides(lib: &Dictionary) -> InstanceOverrides {
             "isFixedPitch" | "postscriptIsFixedPitch" => {
                 overrides.is_fixed_pitch = as_glyphs_bool(value);
             }
+            // the CFF `FullName` operator, not a name record
+            "postscriptFullName" => {
+                overrides.postscript_full_name = value.as_string().map(str::to_string);
+            }
             "Use Typo Metrics" => overrides.use_typo_metrics = as_glyphs_bool(value),
             "Has WWS Names" => overrides.has_wws_names = as_glyphs_bool(value),
             "Don't use Production Names" => {

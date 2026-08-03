@@ -884,6 +884,23 @@ pub fn pin_postscript(
         .iter()
         .map(|(loc, settings)| (fit(loc, &axis_order), settings))
         .collect();
+
+    // ufo2ft's instantiator: `if self.info_mutator.is_static_font() and
+    // is_at_default`, i.e. one info master and a pin at the default location,
+    // the instance inherits the *whole* fontinfo of that master rather than
+    // ufo2ft's copy whitelist — "it's OK for it to inherit ALL the fontinfo
+    // from the default source". So the two attributes an interpolated instance
+    // always loses, `postscriptWeightName` and `postscriptFullName`, come
+    // through here. Measured on the three single-master designspaces in the
+    // corpus — docrepair-fonts' Caprasimo, Lugrasimo and Bacasime Antique —
+    // whose only `--instance @default --flavor otf` diff was fontmake's CFF
+    // `Weight` entry.
+    //
+    // <https://github.com/googlefonts/ufo2ft/blob/main/Lib/ufo2ft/instantiator.py#L725-L740>
+    if let Some(only) = single_master_at_default(static_metadata, &by_location, pin) {
+        return only.clone();
+    }
+
     let model = VariationModel::new(by_location.keys().cloned().collect(), axis_order);
 
     let contributors: Vec<(&PostscriptSettings, f64)> = model
@@ -925,6 +942,9 @@ pub fn pin_postscript(
         stem_snap_v: list(|ps| &ps.stem_snap_v),
         // copied from the default master, not interpolated
         force_bold: static_metadata.postscript_default().force_bold,
+        // Past the single-master short circuit above there is more than one
+        // info master, so `extractInfo` runs and these two are lost.
+        //
         // fontMath derives `postscriptWeightName` — the CFF `Weight` operator —
         // from the *interpolated* `openTypeOS2WeightClass`, which is not the
         // one that reaches OS/2: glyphsLib overwrites that from the axis
@@ -932,11 +952,17 @@ pub fn pin_postscript(
         // `misc.us_weight_class`, the default master's, and no per-master
         // weight classes, so there is nothing here to interpolate — and
         // deriving from the default master's class would be *wrong* wherever
-        // the masters disagree, which for a weight axis is always. Absent is
-        // right for the exact-master pins, where no math runs and fontMath
-        // never sets the attribute; a non-master pin loses a CFF operator that
-        // neither master had. Fixing it needs per-master OS/2 weight classes
-        // in IR.
+        // the masters disagree, which for a weight axis is always. A glyphsLib
+        // master UFO doesn't state `openTypeOS2WeightClass` at all (the axis
+        // mapping sets it later), so for a `.glyphs` source fontMath's answer
+        // is genuinely `None` and absent is exactly right; a multi-master
+        // `.designspace` whose masters *do* state one loses a CFF operator, and
+        // fixing that needs per-master OS/2 weight classes in IR.
+        //
+        // `postscriptFullName` is not a `MathInfo` attribute and not on the
+        // copy whitelist either, so it is lost the same way — but the
+        // *instance's* own is replayed over the top, see
+        // [`pin_instance_overrides`].
         //
         // <https://github.com/robotools/fontMath/blob/0.10.0/Lib/fontMath/mathInfo.py#L154-L169>
         weight_name: None,
@@ -944,6 +970,27 @@ pub fn pin_postscript(
         default_width_x: number(|ps| ps.default_width_x),
         nominal_width_x: number(|ps| ps.nominal_width_x),
     }
+}
+
+/// The one and only info master, when the pin sits on it.
+///
+/// ufo2ft's `is_static_font() and is_at_default`: a designspace with a single
+/// non-sparse source, pinned at the default location. Sparse sources contribute
+/// no fontinfo and so are not in [`StaticMetadata::postscript`] either, which is
+/// what makes counting that map the same test ufo2ft's `collect_info_masters`
+/// makes.
+fn single_master_at_default<'a>(
+    static_metadata: &StaticMetadata,
+    by_location: &HashMap<NormalizedLocation, &'a PostscriptSettings>,
+    pin: &NormalizedLocation,
+) -> Option<&'a PostscriptSettings> {
+    if by_location.len() != 1 {
+        return None;
+    }
+    let axis_order: Vec<_> = static_metadata.axes.iter().map(|a| a.tag).collect();
+    (fit(pin, &axis_order) == fit(static_metadata.default_location(), &axis_order))
+        .then(|| by_location.values().next().copied())
+        .flatten()
 }
 
 /// fontMath's `_processMathOne` for one number, pre-scaled by `scalar`.
@@ -1091,6 +1138,12 @@ fn pin_instance_overrides(pinned: &mut StaticMetadata, instance: &NamedInstance)
     if let Some(meta_table) = overrides.meta_table.as_ref() {
         pinned.misc.meta_table = Some(meta_table.clone());
     }
+    if let Some(full_name) = overrides.postscript_full_name.as_ref() {
+        // one entry, keyed at the pin; see `pin_static_metadata`
+        for settings in pinned.postscript.values_mut() {
+            settings.full_name = Some(full_name.clone());
+        }
+    }
     // glyphsLib unions these two into `openTypeOS2Selection`, so an instance
     // that says nothing leaves whatever the font said standing
     for (stated, flag) in [
@@ -1209,10 +1262,22 @@ fn pin_names(
         NameId::TYPOGRAPHIC_SUBFAMILY_NAME,
     ];
     /// Instance-specific and not on ufo2ft's copy whitelist: simply lost.
-    const DROPPED: [NameId; 3] = [
+    ///
+    /// Name id 25, the Variations PostScript Name Prefix, is here for a
+    /// different reason: it is meaningless in a static font — it exists only so
+    /// that a *variable* font can build its named instances' PostScript names —
+    /// and glyphsLib registers no handler mapping Glyphs'
+    /// `variationsPostScriptNamePrefix` onto any UFO attribute, so no
+    /// interpolated instance can carry one however the source spells it.
+    /// A `Name Table Entry` naming id 25 still wins: those are applied verbatim
+    /// after the table is built, exactly as ufo2ft writes `openTypeNameRecords`.
+    ///
+    /// <https://github.com/googlefonts/glyphsLib/blob/main/Lib/glyphsLib/builder/custom_params.py#L405>
+    const DROPPED: [NameId; 4] = [
         NameId::COMPATIBLE_FULL_NAME,
         NameId::WWS_FAMILY_NAME,
         NameId::WWS_SUBFAMILY_NAME,
+        NameId::VARIATIONS_POSTSCRIPT_NAME_PREFIX,
     ];
     const ENGLISH: u16 = 0x409;
 
@@ -2730,6 +2795,51 @@ mod tests {
         assert_eq!(get(NameId::new(25)), Some("FamRoman".to_string()));
     }
 
+    /// The font's Variations PostScript Name Prefix does not reach a static
+    /// instance: glyphsLib maps `variationsPostScriptNamePrefix` to nothing, so
+    /// fontmake never writes id 25 into one. Measured on
+    /// `googlefonts/googlesans-code GoogleSansCode` and
+    /// `mozilla/mozilla-text-type MozillaText`, whose only `--instance @default`
+    /// diff was fontc's extra id 25 (`GoogleSansCode` / `MozillaTextVF`).
+    #[test]
+    fn pin_names_drops_the_variations_postscript_prefix() {
+        let mut meta = test_static_metadata();
+        meta.names = HashMap::from([
+            (NameKey::new(NameId::FAMILY_NAME, "Fam"), "Fam".to_string()),
+            (
+                NameKey::new(NameId::VARIATIONS_POSTSCRIPT_NAME_PREFIX, "FamVF"),
+                "FamVF".to_string(),
+            ),
+        ]);
+        let names = pin_names(&meta, &named("Bold"));
+        assert!(
+            !names
+                .keys()
+                .any(|key| key.name_id == NameId::VARIATIONS_POSTSCRIPT_NAME_PREFIX),
+            "id 25 survived: {names:?}"
+        );
+
+        // ...but an explicit `Name Table Entry` for id 25 still does
+        let instance = NamedInstance {
+            overrides: crate::ir::InstanceOverrides {
+                name_records: BTreeMap::from([(
+                    NameKey::new(NameId::VARIATIONS_POSTSCRIPT_NAME_PREFIX, "FamRoman"),
+                    "FamRoman".to_string(),
+                )]),
+                ..Default::default()
+            },
+            ..named("Bold")
+        };
+        let names = pin_names(&meta, &instance);
+        assert_eq!(
+            names
+                .iter()
+                .find(|(key, _)| key.name_id == NameId::VARIATIONS_POSTSCRIPT_NAME_PREFIX)
+                .map(|(_, value)| value.clone()),
+            Some("FamRoman".to_string())
+        );
+    }
+
     /// A metric the instance states replaces the interpolated one outright.
     #[test]
     fn build_pinned_prefers_an_instance_override() {
@@ -2901,7 +3011,54 @@ mod tests {
         assert_eq!(pinned.blue_shift, Some(OrderedFloat(8.0)));
         // ... except force_bold, which is always the *default* master's
         assert_eq!(pinned.force_bold, Some(false));
-        // and these two, which no instance ever gets
+        // and these two, which a *multi*-master instance never gets
+        assert_eq!(pinned.weight_name, None);
+        assert_eq!(pinned.full_name, None);
+    }
+
+    /// One info master pinned at the default: ufo2ft copies its whole fontinfo,
+    /// so `postscriptWeightName` and `postscriptFullName` survive. Measured on
+    /// `docrepair-fonts/caprasimo-fonts Caprasimo-Regular.designspace`, a
+    /// one-source designspace whose only `--instance @default --flavor otf`
+    /// diff was fontmake's CFF `<Weight value="Regular"/>`.
+    #[test]
+    fn pin_postscript_one_master_at_default_keeps_the_whole_fontinfo() {
+        let mut meta = test_static_metadata_at(HashSet::from([regular()]));
+        meta.postscript = HashMap::from([(
+            regular(),
+            PostscriptSettings {
+                blue_values: floats(&[-10.0, 0.0]),
+                weight_name: Some("Regular".to_string()),
+                full_name: Some("Caprasimo Regular".to_string()),
+                ..Default::default()
+            },
+        )]);
+
+        let pinned = pin_postscript(&meta, &regular());
+
+        assert_eq!(pinned.weight_name, Some("Regular".to_string()));
+        assert_eq!(pinned.full_name, Some("Caprasimo Regular".to_string()));
+        assert_eq!(pinned.blue_values, floats(&[-10.0, 0.0]));
+    }
+
+    /// ...but two masters is two masters, even where one of them is silent.
+    #[test]
+    fn pin_postscript_two_masters_still_lose_the_names() {
+        let mut meta = test_static_metadata();
+        meta.postscript = HashMap::from([
+            (
+                regular(),
+                PostscriptSettings {
+                    weight_name: Some("Regular".to_string()),
+                    full_name: Some("Fam Regular".to_string()),
+                    ..Default::default()
+                },
+            ),
+            (bold(), PostscriptSettings::default()),
+        ]);
+
+        let pinned = pin_postscript(&meta, &regular());
+
         assert_eq!(pinned.weight_name, None);
         assert_eq!(pinned.full_name, None);
     }
@@ -2946,6 +3103,35 @@ mod tests {
             pinned.postscript_default().blue_values,
             floats(&[-15.0, 0.0, 550.0, 565.0, 750.0, 765.0])
         );
+    }
+
+    /// The instance's own `postscriptFullName` is the CFF `FullName`, beating
+    /// the family-plus-style fallback the backend would otherwise build.
+    /// Measured on `Omnibus-Type/Saira_Stencil SairaStencil-Italic`, whose
+    /// `Thin Italic` instance carries `postscriptFullName` =
+    /// `SairaStencilThinItalic` and whose only `--flavor otf` diff was fontc's
+    /// `Saira Stencil Thin Italic`.
+    #[test]
+    fn pin_static_metadata_applies_the_instance_postscript_full_name() {
+        let mut meta = test_static_metadata();
+        meta.postscript = blue_match();
+        let instance = NamedInstance {
+            overrides: crate::ir::InstanceOverrides {
+                postscript_full_name: Some("FamThinItalic".to_string()),
+                ..Default::default()
+            },
+            ..named("Thin Italic")
+        };
+
+        let pinned = pin_static_metadata(&meta, &mid(), &user_mid(), Some(&instance)).unwrap();
+
+        assert_eq!(
+            pinned.postscript_default().full_name.as_deref(),
+            Some("FamThinItalic")
+        );
+        // and an instance that says nothing still gets nothing
+        let pinned = pin_static_metadata(&meta, &mid(), &user_mid(), Some(&named("Thin"))).unwrap();
+        assert_eq!(pinned.postscript_default().full_name, None);
     }
 
     #[test]

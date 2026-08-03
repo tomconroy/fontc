@@ -155,6 +155,7 @@ pub struct CustomParameters {
     // <https://github.com/googlefonts/glyphsLib/blob/main/Lib/glyphsLib/builder/custom_params.py#L364-L448>
     pub family_name: Option<SmolStr>,
     pub postscript_font_name: Option<SmolStr>,
+    pub postscript_full_name: Option<SmolStr>,
     pub style_map_family_name: Option<SmolStr>,
     pub style_map_style_name: Option<SmolStr>,
     pub preferred_family_name: Option<SmolStr>,
@@ -1328,6 +1329,9 @@ impl RawCustomParameters {
                 "familyName" => add_and_report_issues!(family_name, Plist::as_str, into),
                 "postscriptFontName" => {
                     add_and_report_issues!(postscript_font_name, Plist::as_str, into)
+                }
+                "postscriptFullName" => {
+                    add_and_report_issues!(postscript_full_name, Plist::as_str, into)
                 }
                 "styleMapFamilyName" => {
                     add_and_report_issues!(style_map_family_name, Plist::as_str, into)
@@ -3806,6 +3810,19 @@ impl Instance {
         }
         kept.reverse();
         kept.join(" ")
+    }
+
+    /// The CFF `FullName` for a static build of this instance, if it states one.
+    ///
+    /// glyphsLib registers `postscriptFullName` as both a custom parameter and a
+    /// Glyphs 3 property, and `apply_instance_data_to_ufo` writes it onto the
+    /// interpolated UFO's `postscriptFullName` — which ufo2ft reads only when it
+    /// builds the CFF Top DICT, never for the name table.
+    ///
+    /// <https://github.com/googlefonts/glyphsLib/blob/main/Lib/glyphsLib/builder/custom_params.py#L385>
+    pub fn postscript_full_name(&self) -> Option<&str> {
+        self.property("postscriptFullName")
+            .or(self.custom_parameters.postscript_full_name.as_deref())
     }
 
     /// Get the optional postscript name to use for the `fvar` named instance.
@@ -6338,6 +6355,7 @@ etc;
                 postscript_font_name: Some("FamCond-Regular".into()),
                 style_map_family_name: Some("Fam Cond Black".into()),
                 preferred_family_name: Some("Fam".into()),
+                postscript_full_name: Some("FamCondRegular".into()),
                 ..Default::default()
             },
             properties: Vec::new(),
@@ -6347,6 +6365,7 @@ etc;
         };
         assert_eq!(instance.family_name(), Some("Fam Condensed"));
         assert_eq!(instance.postscript_name(), Some("FamCond-Regular"));
+        assert_eq!(instance.postscript_full_name(), Some("FamCondRegular"));
         assert_eq!(instance.preferred_family_name(), Some("Fam"));
         assert_eq!(
             instance.style_map_family_name("Fam Condensed"),
@@ -6354,12 +6373,24 @@ etc;
         );
 
         // a Glyphs 3 property wins over the parameter
-        instance.properties = vec![RawName {
-            key: "familyNames".into(),
-            value: Some("Fam SemiExpanded".into()),
-            values: Vec::new(),
-        }];
+        instance.properties = vec![
+            RawName {
+                key: "familyNames".into(),
+                value: Some("Fam SemiExpanded".into()),
+                values: Vec::new(),
+            },
+            // Saira Stencil states this one as a property
+            RawName {
+                key: "postscriptFullName".into(),
+                value: Some("FamSemiExpandedRegular".into()),
+                values: Vec::new(),
+            },
+        ];
         assert_eq!(instance.family_name(), Some("Fam SemiExpanded"));
+        assert_eq!(
+            instance.postscript_full_name(),
+            Some("FamSemiExpandedRegular")
+        );
     }
 
     #[test]
