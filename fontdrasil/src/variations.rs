@@ -38,6 +38,16 @@ pub enum RoundingBehaviour {
     None,
     /// Round half-way values to the nearest even number. See [`RoundTiesEven`].
     RoundTiesEven,
+    /// Like [`Self::RoundTiesEven`], but only where the value is already
+    /// within the given tolerance of an integer; anything else keeps its
+    /// fraction.
+    ///
+    /// This is FontTools' `maybeRound`
+    /// (<https://github.com/fonttools/fonttools/blob/4ad6b0db/Lib/fontTools/misc/roundTools.py#L48-L50>),
+    /// which CFF2 charstring blends use with a tolerance of 0.01: a delta
+    /// that is genuinely fractional stays fractional and is written as a
+    /// 16.16 fixed operand.
+    RoundTiesEvenWithin(OrderedFloat<f64>),
 }
 
 impl RoundingBehaviour {
@@ -45,6 +55,9 @@ impl RoundingBehaviour {
         match self {
             RoundingBehaviour::None => value,
             RoundingBehaviour::RoundTiesEven => value.round_ties_even(),
+            RoundingBehaviour::RoundTiesEvenWithin(tolerance) => {
+                value.round_ties_even_within(tolerance.into_inner())
+            }
         }
     }
 }
@@ -69,6 +82,24 @@ impl RoundingBehaviour {
 /// - 'Rounding half to even' section in <https://en.wikipedia.org/wiki/Rounding>.
 pub trait RoundTiesEven {
     fn round_ties_even(self) -> Self;
+
+    /// [`Self::round_ties_even`], but only where that lands within
+    /// `tolerance` of the original value.
+    ///
+    /// FontTools' `maybeRound`; see [`RoundingBehaviour::RoundTiesEvenWithin`].
+    fn round_ties_even_within(self, tolerance: f64) -> Self;
+}
+
+/// f64 flavour of `maybeRound`: round, and keep the rounded value only if it
+/// moved no further than the tolerance.
+#[inline]
+fn maybe_round_f64(value: f64, tolerance: f64) -> f64 {
+    let rounded = value.round_ties_even();
+    if (rounded - value).abs() <= tolerance {
+        rounded
+    } else {
+        value
+    }
 }
 
 impl RoundTiesEven for f64 {
@@ -76,12 +107,25 @@ impl RoundTiesEven for f64 {
     fn round_ties_even(self) -> f64 {
         self.round_ties_even()
     }
+
+    #[inline]
+    fn round_ties_even_within(self, tolerance: f64) -> f64 {
+        maybe_round_f64(self, tolerance)
+    }
 }
 
 impl RoundTiesEven for kurbo::Vec2 {
     #[inline]
     fn round_ties_even(self) -> kurbo::Vec2 {
         kurbo::Vec2::new(self.x.round_ties_even(), self.y.round_ties_even())
+    }
+
+    #[inline]
+    fn round_ties_even_within(self, tolerance: f64) -> kurbo::Vec2 {
+        kurbo::Vec2::new(
+            maybe_round_f64(self.x, tolerance),
+            maybe_round_f64(self.y, tolerance),
+        )
     }
 }
 
@@ -137,6 +181,37 @@ impl VariationModel {
     /// Axis order should not include point axes. (In general it should come
     /// from a call to [`Axes::axis_order`] which guarantees there are no point axes).
     pub fn new(locations: HashSet<NormalizedLocation>, axis_order: Vec<Tag>) -> Self {
+        Self::new_with_reach(locations, axis_order, TentReach::ObservedExtremes)
+    }
+
+    /// A model whose region tents reach the ends of normalized space.
+    ///
+    /// [`Self::new`] stops each tent at the most extreme master location it
+    /// can see, which is what every table fontc writes today wants. FontTools
+    /// instead stops it at `axisRanges`, which for a non-extrapolating model
+    /// defaults to (-1, 1) whatever the masters do
+    /// (<https://github.com/fonttools/fonttools/blob/4ad6b0db/Lib/fontTools/varLib/models.py#L286-L290>,
+    /// used by `_locationsToRegions` at `:459-467`).
+    ///
+    /// The two agree whenever some master sits at a normalized axis extreme,
+    /// which is the usual case for the model over *all* the font's masters —
+    /// but not for a sub-model over the masters one sparse glyph happens to
+    /// have, whose peak may be the furthest thing from the default that the
+    /// sub-model can see. CFF2 writes those tents into its variation store
+    /// verbatim, so it wants FontTools' answer; nothing else does, so nothing
+    /// else calls this.
+    pub fn new_full_axis_ranges(
+        locations: HashSet<NormalizedLocation>,
+        axis_order: Vec<Tag>,
+    ) -> Self {
+        Self::new_with_reach(locations, axis_order, TentReach::FullAxis)
+    }
+
+    fn new_with_reach(
+        locations: HashSet<NormalizedLocation>,
+        axis_order: Vec<Tag>,
+        reach: TentReach,
+    ) -> Self {
         let default = axis_order
             .iter()
             .map(|axis| (*axis, NormalizedCoord::new(ZERO)))
@@ -162,7 +237,7 @@ impl VariationModel {
         let sorting_hat = LocationSortingHat::new(&locations, &axis_order);
         locations.sort_by_cached_key(|loc| sorting_hat.key_for(loc));
 
-        let regions = regions_for(&axis_order, &locations);
+        let regions = regions_for(&axis_order, &locations, reach);
         let influence = master_influence(&axis_order, &regions);
         let delta_weights = delta_weights(&locations, &influence);
 
@@ -230,6 +305,49 @@ impl VariationModel {
     /// The axes in the model, in order
     pub fn axis_order(&self) -> &[Tag] {
         &self.axis_order
+    }
+
+    /// The region each master influences, in [`Self::locations`] order.
+    ///
+    /// FontTools' `VariationModel.supports`. The first entry belongs to the
+    /// default master and is all zeroes; the rest are the regions a variation
+    /// store built from this model would hold, in store order.
+    pub fn regions(&self) -> &[VariationRegion] {
+        &self.influence
+    }
+
+    /// Deltas for one value per master, given in [`Self::locations`] order.
+    ///
+    /// Where [`Self::deltas`] takes a sequence of points per location and
+    /// tolerates locations being absent, this is the scalar case with every
+    /// master present: FontTools' `VariationModel.getDeltas`
+    /// (<https://github.com/fonttools/fonttools/blob/4ad6b0db/Lib/fontTools/varLib/models.py#L481-L500>),
+    /// which is what CFF2 blends are built from. Rounding is applied as each
+    /// delta is produced, so later deltas are computed from the rounded
+    /// earlier ones — the running order matters, see [`Self::deltas`].
+    ///
+    /// # Panics
+    ///
+    /// If `values` is not one value per master.
+    pub fn deltas_for_masters(&self, values: &[f64], rounding: RoundingBehaviour) -> Vec<f64> {
+        assert_eq!(
+            values.len(),
+            self.delta_weights.len(),
+            "one value per master is required"
+        );
+        let mut out: Vec<f64> = Vec::with_capacity(values.len());
+        for (idx, weights) in self.delta_weights.iter().enumerate() {
+            #[allow(clippy::indexing_slicing)] // asserted above
+            let mut delta = values[idx];
+            for (master_idx, weight) in weights.iter() {
+                #[allow(clippy::indexing_slicing)]
+                // delta_weights[i] only ever names masters before i
+                let already = out[*master_idx];
+                delta -= already * weight.into_inner();
+            }
+            out.push(rounding.apply(delta));
+        }
+        out
     }
 
     pub fn supports(&self, location: &NormalizedLocation) -> bool {
@@ -907,11 +1025,26 @@ impl From<Tent> for gvar::Tent {
     }
 }
 
+/// How far a region tent spreads on either side of its peak.
+///
+/// See [`VariationModel::new_full_axis_ranges`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TentReach {
+    /// To the most extreme master location on that axis.
+    ObservedExtremes,
+    /// To the ends of normalized space, -1 and 1.
+    FullAxis,
+}
+
 /// Split space into regions.
 ///
 /// VariationModel::_locationsToRegions in Python.
 /// <https://github.com/fonttools/fonttools/blob/2f1f5e5e7be331d960a0e30d537c2b4c70d89285/Lib/fontTools/varLib/models.py#L416>
-fn regions_for(axis_order: &[Tag], locations: &[NormalizedLocation]) -> Vec<VariationRegion> {
+fn regions_for(
+    axis_order: &[Tag],
+    locations: &[NormalizedLocation],
+    reach: TentReach,
+) -> Vec<VariationRegion> {
     let mut minmax = HashMap::<Tag, (NormalizedCoord, NormalizedCoord)>::new();
     for location in locations.iter() {
         for (tag, value) in location.iter() {
@@ -922,6 +1055,14 @@ fn regions_for(axis_order: &[Tag], locations: &[NormalizedLocation]) -> Vec<Vari
             if value > max {
                 *max = *value;
             }
+        }
+    }
+    if reach == TentReach::FullAxis {
+        // fontTools' default axisRanges: every axis reaches (-1, 1),
+        // regardless of where the masters actually sit
+        for (min, max) in minmax.values_mut() {
+            *min = NormalizedCoord::new(-1.0);
+            *max = NormalizedCoord::new(1.0);
         }
     }
 
@@ -1683,6 +1824,11 @@ mod tests {
         fn round_ties_even(self) -> NoRoundF64 {
             self
         }
+
+        #[inline]
+        fn round_ties_even_within(self, _tolerance: f64) -> NoRoundF64 {
+            self
+        }
     }
 
     impl std::ops::Sub for NoRoundF64 {
@@ -2120,5 +2266,144 @@ mod tests {
             .unwrap();
 
         assert_eq!(at_mid, vec![Vec2::new(50.0, 10.5)]);
+    }
+
+    fn tents(model: &VariationModel, tag: &str) -> Vec<(f64, f64, f64)> {
+        let tag = Tag::from_str(tag).unwrap();
+        model
+            .regions()
+            .iter()
+            .skip(1)
+            .map(|region| {
+                let tent = region.get(&tag).unwrap();
+                (
+                    tent.min.into_inner().into_inner(),
+                    tent.peak.into_inner().into_inner(),
+                    tent.max.into_inner().into_inner(),
+                )
+            })
+            .collect()
+    }
+
+    /// The whole point of [`VariationModel::new_full_axis_ranges`]: a model
+    /// over masters that stop short of the axis extreme.
+    ///
+    /// ```text
+    /// >>> VariationModel([{}, {'wght': 0.4}], ['wght']).supports
+    /// [{}, {'wght': (0, 0.4, 1)}]
+    /// ```
+    #[test]
+    fn full_axis_ranges_reach_past_the_masters() {
+        let locations = HashSet::from([loc1(0.0), loc1(0.4)]);
+        let observed = VariationModel::new(locations.clone(), axis_order(&["wght"]));
+        assert_eq!(tents(&observed, "wght"), vec![(0.0, 0.4, 0.4)]);
+
+        let full = VariationModel::new_full_axis_ranges(locations, axis_order(&["wght"]));
+        assert_eq!(tents(&full, "wght"), vec![(0.0, 0.4, 1.0)]);
+    }
+
+    /// The two agree when a master does sit at the extreme, which is why gvar
+    /// has never noticed the difference. Vf3's three masters, sit at 0, 0.4
+    /// and 1.0:
+    ///
+    /// ```text
+    /// >>> VariationModel([{}, {'wght': 0.4}, {'wght': 1.0}], ['wght']).supports
+    /// [{}, {'wght': (0, 0.4, 1)}, {'wght': (0.4, 1.0, 1)}]
+    /// ```
+    #[test]
+    fn full_axis_ranges_change_nothing_when_a_master_is_extreme() {
+        let locations = HashSet::from([loc1(0.0), loc1(0.4), loc1(1.0)]);
+        let expect = vec![(0.0, 0.4, 1.0), (0.4, 1.0, 1.0)];
+        assert_eq!(
+            tents(
+                &VariationModel::new(locations.clone(), axis_order(&["wght"])),
+                "wght"
+            ),
+            expect
+        );
+        assert_eq!(
+            tents(
+                &VariationModel::new_full_axis_ranges(locations, axis_order(&["wght"])),
+                "wght"
+            ),
+            expect
+        );
+    }
+
+    /// A negative peak reaches to -1, and the tent still stops at 0 on the
+    /// other side.
+    ///
+    /// ```text
+    /// >>> VariationModel([{}, {'wdth': -0.5}], ['wdth']).supports
+    /// [{}, {'wdth': (-1, -0.5, 0)}]
+    /// ```
+    #[test]
+    fn full_axis_ranges_reach_both_ways() {
+        let full = VariationModel::new_full_axis_ranges(
+            HashSet::from([loc1(0.0), loc1(-0.5)]),
+            axis_order(&["wght"]),
+        );
+        assert_eq!(tents(&full, "wght"), vec![(-1.0, -0.5, 0.0)]);
+    }
+
+    /// ```text
+    /// >>> m = VariationModel([{}, {'wght': 0.4}, {'wght': 1.0}], ['wght'])
+    /// >>> m.getDeltas([100.0, 220.0, 400.0])
+    /// [100.0, 120.0, 300.0]
+    /// ```
+    #[test]
+    fn deltas_for_masters_matches_get_deltas() {
+        let model = VariationModel::new_full_axis_ranges(
+            HashSet::from([loc1(0.0), loc1(0.4), loc1(1.0)]),
+            axis_order(&["wght"]),
+        );
+        assert_eq!(
+            model.locations().cloned().collect::<Vec<_>>(),
+            vec![loc1(0.0), loc1(0.4), loc1(1.0)]
+        );
+        assert_eq!(
+            model.deltas_for_masters(&[100.0, 220.0, 400.0], RoundingBehaviour::None),
+            vec![100.0, 120.0, 300.0]
+        );
+    }
+
+    /// A delta that is genuinely fractional survives, one that lands within
+    /// the tolerance of an integer snaps. FontTools:
+    ///
+    /// ```text
+    /// >>> maybeRound(213.55999999999995, 0.01, round)
+    /// 213.55999999999995
+    /// >>> maybeRound(299.999, 0.01, round)
+    /// 300
+    /// ```
+    #[test]
+    fn round_ties_even_within_a_tolerance() {
+        let model = VariationModel::new_full_axis_ranges(
+            HashSet::from([loc1(0.0), loc1(1.0)]),
+            axis_order(&["wght"]),
+        );
+        let tolerance = RoundingBehaviour::RoundTiesEvenWithin(OrderedFloat(0.01));
+        assert_eq!(
+            model.deltas_for_masters(&[0.0, 213.55999999999995], tolerance),
+            vec![0.0, 213.55999999999995]
+        );
+        assert_eq!(
+            model.deltas_for_masters(&[0.0, 299.999], tolerance),
+            vec![0.0, 300.0]
+        );
+        // a tie is half a unit from either integer, so at CFF2's tolerance it
+        // never rounds at all; where it can reach one, it goes to even, like
+        // Python's round
+        assert_eq!(
+            model.deltas_for_masters(&[0.5, 3.0], tolerance),
+            vec![0.5, 2.5]
+        );
+        assert_eq!(
+            model.deltas_for_masters(
+                &[0.5, 3.0],
+                RoundingBehaviour::RoundTiesEvenWithin(OrderedFloat(0.5))
+            ),
+            vec![0.0, 3.0]
+        );
     }
 }
