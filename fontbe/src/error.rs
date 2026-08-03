@@ -61,8 +61,6 @@ pub enum Error {
     UnencodableNames(String),
     #[error("{what} out of bounds: {value}")]
     OutOfBounds { what: String, value: String },
-    #[error("CFF output is only supported for static fonts; this font has variable axes")]
-    CffNotStatic,
     #[error("'{0}' has components; CFF glyphs must be decomposed first")]
     CffGlyphHasComponents(GlyphName),
     #[error("Unable to build the CFF table: {0}")]

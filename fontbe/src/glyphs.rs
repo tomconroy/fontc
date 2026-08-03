@@ -610,7 +610,7 @@ fn cubics_to_quadratics(glyph: CheckedGlyph, units_per_em: u16) -> CheckedGlyph 
 ///     <li>Components are consistent across the design space</li>
 ///     <li>Paths are interpolation compatible</li>
 /// </ul>
-enum CheckedGlyph {
+pub(crate) enum CheckedGlyph {
     Composite {
         name: GlyphName,
         components: Vec<(GlyphName, NormalizedLocation, Affine)>,
@@ -622,7 +622,7 @@ enum CheckedGlyph {
 }
 
 impl CheckedGlyph {
-    fn new(glyph: &ir::Glyph) -> Result<Self, Error> {
+    pub(crate) fn new(glyph: &ir::Glyph) -> Result<Self, Error> {
         let name = &glyph.name;
         // every instance must have consistent component glyphs
         let components: HashSet<BTreeSet<GlyphName>> = glyph
