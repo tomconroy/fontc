@@ -5,7 +5,7 @@ use fontir::orchestration::WorkId as FeWorkId;
 use log::debug;
 use write_fonts::{
     FontBuilder,
-    ps::cff::v1::Cff,
+    ps::cff::{v1::Cff, v2::Cff2},
     read::TopLevelTable,
     tables::{
         avar::Avar, cmap::Cmap, colr::Colr, cpal::Cpal, fvar::Fvar, gasp::Gasp, gdef::Gdef,
@@ -228,6 +228,12 @@ impl Work<Context, AnyWorkId, Error> for FontWork {
                 continue;
             }
             debug!("Grabbing {tag} for final font");
+            // The one PostScript outline work writes CFF2 for a variable font
+            // and CFF for a static one; only the tag differs here
+            let tag = match work_id {
+                WorkId::Cff if context.cff.get().cff2 => &Cff2::TAG,
+                _ => tag,
+            };
             if let Some(bytes) = bytes_for(context, work_id.clone())? {
                 if is_variable_only(work_id) && is_static {
                     log::warn!("We generated {tag} for a static font, which seems weird but okay");

@@ -1,15 +1,18 @@
 //! Generates a [CFF](https://learn.microsoft.com/en-us/typography/opentype/spec/cff) table.
 //!
-//! Only static (single-master) fonts are supported; variable PostScript
-//! outlines require CFF2, which is future work. Components must have been
+//! This is the single-master table; a variable source gets a CFF2 from
+//! [`crate::cff2`] instead, built by the same work. Components must have been
 //! decomposed by fontir ([`Flags::CFF_OUTLINES`] implies
 //! [`Flags::DECOMPOSE_COMPONENTS`] when set via the CLI).
 
+use std::collections::HashMap;
+
 use fontdrasil::{
+    coords::NormalizedLocation,
     orchestration::{Access, Work},
     types::GlyphName,
 };
-use fontir::ir::{PostscriptSettings, StaticMetadata};
+use fontir::ir::{self, PostscriptSettings, StaticMetadata};
 use kurbo::{BezPath, PathEl, Point};
 use ordered_float::OrderedFloat;
 use unicode_normalization::UnicodeNormalization;
@@ -21,7 +24,8 @@ use write_fonts::{
 };
 
 use crate::{
-    error::Error,
+    error::{Error, GlyphProblem},
+    glyphs::CheckedGlyph,
     orchestration::{AnyWorkId, BeWork, CffOutput, Context, WorkId},
     post::final_glyph_names,
 };
@@ -110,8 +114,8 @@ fn postscript_string(value: Option<String>) -> Option<String> {
 /// bearings by. A glyph whose curve overshoots its on-curve points by a
 /// fraction of a unit therefore counts as a whole unit wider than the rounded
 /// box in [`CffOutput::glyph_bounds`] says.
-fn outer_bounds(charstring: &charstring::Charstring) -> Option<[i32; 4]> {
-    charstring.bounds.map(|r| {
+pub(crate) fn outer_bounds(bounds: Option<kurbo::Rect>) -> Option<[i32; 4]> {
+    bounds.map(|r| {
         [
             r.x0.floor() as i32,
             r.y0.floor() as i32,
@@ -148,7 +152,7 @@ pub(crate) fn bbox_from_cff(glyph_name: &GlyphName, bounds: [i32; 4]) -> Result<
 /// stems only when *both* stem-snap lists are non-empty, with StdHW/StdVW
 /// taken from the first element *before* sorting; and bypasses width
 /// optimization when the source states either width explicitly.
-fn private_dict_values(ps: &PostscriptSettings) -> PrivateDictValues {
+pub(crate) fn private_dict_values(ps: &PostscriptSettings) -> PrivateDictValues {
     fn rounded(values: &[OrderedFloat<f64>]) -> Vec<i32> {
         values.iter().map(|v| v.into_inner().ot_round()).collect()
     }
@@ -239,7 +243,7 @@ fn fallback_blue_scale(
     }
 }
 
-/// Drop the explicit closing line segment of each closed contour.
+/// Which explicit closing line segments a glyph's contours can lose.
 ///
 /// fontir spells out the closing segment; in UFO semantics (and hence in
 /// fontmake's charstrings, which are drawn through a point pen) the closing
@@ -250,25 +254,94 @@ fn fallback_blue_scale(
 /// coordinates, because that is what the charstring will contain; the points
 /// themselves are passed through unrounded, since the pen rounds them (and
 /// raises quadratics from the unrounded values).
-fn drop_explicit_closing_lines(path: &BezPath) -> BezPath {
+///
+/// The decision is taken **once for all masters**: a CFF2 charstring blends
+/// one command list across every master, so a line that survived in one
+/// master and vanished in another would leave nothing to blend. The masters
+/// are interpolation compatible by this point, so they agree on where the
+/// `LineTo`s are; all that can differ is whether one of them happens to round
+/// onto its contour start. Returns one flag per path element, true where a
+/// `LineTo` is to be dropped.
+///
+/// fontTools does not face this: `CFF2CharStringMergePen` draws each master
+/// as its source says and then refuses to merge, with
+/// `VarLibCFFPointTypeMergeError`.
+fn droppable_closing_lines<'a>(paths: impl Iterator<Item = &'a BezPath>) -> Vec<bool> {
     fn round(p: Point) -> (i32, i32) {
         (p.x.ot_round(), p.y.ot_round())
     }
-    let mut out: Vec<PathEl> = Vec::with_capacity(path.elements().len());
-    let mut contour_start = (0, 0);
-    for el in path.elements() {
-        match el {
-            PathEl::MoveTo(p) => contour_start = round(*p),
-            PathEl::ClosePath => {
-                if matches!(out.last(), Some(PathEl::LineTo(p)) if round(*p) == contour_start) {
-                    out.pop();
+    let mut droppable: Option<Vec<bool>> = None;
+    for path in paths {
+        let els = path.elements();
+        let mut mine = vec![false; els.len()];
+        let mut contour_start = (0, 0);
+        for (idx, el) in els.iter().enumerate() {
+            match el {
+                PathEl::MoveTo(p) => contour_start = round(*p),
+                PathEl::LineTo(p) => {
+                    let closes_the_contour = round(*p) == contour_start
+                        && matches!(els.get(idx + 1), Some(PathEl::ClosePath));
+                    if closes_the_contour {
+                        #[allow(clippy::indexing_slicing)] // mine is els-sized
+                        {
+                            mine[idx] = true;
+                        }
+                    }
                 }
+                _ => (),
             }
-            _ => (),
         }
-        out.push(*el);
+        droppable = Some(match droppable {
+            None => mine,
+            // every master has to agree, so this is an intersection
+            Some(agreed) => agreed.iter().zip(&mine).map(|(a, b)| *a && *b).collect(),
+        });
     }
-    out.into_iter().collect()
+    droppable.unwrap_or_default()
+}
+
+/// Apply [`droppable_closing_lines`] to one master's path.
+fn without_closing_lines(path: &BezPath, droppable: &[bool]) -> BezPath {
+    path.elements()
+        .iter()
+        .enumerate()
+        .filter(|(idx, _)| !droppable.get(*idx).copied().unwrap_or(false))
+        .map(|(_, el)| *el)
+        .collect()
+}
+
+/// The per-master outlines a PostScript charstring is drawn from.
+///
+/// The contours of each master are concatenated into one path, checked for
+/// interpolation compatibility exactly as the glyf/gvar path checks them (so
+/// an incompatible source fails the same way, not with a panic), and stripped
+/// of the closing lines every master agrees are redundant.
+///
+/// `keep_closing_lines` is for the `.notdef` fontir synthesizes: like ufo2ft's
+/// stub it draws the closing line of each box explicitly, and ufo2ft keeps
+/// those (its `explicitClosingLine` glyph lib key), so we do too.
+pub(crate) fn postscript_outlines(
+    glyph: &ir::Glyph,
+    keep_closing_lines: bool,
+) -> Result<HashMap<NormalizedLocation, BezPath>, Error> {
+    if glyph
+        .sources()
+        .values()
+        .any(|instance| !instance.components.is_empty())
+    {
+        return Err(Error::CffGlyphHasComponents(glyph.name.clone()));
+    }
+    let CheckedGlyph::Contour { paths, .. } = CheckedGlyph::new(glyph)? else {
+        return Err(Error::CffGlyphHasComponents(glyph.name.clone()));
+    };
+    if keep_closing_lines {
+        return Ok(paths);
+    }
+    let droppable = droppable_closing_lines(paths.values());
+    Ok(paths
+        .iter()
+        .map(|(loc, path)| (loc.clone(), without_closing_lines(path, &droppable)))
+        .collect())
 }
 
 impl Work<Context, AnyWorkId, Error> for CffWork {
@@ -283,11 +356,17 @@ impl Work<Context, AnyWorkId, Error> for CffWork {
         Access::Unknown
     }
 
-    /// Generate [CFF](https://learn.microsoft.com/en-us/typography/opentype/spec/cff)
+    /// Generate [CFF](https://learn.microsoft.com/en-us/typography/opentype/spec/cff),
+    /// or [CFF2](https://learn.microsoft.com/en-us/typography/opentype/spec/cff2)
+    /// when the font has axes.
+    ///
+    /// A font has one PostScript outline table, never both, so one work
+    /// produces whichever the source calls for; see [`crate::cff2`].
     fn exec(&self, context: &Context) -> Result<(), Error> {
         let static_metadata = context.ir.static_metadata.get();
         if !static_metadata.axes.is_empty() {
-            return Err(Error::CffNotStatic);
+            context.cff.set(crate::cff2::build_cff2(context)?);
+            return Ok(());
         }
         let glyph_order = context.ir.glyph_order.get();
         let metrics = context
@@ -360,21 +439,18 @@ impl Work<Context, AnyWorkId, Error> for CffWork {
         for (glyph_name, final_name) in glyph_order.names().zip(final_names) {
             let glyph = context.ir.get_glyph(glyph_name.clone());
             let instance = glyph.default_instance();
-            if !instance.components.is_empty() {
-                return Err(Error::CffGlyphHasComponents(glyph_name.clone()));
-            }
             let keep_closing_lines = synthesized_notdef && *glyph_name == notdef;
+            let outlines = postscript_outlines(&glyph, keep_closing_lines)?;
+            let path = outlines
+                .get(static_metadata.default_location())
+                .ok_or_else(|| {
+                    Error::GlyphError(glyph_name.clone(), GlyphProblem::MissingDefault)
+                })?;
 
             let mut pen = charstring::CharstringBuilder::new();
-            for contour in &instance.contours {
-                // CFF keeps the source (counter-clockwise) contour direction,
-                // so unlike glyf there is nothing to reverse here
-                if keep_closing_lines {
-                    pen.append_path(contour);
-                } else {
-                    pen.append_path(&drop_explicit_closing_lines(contour));
-                }
-            }
+            // CFF keeps the source (counter-clockwise) contour direction, so
+            // unlike glyf there is nothing to reverse here
+            pen.append_path(path);
             let charstring = pen.build(None, true)?;
             // ufo2ft measures the charstring it just built, rounds each side
             // (roundTolerance 0.5 never reaches the floor/ceil fallback), and
@@ -393,7 +469,7 @@ impl Work<Context, AnyWorkId, Error> for CffWork {
                     })
                     .filter(|bounds| *bounds != [0; 4]),
             );
-            glyph_outer_bounds.push(outer_bounds(&charstring));
+            glyph_outer_bounds.push(outer_bounds(charstring.bounds));
             builder.add_glyph(GlyphData {
                 name: final_name,
                 advance_width: instance.width,
@@ -405,6 +481,7 @@ impl Work<Context, AnyWorkId, Error> for CffWork {
         let cff = builder.build()?;
         context.cff.set(CffOutput {
             table: cff.as_bytes().to_vec(),
+            cff2: false,
             glyph_bounds,
             glyph_outer_bounds,
         });
@@ -415,6 +492,10 @@ impl Work<Context, AnyWorkId, Error> for CffWork {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn path(svg: &str) -> BezPath {
+        BezPath::from_svg(svg).unwrap()
+    }
 
     fn floats(values: &[f64]) -> Vec<OrderedFloat<f64>> {
         values.iter().copied().map(OrderedFloat).collect()
@@ -468,6 +549,52 @@ mod tests {
         // a decomposition may reintroduce exception characters; they stay,
         // because ufo2ft only filters the original character
         assert_eq!(normalize_string_for_postscript("\u{2474}"), "(1)");
+    }
+
+    /// A closed contour's final line back to its start is implied by the
+    /// contour close, so ufo2ft's point pen never emits it and neither do we.
+    #[test]
+    fn a_closing_line_is_redundant() {
+        let square = path("M0,0 L100,0 L100,100 L0,100 L0,0 Z");
+        let droppable = droppable_closing_lines([&square].into_iter());
+        assert_eq!(droppable, vec![false, false, false, false, true, false]);
+        assert_eq!(
+            without_closing_lines(&square, &droppable).to_svg(),
+            "M0,0 L100,0 L100,100 L0,100 Z"
+        );
+    }
+
+    /// But the decision is taken across every master at once. A CFF2
+    /// charstring blends one command list, so a line that vanished in one
+    /// master and survived in another would leave nothing to blend — here the
+    /// second master's last point does not land on its contour start, so both
+    /// masters keep the line.
+    #[test]
+    fn masters_agree_on_which_closing_lines_go() {
+        let closes = path("M0,0 L100,0 L100,100 L0,100 L0,0 Z");
+        let doesnt = path("M0,0 L120,0 L120,110 L0,110 L5,20 Z");
+        let droppable = droppable_closing_lines([&closes, &doesnt].into_iter());
+        assert!(!droppable.iter().any(|drop| *drop));
+        assert_eq!(
+            without_closing_lines(&closes, &droppable).to_svg(),
+            closes.to_svg()
+        );
+        // and the two masters still draw the same sequence of commands
+        assert_eq!(
+            without_closing_lines(&closes, &droppable).elements().len(),
+            without_closing_lines(&doesnt, &droppable).elements().len()
+        );
+    }
+
+    /// Each contour is decided on its own, and an open contour has no
+    /// closing line to lose.
+    #[test]
+    fn every_contour_is_decided_separately() {
+        let two = path("M0,0 L10,0 L0,0 Z M50,0 L60,0 L60,10");
+        assert_eq!(
+            droppable_closing_lines([&two].into_iter()),
+            vec![false, false, true, false, false, false, false]
+        );
     }
 
     #[test]

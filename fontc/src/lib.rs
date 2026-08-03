@@ -7421,4 +7421,280 @@ mod tests {
             "the descender zone"
         );
     }
+
+    // ---- --flavor otf on a variable source: CFF2 ----
+
+    fn cff2_bytes<'a>(font: &FontRef<'a>) -> &'a [u8] {
+        font.table_data(Tag::new(b"CFF2"))
+            .expect("a variable PostScript font should have CFF2")
+            .as_bytes()
+    }
+
+    /// A variable source in the PostScript flavor is an OTTO font with CFF2
+    /// and none of the TrueType outline tables — and it keeps `fvar`, so it
+    /// really is variable.
+    ///
+    /// Checked against `fontmake -o variable-cff2 --optimize-cff 1`, whose
+    /// table set is `head hhea maxp OS/2 hmtx cmap name post CFF2 … STAT fvar`.
+    #[test]
+    fn cff_flavor_of_a_variable_source_is_cff2() {
+        use write_fonts::read::ps::cff::CffFontRef;
+        use write_fonts::types::Version16Dot16;
+
+        let result = compile_cff("glyphs3/WghtVar.glyphs");
+        let font = result.font();
+
+        assert!(font.table_data(Tag::new(b"CFF ")).is_none());
+        assert!(font.table_data(Tag::new(b"glyf")).is_none());
+        assert!(font.table_data(Tag::new(b"loca")).is_none());
+        assert!(font.table_data(Tag::new(b"gvar")).is_none());
+        assert!(font.fvar().is_ok(), "should still be variable");
+        assert_eq!(font.maxp().unwrap().version(), Version16Dot16::VERSION_0_5);
+
+        // CFF2 has no charset, so unlike CFF the glyph names have to be in post
+        assert_eq!(font.post().unwrap().version(), Version16Dot16::VERSION_2_0);
+        assert!(
+            font.post()
+                .unwrap()
+                .glyph_name_index()
+                .map(|names| !names.is_empty())
+                .unwrap_or(false),
+            "post 2.0 should carry the glyph names"
+        );
+
+        let cff2 = CffFontRef::new_cff2(cff2_bytes(&font), Some(1000)).unwrap();
+        assert_eq!(
+            cff2.charstrings().count() as usize,
+            font.maxp().unwrap().num_glyphs() as usize
+        );
+        assert!(cff2.var_store().is_some(), "outlines should blend");
+    }
+
+    /// The same source in the default flavor is untouched by any of this.
+    #[test]
+    fn ttf_flavor_of_a_variable_source_is_unchanged() {
+        let result = TestCompile::compile_source("glyphs3/WghtVar.glyphs");
+        let font = result.font();
+        assert!(font.table_data(Tag::new(b"glyf")).is_some());
+        assert!(font.table_data(Tag::new(b"gvar")).is_some());
+        assert!(font.table_data(Tag::new(b"CFF2")).is_none());
+        assert!(font.table_data(Tag::new(b"CFF ")).is_none());
+    }
+
+    /// A static source in the PostScript flavor still gets a CFF, not a CFF2.
+    #[test]
+    fn cff_flavor_of_a_static_source_is_still_cff() {
+        let result = compile_cff("static.designspace");
+        let font = result.font();
+        assert!(font.table_data(Tag::new(b"CFF ")).is_some());
+        assert!(font.table_data(Tag::new(b"CFF2")).is_none());
+    }
+
+    /// CFF2 outlines interpolate: skrifa draws the same glyph differently at
+    /// each end of the axis.
+    #[test]
+    fn cff2_glyphs_blend() {
+        use skrifa::{
+            MetadataProvider,
+            instance::Size,
+            outline::{DrawSettings, OutlinePen},
+        };
+
+        #[derive(Default)]
+        struct BoxPen(Option<(f32, f32, f32, f32)>);
+        impl BoxPen {
+            fn add(&mut self, x: f32, y: f32) {
+                self.0 = Some(match self.0 {
+                    None => (x, y, x, y),
+                    Some((x0, y0, x1, y1)) => (x0.min(x), y0.min(y), x1.max(x), y1.max(y)),
+                });
+            }
+        }
+        impl OutlinePen for BoxPen {
+            fn move_to(&mut self, x: f32, y: f32) {
+                self.add(x, y);
+            }
+            fn line_to(&mut self, x: f32, y: f32) {
+                self.add(x, y);
+            }
+            fn quad_to(&mut self, _x0: f32, _y0: f32, x: f32, y: f32) {
+                self.add(x, y);
+            }
+            fn curve_to(&mut self, _x0: f32, _y0: f32, _x1: f32, _y1: f32, x: f32, y: f32) {
+                self.add(x, y);
+            }
+            fn close(&mut self) {}
+        }
+
+        let result = compile_cff("glyphs3/WghtVar.glyphs");
+        let font = result.font();
+        let gid = GlyphId::from(result.get_gid("bar"));
+        let draw_at = |wght: f32| {
+            let location = font.axes().location([("wght", wght)]);
+            let mut pen = BoxPen::default();
+            font.outline_glyphs()
+                .get(gid)
+                .unwrap()
+                .draw(
+                    DrawSettings::unhinted(Size::unscaled(), &location),
+                    &mut pen,
+                )
+                .unwrap();
+            pen.0.unwrap()
+        };
+        assert_ne!(
+            draw_at(400.0),
+            draw_at(700.0),
+            "'bar' should be a different width at each master"
+        );
+    }
+
+    /// Variation store index 0 belongs to the *first varying glyph in glyph
+    /// order*, not to the model over every master, and the region list is
+    /// accumulated in the order the sub-models are first seen.
+    ///
+    /// `wght_var.designspace` has three sources — Regular, Bold, and a `{600}`
+    /// layer source that only `bar` appears in. Glyph order is
+    /// `.notdef, plus, bar`; ufo2ft compiles a `.notdef` into every master,
+    /// including the sparse one, so `.notdef` blends across all three and
+    /// takes index 0. `plus`, which only Regular and Bold draw, needs a second
+    /// index. Asserted against `fontmake -o variable-cff2 --optimize-cff 1`,
+    /// whose `vsindex_dict` is
+    /// `{0: [{}, {wght: 0.667}, {wght: 1.0}], 1: [{}, {wght: 1.0}]}`.
+    #[test]
+    fn cff2_vsindexes_are_numbered_by_first_varying_glyph() {
+        use write_fonts::read::ps::cff::CffFontRef;
+
+        let result = compile_cff("wght_var.designspace");
+        let font = result.font();
+        assert_eq!(
+            result
+                .fe_context
+                .glyph_order
+                .get()
+                .names()
+                .map(|name| name.to_string())
+                .collect::<Vec<_>>(),
+            vec![".notdef", "plus", "bar"]
+        );
+
+        let cff2 = CffFontRef::new_cff2(cff2_bytes(&font), Some(1000)).unwrap();
+        let store = cff2.var_store().unwrap();
+        let regions: Vec<_> = store
+            .variation_region_list()
+            .unwrap()
+            .variation_regions()
+            .iter()
+            .map(|region| {
+                let axes = region.unwrap();
+                let axis = axes.region_axes()[0];
+                (
+                    axis.start_coord().to_f32(),
+                    axis.peak_coord().to_f32(),
+                    axis.end_coord().to_f32(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            regions,
+            vec![(0.0, 0.666687, 1.0), (0.666687, 1.0, 1.0), (0.0, 1.0, 1.0)],
+            "the three-master glyph's regions come first"
+        );
+        let subtables: Vec<Vec<u16>> = store
+            .item_variation_data()
+            .iter()
+            .map(|data| {
+                data.unwrap()
+                    .unwrap()
+                    .region_indexes()
+                    .iter()
+                    .map(|index| index.get())
+                    .collect::<Vec<u16>>()
+            })
+            .collect();
+        assert_eq!(subtables, vec![vec![0, 1], vec![2]]);
+
+        // and only the glyph that needs the *second* index says so
+        let vsindex_prefixed = |gid: u32| {
+            let program = cff2.charstrings().get(gid as usize).unwrap();
+            // `<n> vsindex` is a one-byte operand plus opcode 15
+            program.get(1) == Some(&15)
+        };
+        assert!(!vsindex_prefixed(0), ".notdef should use index 0");
+        assert!(vsindex_prefixed(1), "plus needs index 1");
+        assert!(!vsindex_prefixed(2), "bar should use index 0");
+    }
+
+    /// A glyph whose masters all agree gets no variation store index, and
+    /// neither does one that draws nothing.
+    #[test]
+    fn cff2_static_and_empty_glyphs_carry_no_vsindex() {
+        use write_fonts::read::ps::cff::CffFontRef;
+
+        let result = compile_cff("glyphs3/WghtVar.glyphs");
+        let font = result.font();
+        let cff2 = CffFontRef::new_cff2(cff2_bytes(&font), Some(1000)).unwrap();
+
+        let program = |name: &str| {
+            let gid = result.get_gid(name).to_u16() as usize;
+            cff2.charstrings().get(gid).unwrap().to_vec()
+        };
+        assert!(program("space").is_empty(), "an empty glyph draws nothing");
+        for name in ["space", "bar", "hyphen"] {
+            assert_ne!(program(name).get(1), Some(&15), "{name} needs no vsindex");
+        }
+    }
+
+    /// The Private DICT blends against variation store index 0's sub-model,
+    /// and only for keys the *default* master's DICT holds.
+    ///
+    /// In this source only Regular states alignment zones; Bold states none,
+    /// so ufo2ft's Bold Private DICT has no `BlueValues` at all and varLib
+    /// discards the key rather than blending it, leaving Regular's array
+    /// verbatim. `BlueScale` and `BlueFuzz` *do* blend, because cffLib fills
+    /// those in for Bold with the CFF defaults (0.039625 and 1). Checked
+    /// against fontmake's merged DICT:
+    /// `BlueValues [-16, 0, 737, 753]`, `OtherBlues [-58, -42]`,
+    /// `BlueScale [0.046875, -0.0072499999999999995]`, `BlueFuzz [0, 1]`.
+    #[test]
+    fn cff2_private_dict_blends_against_vsindex_zero() {
+        use write_fonts::read::ps::cff::CffFontRef;
+
+        let result = compile_cff("glyphs3/WghtVar.glyphs");
+        let font = result.font();
+        let cff2 = CffFontRef::new_cff2(cff2_bytes(&font), Some(1000)).unwrap();
+
+        let zones = |wght: f32| {
+            let coords = [F2Dot14::from_f32(wght)];
+            let (_, hints) = cff2.subfont_hinted(0, &coords).unwrap();
+            (
+                hints
+                    .blues
+                    .values()
+                    .iter()
+                    .map(|(a, b)| (a.to_f64(), b.to_f64()))
+                    .collect::<Vec<_>>(),
+                hints.other_blues.values().len(),
+            )
+        };
+        // the discarded key is Regular's, at both ends of the axis
+        assert_eq!(
+            zones(0.0),
+            (vec![(-16.0, 0.0), (737.0, 753.0)], 1),
+            "Regular's zones"
+        );
+        assert_eq!(zones(1.0), zones(0.0), "BlueValues does not blend");
+
+        // BlueFuzz does: 0 in Regular, cffLib's default 1 for Bold
+        let fuzz = |wght: f32| {
+            let coords = [F2Dot14::from_f32(wght)];
+            cff2.subfont_hinted(0, &coords)
+                .unwrap()
+                .1
+                .blue_fuzz
+                .to_f64()
+        };
+        assert_eq!(fuzz(0.0), 0.0);
+        assert_eq!(fuzz(1.0), 1.0);
+    }
 }
