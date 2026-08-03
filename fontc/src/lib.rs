@@ -6747,6 +6747,61 @@ mod tests {
         );
     }
 
+    /// The pinned instance's *own* custom parameters win over the masters'.
+    ///
+    /// glyphsLib's `apply_instance_data_to_ufo` replays them onto the
+    /// interpolated UFO after interpolation, so each one overwrites whatever
+    /// came out of the model. The fixture's Regular instance states one of
+    /// each kind: `panose` (OS/2), `meta Table`, `typoAscender` (a global
+    /// metric), `Don't use Production Names`, `Name Table Entry`,
+    /// `preferredFamilyName` and `styleMapStyleName`, plus a `familyNames`
+    /// property.
+    #[test]
+    fn instance_applies_its_own_custom_parameters() {
+        let result = compile_instance("glyphs3/InstanceCustomParameters.glyphs", "wght=400");
+        let font = result.font();
+
+        let os2 = font.os2().unwrap();
+        assert_eq!(
+            os2.panose_10(),
+            [2u8, 11, 5, 2, 4, 5, 4, 2, 2, 4].as_slice(),
+            "the instance's own PANOSE, not the merge across masters"
+        );
+        assert_eq!(os2.s_typo_ascender(), 1234);
+        assert!(
+            table_tags(&font).contains(&Tag::new(b"meta")),
+            "the instance's `meta Table` parameter builds a meta table"
+        );
+
+        // English/Windows only: the fixture also carries a Spanish family name
+        let names = font.name().unwrap();
+        let get = |id: u16| {
+            names
+                .name_record()
+                .iter()
+                .find(|record| record.name_id().to_u16() == id && record.language_id() == 0x409)
+                .map(|record| {
+                    record
+                        .string(names.string_data())
+                        .unwrap()
+                        .chars()
+                        .collect::<String>()
+                })
+        };
+        // `Name Table Entry`, which nothing else would produce
+        assert_eq!(get(25), Some("WghtVarRoman".to_string()));
+        // 16 <- preferredFamilyName, 17 <- the style name, 2 <- the non-RIBBI
+        // styleMapStyleName verbatim, 1 <- glyphsLib's style-linked family name
+        // built from the instance's own `familyNames`
+        assert_eq!(get(16), Some("WghtVar Preferred".to_string()));
+        assert_eq!(get(17), Some("Regular".to_string()));
+        assert_eq!(get(2), Some("Black".to_string()));
+        assert_eq!(get(1), Some("WghtVar Narrow".to_string()));
+        // a non-RIBBI style map style earns no RIBBI bit at all
+        assert_eq!(os2.fs_selection().bits() & 0b100_0011, 0);
+        assert_eq!(font.head().unwrap().mac_style().bits(), 0);
+    }
+
     /// A .glyphs v3 source, where the axis is real and declared.
     #[test]
     fn instance_of_glyphs3() {

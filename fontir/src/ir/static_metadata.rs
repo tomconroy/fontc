@@ -22,6 +22,7 @@ use fontdrasil::{
     variations::{VariationModel, VariationModelError},
 };
 
+use super::GlobalMetric;
 use super::feature_writers::FeatureWriterSpec;
 use crate::orchestration::Persistable;
 
@@ -127,9 +128,117 @@ pub struct NamedInstance {
     pub style_map_family_name: Option<String>,
     /// Name ID 2 for this instance, if the source states one.
     ///
-    /// Drives `fsSelection` and `head.macStyle` as well as the name.
+    /// Kept as the source's own string rather than as a [`StyleMapStyle`]:
+    /// ufo2ft's instantiator writes a `stylemapstylename` that *isn't* one of
+    /// the four through to the instance UFO anyway — it only logs "may cause
+    /// problems in some applications" — and the compiler then title-cases it
+    /// straight into name id 2 while setting **no** RIBBI bit in `fsSelection`
+    /// or `head.macStyle`. Doto's `@default` is exactly that: style map style
+    /// `Black`, name id 2 `Black`, `fsSelection` `0x0080`.
+    ///
+    /// Read it with [`Self::style_map_style`] for the flags and
+    /// [`Self::style_map_style_display`] for the name.
+    ///
+    /// <https://github.com/googlefonts/ufo2ft/blob/main/Lib/ufo2ft/instantiator.py#L775-L792>
+    /// <https://github.com/googlefonts/ufo2ft/blob/main/Lib/ufo2ft/outlineCompiler.py#L404>
     #[serde(default)]
-    pub style_map_style_name: Option<StyleMapStyle>,
+    pub style_map_style_name: Option<String>,
+    /// What the instance's *own* Glyphs custom parameters say to override.
+    ///
+    /// Empty for a source that has none, and for anything but `--instance`:
+    /// nothing outside the pin reads it.
+    #[serde(default)]
+    pub overrides: InstanceOverrides,
+}
+
+impl NamedInstance {
+    /// The style linking this instance's name id 2 implies, if it implies any.
+    ///
+    /// `None` for a `styleMapStyleName` that isn't one of the four: ufo2ft
+    /// sets no RIBBI bit for it at all.
+    pub fn style_map_style(&self) -> Option<StyleMapStyle> {
+        StyleMapStyle::parse(self.style_map_style_name.as_deref()?)
+    }
+
+    /// `styleMapStyleName` as name id 2 spells it.
+    ///
+    /// ufo2ft lowercases the UFO attribute on the way in and `.title()`s it on
+    /// the way out, so `BLACK`, `black` and `Black` all end up `Black`.
+    pub fn style_map_style_display(&self) -> Option<String> {
+        self.style_map_style_name.as_deref().map(title_case)
+    }
+}
+
+/// Python's `str.title()`: capitalise every run of letters, lowercase the rest.
+fn title_case(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    let mut in_word = false;
+    for c in raw.chars() {
+        if c.is_alphabetic() {
+            if in_word {
+                out.extend(c.to_lowercase());
+            } else {
+                out.extend(c.to_uppercase());
+            }
+            in_word = true;
+        } else {
+            out.push(c);
+            in_word = false;
+        }
+    }
+    out
+}
+
+/// What an instance's own Glyphs custom parameters and properties override.
+///
+/// glyphsLib's `apply_instance_data_to_ufo` runs `to_ufo_custom_params` over
+/// the *instance's* parameters on the already-interpolated UFO, so every one of
+/// them wins over whatever the masters produced — and it runs for
+/// `.designspace` sources as much as for `.glyphs` ones, because fontmake
+/// stashes the parameters in the designspace `<instance><lib>` and replays them
+/// from there. Only [`crate::instance`] reads this.
+///
+/// Parameters whose effect is on *global metrics* live in
+/// [`Self::metrics`]; those are applied where the metrics are pinned, in
+/// [`GlobalMetricsBuilder::build_pinned`](crate::ir::GlobalMetricsBuilder::build_pinned).
+///
+/// <https://github.com/googlefonts/glyphsLib/blob/main/Lib/glyphsLib/builder/instances.py#L454-L470>
+/// <https://github.com/googlefonts/glyphsLib/blob/main/Lib/glyphsLib/builder/custom_params.py#L314-L448>
+#[derive(Serialize, Deserialize, Debug, Default, Clone, PartialEq, Eq)]
+pub struct InstanceOverrides {
+    /// `panose` / `openTypeOS2Panose`, which *replaces* the merged-across-masters
+    /// PANOSE an interpolated instance would otherwise get.
+    pub panose: Option<Panose>,
+    /// `fsType` / `openTypeOS2Type`.
+    pub fs_type: Option<u16>,
+    /// `isFixedPitch` / `postscriptIsFixedPitch`.
+    pub is_fixed_pitch: Option<bool>,
+    /// `unicodeRanges` / `openTypeOS2UnicodeRanges`.
+    pub unicode_range_bits: Option<HashSet<u32>>,
+    /// `codePageRanges`.
+    pub codepage_range_bits: Option<HashSet<u32>>,
+    /// `meta Table`, which becomes `public.openTypeMeta`.
+    pub meta_table: Option<MetaTableValues>,
+    /// `Use Typo Metrics`, i.e. `fsSelection` bit 7.
+    pub use_typo_metrics: Option<bool>,
+    /// `Has WWS Names`, i.e. `fsSelection` bit 8.
+    pub has_wws_names: Option<bool>,
+    /// `Don't use Production Names`, already negated into ufo2ft's
+    /// `useProductionNames`.
+    pub use_production_names: Option<bool>,
+    /// Metrics the instance states outright, overriding the interpolation.
+    pub metrics: BTreeMap<GlobalMetric, OrderedFloat<f64>>,
+    /// Names the instance states as *fontinfo*, so they also drive the
+    /// fallbacks: `preferredFamilyName` (16), `preferredSubfamilyName` (17),
+    /// `compatibleFullName` (18), `WWSFamilyName` (21), `WWSSubfamilyName`
+    /// (22). Windows/English, like everything `NameBuilder` computes.
+    pub names: BTreeMap<NameId, String>,
+    /// `Name Table Entry`, i.e. `openTypeNameRecords`.
+    ///
+    /// Any id on any platform, and applied *after* the table is built — these
+    /// override the computed records and never feed them, which is the order
+    /// `outlineCompiler.setupTable_name` uses.
+    pub name_records: BTreeMap<NameKey, String>,
 }
 
 /// The four style-linking styles, i.e. UFO `styleMapStyleName`.
@@ -297,6 +406,18 @@ pub struct MiscMetadata {
 
     /// See <https://learn.microsoft.com/en-us/typography/opentype/spec/os2#achvendid>
     pub vendor_id: Tag,
+
+    /// `openTypeOS2VendorID` exactly as the source stated it, if it stated one.
+    ///
+    /// [`Self::vendor_id`] is `achVendID`, which is four bytes and which `Tag`
+    /// pads a short id out to. Name id 3's fallback interpolates the *raw*
+    /// attribute instead — ufo2ft only `ljust`s for OS/2 — so a source whose
+    /// vendor id is a single space (Geom) gets `1.102; ;Geom-Regular`, which
+    /// the padded tag cannot spell. The frontends already hand this string to
+    /// [`NameBuilder::build`](crate::ir::NameBuilder::build); a pin that
+    /// rebuilds the name table needs it too.
+    #[serde(default)]
+    pub raw_vendor_id: Option<String>,
 
     /// UFO appears to allow negative major versions.
     ///
@@ -710,6 +831,7 @@ impl StaticMetadata {
                 is_fixed_pitch: None,
                 selection_flags: Default::default(),
                 vendor_id: Self::DEFAULT_VENDOR_ID_TAG,
+                raw_vendor_id: None,
                 // https://github.com/googlefonts/ufo2ft/blob/0d2688cd847d003b41104534d16973f72ef26c40/Lib/ufo2ft/fontInfoData.py#L353-L354
                 version_major: 0,
                 version_minor: 0,
@@ -897,6 +1019,7 @@ mod tests {
                 is_fixed_pitch: None,
                 selection_flags: SelectionFlags::default(),
                 vendor_id: Tag::from_be_bytes(*b"DUCK"),
+                raw_vendor_id: None,
                 version_major: 42,
                 version_minor: 24,
                 head_flags: head::Flags::empty(),

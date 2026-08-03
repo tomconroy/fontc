@@ -20,16 +20,16 @@ use fontir::{
         self, AnchorBuilder, ColorGlyphs, ColorPalettes, Condition, ConditionSet,
         DEFAULT_VENDOR_ID, FEATURE_WRITERS_LIB_KEY, FeatureWriterOptionValue, FeatureWriterSpec,
         GlobalMetric, GlobalMetrics, GlobalMetricsBuilder, GlyphAnchors, GlyphInstance, GlyphOrder,
-        KernGroup, KernSide, KerningInstance, KerningLocations, MetaTableValues, NameBuilder,
-        NameKey, NamedInstance, Paint, PaintGlyph, Panose, PostscriptNames, PostscriptSettings,
-        PreliminaryGdefCategories, Rule, StaticMetadata, StyleMapStyle, Substitution,
-        VariableFeature, reject_duplicate_writers, validate_feature_writer,
+        InstanceOverrides, KernGroup, KernSide, KerningInstance, KerningLocations, MetaTableValues,
+        NameBuilder, NameKey, NamedInstance, Paint, PaintGlyph, Panose, PostscriptNames,
+        PostscriptSettings, PreliminaryGdefCategories, Rule, StaticMetadata, StyleMapStyle,
+        Substitution, VariableFeature, reject_duplicate_writers, validate_feature_writer,
     },
     orchestration::{Context, Flags, IrWork, WorkId},
     source::Source,
 };
 use glyphs_reader::{
-    Font, FontMaster, InstanceType, Layer, Plist,
+    Font, FontMaster, Instance, InstanceType, Layer, Plist,
     glyphdata::{Category, Subcategory},
 };
 use indexmap::IndexMap;
@@ -330,6 +330,149 @@ fn names(font: &Font, flags: SelectionFlags) -> HashMap<NameKey, String> {
     names
 }
 
+/// A `panose` custom parameter's ten digits, zero-padded and truncated.
+fn to_ir_panose(raw: &[i64]) -> Panose {
+    let mut bytes = [0u8; 10];
+    bytes
+        .iter_mut()
+        .zip(raw)
+        .for_each(|(dst, src)| *dst = *src as u8);
+    bytes.into()
+}
+
+/// What this instance's *own* custom parameters override at the pin.
+///
+/// glyphsLib stashes an instance's parameters in the designspace instance lib
+/// and `apply_instance_data_to_ufo` replays them onto the already-interpolated
+/// UFO (`instances.py:454-470`), so each one beats whatever the masters
+/// produced. Only `--instance` reads the result.
+///
+/// The list is glyphsLib's `to_ufo_custom_params` handlers, minus the ones that
+/// need machinery fontc does not have (`Filter`/`PreFilter`,
+/// `Rename`/`Reencode Glyphs`, `Replace Feature`/`Prefix`,
+/// `Keep`/`Remove Glyphs`, `TTFAutohint options`, `GASP Table`,
+/// `Color Palettes`) and the ones glyphsLib has no handler for at all, which
+/// fontmake therefore ignores too: notably **`xHeight`, `capHeight` and
+/// `italicAngle`**, none of which appears in `KNOWN_PARAM_HANDLERS` — they end
+/// up as inert `com.schriftgestaltung.customParameter.…` lib keys. `weightClass`
+/// and `widthClass` are blacklisted out of the instance lib entirely
+/// (`constants.py:77-88`); the axis mapping decides those.
+///
+/// <https://github.com/googlefonts/glyphsLib/blob/main/Lib/glyphsLib/builder/custom_params.py#L314-L448>
+fn instance_overrides(inst: &Instance) -> InstanceOverrides {
+    let params = &inst.custom_parameters;
+    let mut metrics = BTreeMap::new();
+    macro_rules! set_metric {
+        ($variant:ident, $field:ident) => {
+            if let Some(value) = params.$field {
+                metrics.insert(GlobalMetric::$variant, OrderedFloat(value as f64));
+            }
+        };
+    }
+    set_metric!(Os2TypoAscender, typo_ascender);
+    set_metric!(Os2TypoDescender, typo_descender);
+    set_metric!(Os2TypoLineGap, typo_line_gap);
+    set_metric!(Os2WinAscent, win_ascent);
+    set_metric!(HheaAscender, hhea_ascender);
+    set_metric!(HheaDescender, hhea_descender);
+    set_metric!(HheaLineGap, hhea_line_gap);
+    set_metric!(VheaAscender, vhea_ascender);
+    set_metric!(VheaDescender, vhea_descender);
+    set_metric!(VheaLineGap, vhea_line_gap);
+    set_metric!(StrikeoutPosition, strikeout_position);
+    set_metric!(StrikeoutSize, strikeout_size);
+    set_metric!(SubscriptXOffset, subscript_x_offset);
+    set_metric!(SubscriptXSize, subscript_x_size);
+    set_metric!(SubscriptYOffset, subscript_y_offset);
+    set_metric!(SubscriptYSize, subscript_y_size);
+    set_metric!(SuperscriptXOffset, superscript_x_offset);
+    set_metric!(SuperscriptXSize, superscript_x_size);
+    set_metric!(SuperscriptYOffset, superscript_y_offset);
+    set_metric!(SuperscriptYSize, superscript_y_size);
+    set_metric!(CaretSlopeRun, hhea_caret_slope_run);
+    set_metric!(CaretSlopeRise, hhea_caret_slope_rise);
+    set_metric!(CaretOffset, hhea_caret_offset);
+    set_metric!(VheaCaretSlopeRun, vhea_caret_slope_run);
+    set_metric!(VheaCaretSlopeRise, vhea_caret_slope_rise);
+    set_metric!(VheaCaretOffset, vhea_caret_offset);
+    // these two are floats in the source, not integers
+    for (metric, value) in [
+        (GlobalMetric::UnderlineThickness, params.underline_thickness),
+        (GlobalMetric::UnderlinePosition, params.underline_position),
+    ] {
+        if let Some(value) = value {
+            metrics.insert(metric, value);
+        }
+    }
+    // "enforce that winAscent/Descent are positive, according to UFO spec"
+    // <https://github.com/googlefonts/glyphsLib/blob/main/Lib/glyphsLib/builder/custom_params.py#L533-L544>
+    if let Some(win_descent) = params.win_descent {
+        metrics.insert(
+            GlobalMetric::Os2WinDescent,
+            OrderedFloat(win_descent.abs() as f64),
+        );
+    }
+
+    let mut names = BTreeMap::new();
+    for (name_id, value) in [
+        (
+            NameId::TYPOGRAPHIC_FAMILY_NAME,
+            inst.preferred_family_name(),
+        ),
+        (
+            NameId::TYPOGRAPHIC_SUBFAMILY_NAME,
+            inst.preferred_subfamily_name(),
+        ),
+        (NameId::COMPATIBLE_FULL_NAME, inst.compatible_full_name()),
+        (NameId::WWS_FAMILY_NAME, inst.wws_family_name()),
+        (NameId::WWS_SUBFAMILY_NAME, inst.wws_subfamily_name()),
+    ] {
+        if let Some(value) = value {
+            names.insert(name_id, value.to_string());
+        }
+    }
+
+    let name_records = params
+        .name_table_entries
+        .iter()
+        .map(|entry| {
+            (
+                NameKey {
+                    name_id: NameId::new(entry.name_id),
+                    platform_id: entry.platform_id,
+                    encoding_id: entry.encoding_id,
+                    lang_id: entry.lang_id,
+                },
+                entry.value.clone(),
+            )
+        })
+        .collect();
+
+    InstanceOverrides {
+        panose: params.panose.as_ref().map(|raw| to_ir_panose(raw)),
+        fs_type: params.fs_type,
+        is_fixed_pitch: params.is_fixed_pitch,
+        unicode_range_bits: params
+            .unicode_range_bits
+            .as_ref()
+            .map(|bits| bits.iter().copied().collect()),
+        codepage_range_bits: params
+            .codepage_range_bits
+            .as_ref()
+            .map(|bits| bits.iter().copied().collect()),
+        meta_table: params.meta_table.as_ref().map(|meta| MetaTableValues {
+            dlng: meta.dlng.clone(),
+            slng: meta.slng.clone(),
+        }),
+        use_typo_metrics: params.use_typo_metrics,
+        has_wws_names: params.has_wws_names,
+        use_production_names: params.dont_use_production_names.map(|dont| !dont),
+        metrics,
+        names,
+        name_records,
+    }
+}
+
 /// Read the `com.github.googlei18n.ufo2ft.featureWriters` config from font userData.
 ///
 /// glyphsLib round-trips the key at the font level, so this mirrors ufo2fontir's
@@ -462,10 +605,21 @@ impl Work<Context, WorkId, Error> for StaticMetadataWork {
                         .unwrap(),
                     family_name: Some(family_name.to_string()),
                     style_map_family_name: Some(inst.style_map_family_name(family_name)),
-                    style_map_style_name: Some(StyleMapStyle::from_flags(
-                        inst.is_bold,
-                        inst.is_italic,
-                    )),
+                    // an explicit `styleMapStyleName` parameter beats the
+                    // style-linking flags: glyphsLib replays it over the
+                    // descriptor's value after interpolation
+                    style_map_style_name: Some(
+                        inst.custom_parameters
+                            .style_map_style_name
+                            .as_deref()
+                            .map(str::to_string)
+                            .unwrap_or_else(|| {
+                                StyleMapStyle::from_flags(inst.is_bold, inst.is_italic)
+                                    .to_name()
+                                    .to_string()
+                            }),
+                    ),
+                    overrides: instance_overrides(inst),
                 })
             })
             .collect();
@@ -587,6 +741,10 @@ impl Work<Context, WorkId, Error> for StaticMetadataWork {
         static_metadata.misc.selection_flags = selection_flags;
         static_metadata.misc.feature_generation = feature_writers_from_user_data(&font.user_data)?;
         static_metadata.variations = variations;
+        // what `names` above already handed NameBuilder, kept so that a pin can
+        // rebuild name id 3 with the same string; see `MiscMetadata::raw_vendor_id`
+        static_metadata.misc.raw_vendor_id =
+            Some(font.vendor_id().unwrap_or(DEFAULT_VENDOR_ID).to_string());
         // treat  empty string or all spaces as equivalent to no value; it means
         // 'null', per the spec
         if let Some(vendor_id) = font.vendor_id().filter(|id| !id.trim().is_empty()) {

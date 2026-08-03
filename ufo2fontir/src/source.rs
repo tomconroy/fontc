@@ -22,15 +22,16 @@ use fontir::{
     ir::{
         AnchorBuilder, Color, ColorGlyphs, ColorPalettes, Condition, ConditionSet,
         DEFAULT_VENDOR_ID, FEATURE_WRITERS_LIB_KEY, FeatureWriterOptionValue, FeatureWriterSpec,
-        FeaturesSource, GlobalMetric, GlobalMetricsBuilder, GlyphOrder, KernGroup, KernSide,
-        KerningInstance, KerningLocations, MetaTableValues, NameBuilder, NameKey, NamedInstance,
-        Paint, PaintGlyph, PaintSolid, Panose, PostscriptNames, PostscriptSettings,
-        PreliminaryGdefCategories, Rule, StaticMetadata, StyleMapStyle as IrStyleMapStyle,
-        Substitution, VariableFeature, reject_duplicate_writers, validate_feature_writer,
+        FeaturesSource, GlobalMetric, GlobalMetricsBuilder, GlyphOrder, InstanceOverrides,
+        KernGroup, KernSide, KerningInstance, KerningLocations, MetaTableValues, NameBuilder,
+        NameKey, NamedInstance, Paint, PaintGlyph, PaintSolid, Panose, PostscriptNames,
+        PostscriptSettings, PreliminaryGdefCategories, Rule, StaticMetadata, Substitution,
+        VariableFeature, reject_duplicate_writers, validate_feature_writer,
     },
     orchestration::{Context, Flags, IrWork, WorkId},
     source::Source,
 };
+use glyphs_reader::NameTableEntry;
 use log::{Level, debug, log_enabled, trace, warn};
 use norad::{
     DataRequest,
@@ -1123,11 +1124,14 @@ impl Work<Context, WorkId, Error> for StaticMetadataWork {
                         .familyname
                         .clone()
                         .or_else(|| font_info_at_default.family_name.clone()),
-                    style_map_family_name: inst.stylemapfamilyname.clone(),
-                    style_map_style_name: inst
-                        .stylemapstylename
-                        .as_deref()
-                        .and_then(IrStyleMapStyle::parse),
+                    // glyphsLib replays a `styleMapFamilyName`/`styleMapStyleName`
+                    // instance parameter *after* the instantiator has written the
+                    // descriptor's, so the parameter wins
+                    style_map_family_name: string_param(&inst.lib, "styleMapFamilyName")
+                        .or_else(|| inst.stylemapfamilyname.clone()),
+                    style_map_style_name: string_param(&inst.lib, "styleMapStyleName")
+                        .or_else(|| inst.stylemapstylename.clone()),
+                    overrides: instance_overrides(&inst.lib),
                 }
             })
             .collect();
@@ -1241,6 +1245,14 @@ impl Work<Context, WorkId, Error> for StaticMetadataWork {
         )
         .map_err(Error::VariationModelError)?;
         static_metadata.misc.selection_flags = selection_flags;
+        // what `names` above already handed NameBuilder, kept so that a pin can
+        // rebuild name id 3 with the same string; see `MiscMetadata::raw_vendor_id`
+        static_metadata.misc.raw_vendor_id = Some(
+            font_info_at_default
+                .open_type_os2_vendor_id
+                .clone()
+                .unwrap_or_else(|| DEFAULT_VENDOR_ID.to_string()),
+        );
         if let Some(vendor_id) = font_info_at_default
             .open_type_os2_vendor_id
             .as_ref()
@@ -1410,6 +1422,177 @@ fn source_has_kerning(
     let font = norad::Font::load_requested_data(&ufo_dir, norad::DataRequest::none().kerning(true))
         .map_err(|e| BadSource::custom(ufo_dir, e))?;
     Ok(!font.kerning.is_empty())
+}
+
+/// The Glyphs custom parameters glyphsLib stashed in a designspace `<instance><lib>`.
+///
+/// `to_designspace` writes an instance's parameters out as `[name, value]`
+/// pairs under `com.schriftgestaltung.customParameters`, and
+/// `apply_instance_data_to_ufo` replays them onto the interpolated UFO — for a
+/// `.designspace` source exactly as for a `.glyphs` one, because fontmake runs
+/// glyphsLib over the instances it interpolates whatever the source was. So a
+/// designspace generated from Glyphs carries per-instance PANOSE and metrics
+/// that fontc has to honour at the pin (DancingScript, Domine,
+/// NotoSansCherokee, NotoSansMedefaidrin and NotoSerifYezidi all do).
+///
+/// Same list as glyphs2fontir's, minus `codePageRanges` (which would need
+/// Glyphs' codepage-to-bit table) and `meta Table` (whose parameter form is
+/// Glyphs', not `public.openTypeMeta`'s); no corpus designspace states either.
+///
+/// <https://github.com/googlefonts/glyphsLib/blob/main/Lib/glyphsLib/builder/instances.py#L166-L174>
+fn instance_overrides(lib: &Dictionary) -> InstanceOverrides {
+    let mut overrides = InstanceOverrides::default();
+    let Some(params) = lib
+        .get("com.schriftgestaltung.customParameters")
+        .and_then(Value::as_array)
+    else {
+        return overrides;
+    };
+
+    const METRICS: &[(&str, GlobalMetric)] = &[
+        ("typoAscender", GlobalMetric::Os2TypoAscender),
+        ("typoDescender", GlobalMetric::Os2TypoDescender),
+        ("typoLineGap", GlobalMetric::Os2TypoLineGap),
+        ("winAscent", GlobalMetric::Os2WinAscent),
+        ("hheaAscender", GlobalMetric::HheaAscender),
+        ("hheaDescender", GlobalMetric::HheaDescender),
+        ("hheaLineGap", GlobalMetric::HheaLineGap),
+        ("vheaVertAscender", GlobalMetric::VheaAscender),
+        ("vheaVertDescender", GlobalMetric::VheaDescender),
+        ("vheaVertLineGap", GlobalMetric::VheaLineGap),
+        ("strikeoutPosition", GlobalMetric::StrikeoutPosition),
+        ("strikeoutSize", GlobalMetric::StrikeoutSize),
+        ("subscriptXOffset", GlobalMetric::SubscriptXOffset),
+        ("subscriptXSize", GlobalMetric::SubscriptXSize),
+        ("subscriptYOffset", GlobalMetric::SubscriptYOffset),
+        ("subscriptYSize", GlobalMetric::SubscriptYSize),
+        ("superscriptXOffset", GlobalMetric::SuperscriptXOffset),
+        ("superscriptXSize", GlobalMetric::SuperscriptXSize),
+        ("superscriptYOffset", GlobalMetric::SuperscriptYOffset),
+        ("superscriptYSize", GlobalMetric::SuperscriptYSize),
+        ("underlinePosition", GlobalMetric::UnderlinePosition),
+        ("underlineThickness", GlobalMetric::UnderlineThickness),
+    ];
+    const NAMES: &[(&str, NameId)] = &[
+        ("preferredFamilyName", NameId::TYPOGRAPHIC_FAMILY_NAME),
+        ("preferredSubfamilyName", NameId::TYPOGRAPHIC_SUBFAMILY_NAME),
+        ("compatibleFullName", NameId::COMPATIBLE_FULL_NAME),
+        ("WWSFamilyName", NameId::WWS_FAMILY_NAME),
+        ("WWSSubfamilyName", NameId::WWS_SUBFAMILY_NAME),
+    ];
+
+    for param in params {
+        let Some([name, value]) = param.as_array().and_then(|pair| pair.first_chunk::<2>()) else {
+            continue;
+        };
+        let Some(name) = name.as_string() else {
+            continue;
+        };
+        if let Some((_, metric)) = METRICS.iter().find(|(known, _)| *known == name) {
+            if let Some(number) = as_number(value) {
+                overrides.metrics.insert(*metric, OrderedFloat(number));
+            }
+            continue;
+        }
+        if let Some((_, name_id)) = NAMES.iter().find(|(known, _)| *known == name) {
+            if let Some(string) = value.as_string() {
+                overrides.names.insert(*name_id, string.to_string());
+            }
+            continue;
+        }
+        match name {
+            // glyphsLib takes the absolute value of both win metrics
+            "winDescent" => {
+                if let Some(number) = as_number(value) {
+                    overrides
+                        .metrics
+                        .insert(GlobalMetric::Os2WinDescent, OrderedFloat(number.abs()));
+                }
+            }
+            "panose" | "openTypeOS2Panose" => {
+                let mut digits = [0u8; 10];
+                for (dst, src) in digits
+                    .iter_mut()
+                    .zip(value.as_array().into_iter().flatten())
+                {
+                    *dst = src.as_signed_integer().unwrap_or_default() as u8;
+                }
+                overrides.panose = Some(Panose::from_digits(digits));
+            }
+            "fsType" | "openTypeOS2Type" => {
+                overrides.fs_type = Some(
+                    value
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .filter_map(Value::as_signed_integer)
+                        .fold(0u16, |acc, bit| acc | (1 << bit)),
+                );
+            }
+            "unicodeRanges" | "openTypeOS2UnicodeRanges" => {
+                overrides.unicode_range_bits = Some(
+                    value
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .filter_map(Value::as_signed_integer)
+                        .map(|bit| bit as u32)
+                        .collect(),
+                );
+            }
+            "isFixedPitch" | "postscriptIsFixedPitch" => {
+                overrides.is_fixed_pitch = as_glyphs_bool(value);
+            }
+            "Use Typo Metrics" => overrides.use_typo_metrics = as_glyphs_bool(value),
+            "Has WWS Names" => overrides.has_wws_names = as_glyphs_bool(value),
+            "Don't use Production Names" => {
+                overrides.use_production_names = as_glyphs_bool(value).map(|dont| !dont);
+            }
+            "Name Table Entry" => match value.as_string().map(NameTableEntry::from_str) {
+                Some(Ok(entry)) => {
+                    overrides.name_records.insert(
+                        NameKey {
+                            name_id: NameId::new(entry.name_id),
+                            platform_id: entry.platform_id,
+                            encoding_id: entry.encoding_id,
+                            lang_id: entry.lang_id,
+                        },
+                        entry.value,
+                    );
+                }
+                Some(Err(e)) => warn!("bad instance 'Name Table Entry': {e}"),
+                None => (),
+            },
+            _ => (),
+        }
+    }
+    overrides
+}
+
+/// One string-valued Glyphs custom parameter out of a designspace instance lib.
+fn string_param(lib: &Dictionary, name: &str) -> Option<String> {
+    lib.get("com.schriftgestaltung.customParameters")
+        .and_then(Value::as_array)?
+        .iter()
+        .filter_map(|param| param.as_array()?.first_chunk::<2>())
+        .find(|[key, _]| key.as_string() == Some(name))
+        .and_then(|[_, value]| value.as_string())
+        .map(str::to_string)
+}
+
+fn as_number(value: &Value) -> Option<f64> {
+    value
+        .as_real()
+        .or_else(|| value.as_signed_integer().map(|v| v as f64))
+        // Glyphs 2 wrote numbers as strings often enough to be worth trying
+        .or_else(|| value.as_string().and_then(|s| s.parse().ok()))
+}
+
+/// Glyphs writes its checkbox parameters as 0/1 integers, not booleans.
+fn as_glyphs_bool(value: &Value) -> Option<bool> {
+    value
+        .as_boolean()
+        .or_else(|| value.as_signed_integer().map(|v| v != 0))
 }
 
 fn parse_meta_table_values(plist: &plist::Value) -> Option<MetaTableValues> {

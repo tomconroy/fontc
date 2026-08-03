@@ -295,10 +295,16 @@ pub fn build_global_metrics(
         return builder.build(&static_metadata.axes);
     };
     let pin = resolve(static_metadata, spec)?;
+    // the instance's own metric parameters, which glyphsLib replays over the
+    // interpolated fontinfo; empty when the pin isn't a named instance
+    let overrides = named_instance_at(static_metadata, spec, &pin)
+        .map(|instance| instance.overrides.metrics.clone())
+        .unwrap_or_default();
     builder.build_pinned(
         &static_metadata.axes,
         &pin,
         static_metadata.default_location(),
+        &overrides,
     )
 }
 
@@ -365,12 +371,43 @@ pub fn interpolate_glyph_instance(
 ///
 /// The result has exactly one source, at [`StaticMetadata::default_location`],
 /// which is what a genuinely static source produces.
+///
+/// # A pin on a master is a copy, not an interpolation
+///
+/// ufo2ft's `Variator.instance_at` short-circuits when the normalized location
+/// equals a master's: that master is `deepcopy`-returned and the variation
+/// model never runs. So a glyph whose masters are *point-incompatible* — a
+/// different number of points, or a different number of components — still
+/// instances fine at any of its own masters, which is Glyphs.app semantics.
+/// Interpolating anyway fails with "every point sequence must have the same
+/// length" on fonts that `fontmake -i` builds without complaint and that
+/// fontc's own *variable* build is happy with, because there the glyph is
+/// converted to quadratics first and `fontbe` only warns about what is left.
+/// 26 of the 27 corpus targets that hit the delta error at `@default` build
+/// once the pin stops interpolating a master into itself.
+///
+/// Only when the glyph *has* a source there: a sparse glyph that the pin
+/// happens to sit on top of has nothing to copy and still interpolates from
+/// the masters it does have. [`pin_kerning`] does the same thing for the same
+/// reason.
+///
+/// <https://github.com/googlefonts/ufo2ft/blob/main/Lib/ufo2ft/instantiator.py#L1233-L1235>
 pub fn pin_glyph(
     static_metadata: &StaticMetadata,
     glyph: &Glyph,
     pin: &NormalizedLocation,
 ) -> Result<Glyph, BadGlyph> {
-    let instance = interpolate_glyph_instance(static_metadata, glyph, pin)?;
+    let axis_order: Vec<_> = static_metadata.axes.iter().map(|a| a.tag).collect();
+    let at = fit(pin, &axis_order);
+    let master = glyph
+        .sources()
+        .iter()
+        .find(|(loc, _)| fit(loc, &axis_order) == at)
+        .map(|(_, instance)| instance.clone());
+    let instance = match master {
+        Some(instance) => instance,
+        None => interpolate_glyph_instance(static_metadata, glyph, pin)?,
+    };
     Glyph::new(
         glyph.name.clone(),
         glyph.emit_to_binary,
@@ -1004,8 +1041,83 @@ pub fn pin_static_metadata(
     }
     pin_os2_classes(&mut pinned, &static_metadata.axes, user_pin);
     pin_instance_fontinfo(&mut pinned, static_metadata);
+    if let Some(instance) = instance {
+        pin_instance_overrides(&mut pinned, instance);
+    }
 
     Ok(pinned)
+}
+
+/// Replay the instance's own custom parameters over the pinned metadata.
+///
+/// glyphsLib's `apply_instance_data_to_ufo` runs *after* the instantiator, on
+/// the finished instance UFO, so an instance parameter beats everything the
+/// masters said — including the values [`pin_instance_fontinfo`] just chose.
+/// Last, therefore.
+///
+/// The parameters here are the ones with a `ParamHandler` that lands in
+/// `ufo.info` (or, for `meta Table`, in a lib key ufo2ft compiles) *and* an
+/// equivalent in fontc's static metadata. Name records are
+/// [`pin_names`]'s and metrics are
+/// [`GlobalMetricsBuilder::build_pinned`](crate::ir::GlobalMetricsBuilder::build_pinned)'s;
+/// both run before this and read the same [`InstanceOverrides`].
+///
+/// Deliberately not here, because glyphsLib has no handler for them at all and
+/// so fontmake ignores them too: `xHeight`, `capHeight`, `italicAngle`,
+/// `weightClass`/`widthClass` (blacklisted out of the instance lib; the axis
+/// mapping decides, see [`pin_os2_classes`]), `Disable Masters`, instance-level
+/// `glyphOrder`. Deliberately not here because they need machinery fontc does
+/// not have: `Filter`/`PreFilter`, `Rename`/`Reencode Glyphs`,
+/// `Replace Feature`/`Prefix`, `Keep`/`Remove Glyphs`, `TTFAutohint options`.
+///
+/// <https://github.com/googlefonts/glyphsLib/blob/main/Lib/glyphsLib/builder/custom_params.py#L314-L448>
+fn pin_instance_overrides(pinned: &mut StaticMetadata, instance: &NamedInstance) {
+    let overrides = &instance.overrides;
+    if let Some(panose) = overrides.panose.as_ref() {
+        pinned.misc.panose = Some(panose.clone());
+    }
+    if let Some(fs_type) = overrides.fs_type {
+        pinned.misc.fs_type = Some(fs_type);
+    }
+    if let Some(is_fixed_pitch) = overrides.is_fixed_pitch {
+        pinned.misc.is_fixed_pitch = Some(is_fixed_pitch);
+    }
+    if let Some(bits) = overrides.unicode_range_bits.as_ref() {
+        pinned.misc.unicode_range_bits = Some(bits.clone());
+    }
+    if let Some(bits) = overrides.codepage_range_bits.as_ref() {
+        pinned.misc.codepage_range_bits = Some(bits.clone());
+    }
+    if let Some(meta_table) = overrides.meta_table.as_ref() {
+        pinned.misc.meta_table = Some(meta_table.clone());
+    }
+    // glyphsLib unions these two into `openTypeOS2Selection`, so an instance
+    // that says nothing leaves whatever the font said standing
+    for (stated, flag) in [
+        (overrides.use_typo_metrics, SelectionFlags::USE_TYPO_METRICS),
+        (overrides.has_wws_names, SelectionFlags::WWS),
+    ] {
+        match stated {
+            Some(true) => pinned.misc.selection_flags |= flag,
+            Some(false) => pinned.misc.selection_flags -= flag,
+            None => (),
+        }
+    }
+    match overrides.use_production_names {
+        // `Don't use Production Names`: ufo2ft renames on the compiled binary
+        // from `public.postscriptNames`, and this turns that off
+        Some(false) => pinned.postscript_names = None,
+        // the other direction cannot be honoured here: if the *font* said don't
+        // use them the frontend never built the map, and there is nothing at
+        // the pin to build it from
+        Some(true) if pinned.postscript_names.is_none() => {
+            log::warn!(
+                "instance '{}' asks for production names but the font turned them off; ignoring",
+                instance.name
+            );
+        }
+        _ => (),
+    }
 }
 
 /// The named instance `pin` builds, if the source has one there.
@@ -1024,6 +1136,12 @@ pub fn pin_static_metadata(
 /// weight, say) and a location pin then picks the first in source order. There
 /// is nothing better to pick — a location does not say which name was meant —
 /// so a caller that cares should pass the name.
+///
+/// Each candidate's *own* location is normalized, never re-resolved through
+/// its name: style names repeat across a second axis all the time — Martian
+/// Mono ships four instances called `Regular`, one per width — and looking a
+/// name back up finds the first of them, so every one but the first would fail
+/// to match itself and the pin would silently fall back to the family's names.
 pub fn named_instance_at<'a>(
     static_metadata: &'a StaticMetadata,
     spec: &InstanceSpec,
@@ -1038,7 +1156,19 @@ pub fn named_instance_at<'a>(
     };
     by_name.or_else(|| {
         static_metadata.named_instances.iter().find(|instance| {
-            resolve(static_metadata, &InstanceSpec::Named(instance.name.clone()))
+            // an axis the instance doesn't mention sits at its default, the
+            // same completion `resolve_user` does
+            let at: UserLocation = static_metadata
+                .axes
+                .iter()
+                .map(|axis| {
+                    (
+                        axis.tag,
+                        instance.location.get(axis.tag).unwrap_or(axis.default),
+                    )
+                })
+                .collect();
+            at.to_normalized(&static_metadata.axes)
                 .is_ok_and(|at| at == *pin)
         })
     })
@@ -1116,22 +1246,50 @@ fn pin_names(
     if let Some(style_map_family_name) = instance.style_map_family_name.as_ref() {
         builder.add(NameId::FAMILY_NAME, style_map_family_name.clone());
     }
-    if let Some(style) = instance.style_map_style_name {
-        builder.add(NameId::SUBFAMILY_NAME, style.to_name().to_string());
+    // Verbatim, RIBBI or not: ufo2ft `.title()`s whatever the instance says
+    // into id 2 and only *warns* when it isn't one of the four.
+    if let Some(style) = instance.style_map_style_display() {
+        builder.add(NameId::SUBFAMILY_NAME, style);
     }
     if let Some(postscript_name) = instance.postscript_name.as_ref() {
         builder.add(NameId::POSTSCRIPT_NAME, postscript_name.clone());
     }
+    // The instance's own name parameters, which glyphsLib writes onto the
+    // interpolated UFO's fontinfo — so they beat the derived ids, including the
+    // 16/17 just added and the three `DROPPED` ones, which come back if the
+    // instance states them, and they feed the id 4 and 6 fallbacks.
+    for (name_id, value) in instance.overrides.names.iter() {
+        builder.add(*name_id, value.clone());
+    }
 
-    // `Tag` pads a short vendor id out to four bytes, but name id 3's fallback
-    // reads the raw `openTypeOS2VendorID`; only `achVendID` is `ljust`ed
-    let vendor_id = static_metadata.misc.vendor_id.to_string();
-    let mut names = builder.build(vendor_id.trim_end());
+    // Name id 3's fallback is `f"{version};{vendorID};{psName}"` with the
+    // *raw* `openTypeOS2VendorID`, trailing spaces and all — only `achVendID`
+    // is `ljust`ed. So `IFF ` gives `2.000;IFF ;Teko-Light` and Geom's single
+    // space gives `1.102; ;Geom-Regular`, neither of which survives a trim or a
+    // round trip through `Tag`. Both are what fontc's own *variable* build of
+    // the same source emits, since that hands `NameBuilder` the same string.
+    //
+    // <https://github.com/googlefonts/ufo2ft/blob/main/Lib/ufo2ft/fontInfoData.py#L178-L185>
+    let vendor_id = static_metadata
+        .misc
+        .raw_vendor_id
+        .clone()
+        .unwrap_or_else(|| static_metadata.misc.vendor_id.to_string());
+    let mut names = builder.build(&vendor_id);
     names.extend(
         static_metadata
             .names
             .iter()
             .filter(|(key, _)| key.lang_id != ENGLISH)
+            .map(|(key, value)| (*key, value.clone())),
+    );
+    // `openTypeNameRecords`, set last and overriding, exactly as the font-level
+    // `Name Table Entry` is applied in the frontends
+    names.extend(
+        instance
+            .overrides
+            .name_records
+            .iter()
             .map(|(key, value)| (*key, value.clone())),
     );
     names
@@ -1151,6 +1309,13 @@ fn pin_names(
 /// With no `styleMapStyleName` the fallback is ufo2ft's: the style name if it
 /// is one of the four, else regular.
 ///
+/// A `styleMapStyleName` the source states that *isn't* one of the four — Doto
+/// ships `Black` — earns **no** RIBBI bit at all: ufo2ft's `if/elif` chain
+/// simply falls off the end, so `fsSelection` keeps only what
+/// `openTypeOS2Selection` said and `macStyle` is 0. Note this is not the same
+/// as the no-`styleMapStyleName` case, which does fall back to regular; the
+/// fallback only runs when the attribute is absent.
+///
 /// <https://github.com/googlefonts/ufo2ft/blob/main/Lib/ufo2ft/outlineCompiler.py#L714-L725>
 /// <https://github.com/googlefonts/ufo2ft/blob/main/Lib/ufo2ft/outlineCompiler.py#L365-L374>
 fn pin_selection_flags(
@@ -1158,11 +1323,14 @@ fn pin_selection_flags(
     instance: &NamedInstance,
 ) -> SelectionFlags {
     let ribbi = SelectionFlags::REGULAR | SelectionFlags::BOLD | SelectionFlags::ITALIC;
-    let style = instance
-        .style_map_style_name
-        .or_else(|| StyleMapStyle::parse(&instance.name))
-        .unwrap_or(StyleMapStyle::Regular);
-    (static_metadata.misc.selection_flags - ribbi) | style.selection_flags()
+    let style = match instance.style_map_style_name.as_deref() {
+        Some(stated) => StyleMapStyle::parse(stated),
+        None => StyleMapStyle::parse(&instance.name).or(Some(StyleMapStyle::Regular)),
+    };
+    let style = style
+        .map(StyleMapStyle::selection_flags)
+        .unwrap_or_default();
+    (static_metadata.misc.selection_flags - ribbi) | style
 }
 
 /// `usWeightClass` and `usWidthClass` from where the pin is in *user* space.
@@ -1442,6 +1610,54 @@ mod tests {
         let pinned = pin_glyph(&meta, &glyph, &bold()).unwrap();
 
         assert_eq!(*pinned.default_instance(), bold_instance);
+    }
+
+    /// ufo2ft's `Variator` short circuit: a pin on a master copies it, so
+    /// masters that could never interpolate together still build there.
+    ///
+    /// This is the shape of `EpundaSans`' `S.001`, `RobotoSlab`'s `utildeacute`
+    /// and the other 14 sources that fail `--instance @default` in fontc but
+    /// build fine under `fontmake -i`.
+    ///
+    /// The midpoint case below is deliberately *not* claimed to match
+    /// fontmake. For mismatched **point** counts fontMath raises too —
+    /// `_processMathOneContours` indexes `points2[index]` — but for mismatched
+    /// **components** it does not: `_pairComponents` matches by base glyph name
+    /// and silently drops whatever is left over, so `fontmake -i "Roboto Slab
+    /// Medium"` succeeds (measured) where fontc reports the delta error. That
+    /// gap is component *pairing*, a separate thing from this short circuit.
+    ///
+    /// <https://github.com/robotools/fontMath/blob/master/Lib/fontMath/mathGlyph.py#L494-L507>
+    /// <https://github.com/robotools/fontMath/blob/master/Lib/fontMath/mathGlyph.py#L653-L682>
+    #[test]
+    fn pin_glyph_at_an_incompatible_master_is_that_master() {
+        let meta = test_static_metadata();
+        // three points vs four: no variation model can relate them
+        let mut triangle = BezPath::new();
+        triangle.move_to((0.0, 0.0));
+        triangle.line_to((100.0, 0.0));
+        triangle.line_to((50.0, 700.0));
+        triangle.close_path();
+        let regular_instance = instance(500.0, vec![triangle], Vec::new());
+        let bold_instance = instance(600.0, vec![rect(0.0, 0.0, 300.0, 701.0)], Vec::new());
+        let glyph = two_master_glyph("S.001", regular_instance.clone(), bold_instance.clone());
+
+        assert_eq!(
+            *pin_glyph(&meta, &glyph, &regular())
+                .unwrap()
+                .default_instance(),
+            regular_instance
+        );
+        assert_eq!(
+            *pin_glyph(&meta, &glyph, &bold())
+                .unwrap()
+                .default_instance(),
+            bold_instance
+        );
+
+        // between them there is nothing to copy and no way to interpolate
+        let e = pin_glyph(&meta, &glyph, &mid()).unwrap_err().to_string();
+        assert!(e.contains("same length"), "{e}");
     }
 
     #[test]
@@ -1860,7 +2076,7 @@ mod tests {
         }
 
         let pinned = builder
-            .build_pinned(&axes, &mid(), meta.default_location())
+            .build_pinned(&axes, &mid(), meta.default_location(), &Default::default())
             .unwrap();
 
         let at = pinned.at(meta.default_location());
@@ -1914,7 +2130,7 @@ mod tests {
         }
 
         let pinned = builder
-            .build_pinned(&axes, &mid(), meta.default_location())
+            .build_pinned(&axes, &mid(), meta.default_location(), &Default::default())
             .unwrap();
         let at = pinned.at(meta.default_location());
 
@@ -1945,7 +2161,7 @@ mod tests {
         }
 
         let pinned = builder
-            .build_pinned(&axes, &bold(), meta.default_location())
+            .build_pinned(&axes, &bold(), meta.default_location(), &Default::default())
             .unwrap();
 
         let at = pinned.at(meta.default_location());
@@ -1975,7 +2191,7 @@ mod tests {
         }
 
         let pinned = builder
-            .build_pinned(&axes, &mid(), meta.default_location())
+            .build_pinned(&axes, &mid(), meta.default_location(), &Default::default())
             .unwrap();
 
         let at = pinned.at(meta.default_location());
@@ -1998,7 +2214,7 @@ mod tests {
         }
 
         let pinned = builder
-            .build_pinned(&axes, &bold(), meta.default_location())
+            .build_pinned(&axes, &bold(), meta.default_location(), &Default::default())
             .unwrap();
 
         // 770 + the computed typo line gap (1200 - 770 - 200 = 230), not 0
@@ -2155,7 +2371,7 @@ mod tests {
         ]);
         let instance = NamedInstance {
             style_map_family_name: Some("Fam".to_string()),
-            style_map_style_name: Some(StyleMapStyle::BoldItalic),
+            style_map_style_name: Some(StyleMapStyle::BoldItalic.to_name().to_string()),
             ..named("Bold Italic")
         };
 
@@ -2285,6 +2501,256 @@ mod tests {
         meta.misc.fs_type = Some(0);
         let pinned = pin_static_metadata(&meta, &mid(), &user_mid(), None).unwrap();
         assert_eq!(pinned.misc.fs_type, Some(0));
+    }
+
+    /// Name id 3 keeps the vendor id exactly as the source spelled it.
+    ///
+    /// Only `achVendID` is padded to four bytes; `openTypeOS2VendorID` reaches
+    /// the unique id verbatim. Teko states `IFF ` and fontmake writes
+    /// `2.000;IFF ;Teko-Light`; Geom states a single space and gets
+    /// `1.102; ;Geom-Regular`. Both are what fontc's variable build already
+    /// emits, which is what makes a trimmed or `Tag`-padded id a regression.
+    #[test]
+    fn pin_names_keeps_the_vendor_id_verbatim() {
+        for raw in ["IFF ", " ", "NONE"] {
+            let mut meta = test_static_metadata();
+            meta.names =
+                HashMap::from([(NameKey::new(NameId::FAMILY_NAME, "Fam"), "Fam".to_string())]);
+            meta.misc.raw_vendor_id = Some(raw.to_string());
+
+            let names = pin_names(&meta, &named("Bold"));
+
+            assert_eq!(
+                names
+                    .iter()
+                    .find(|(key, _)| key.name_id == NameId::UNIQUE_ID)
+                    .map(|(_, value)| value.as_str()),
+                Some(format!("0.000;{raw};Fam-Bold").as_str()),
+                "vendor id {raw:?}"
+            );
+        }
+    }
+
+    /// A `styleMapStyleName` that isn't RIBBI goes to name id 2 untouched.
+    ///
+    /// Doto's `@default` is `Doto Black`, whose designspace instance states
+    /// `stylemapstylename="Black"`. ufo2ft logs "not one of the standard
+    /// values" and writes it through anyway; the `fsSelection` if/elif then
+    /// falls off the end, so the RIBBI bits stay clear (fontmake emits
+    /// `0x0080`, i.e. USE_TYPO_METRICS alone) and `macStyle` is 0.
+    #[test]
+    fn pin_names_passes_a_non_ribbi_style_map_style_through() {
+        let mut meta = test_static_metadata();
+        meta.names = HashMap::from([(NameKey::new(NameId::FAMILY_NAME, "Doto"), "Doto".into())]);
+        meta.misc.selection_flags = SelectionFlags::REGULAR | SelectionFlags::USE_TYPO_METRICS;
+        let instance = NamedInstance {
+            style_map_family_name: Some("Doto Black".to_string()),
+            style_map_style_name: Some("Black".to_string()),
+            family_name: Some("Doto".to_string()),
+            ..named("Black")
+        };
+
+        let names = pin_names(&meta, &instance);
+        let get = |id: NameId| {
+            names
+                .iter()
+                .find(|(key, _)| key.name_id == id)
+                .map(|(_, v)| v.clone())
+        };
+        assert_eq!(get(NameId::FAMILY_NAME), Some("Doto Black".to_string()));
+        assert_eq!(get(NameId::SUBFAMILY_NAME), Some("Black".to_string()));
+
+        assert_eq!(
+            pin_selection_flags(&meta, &instance),
+            SelectionFlags::USE_TYPO_METRICS,
+            "a non-RIBBI style map style earns no RIBBI bit"
+        );
+        // ufo2ft lowercases on the way in and title-cases on the way out
+        assert_eq!(
+            NamedInstance {
+                style_map_style_name: Some("BLACK".to_string()),
+                ..instance
+            }
+            .style_map_style_display(),
+            Some("Black".to_string())
+        );
+    }
+
+    /// Two instances may share a style name; each has to match its own location.
+    ///
+    /// Martian Mono ships four instances called `Regular`, one per width. Going
+    /// back through the *name* to find where an instance sits finds the first
+    /// of them every time, so the `@default` pin matched none of them and fell
+    /// back to the family's names — family `Martian Mono` instead of
+    /// `Martian Mono SemiExpanded`, and a PostScript name to match.
+    #[test]
+    fn named_instance_at_tells_repeated_style_names_apart() {
+        let mut meta = test_static_metadata();
+        meta.named_instances = vec![
+            NamedInstance {
+                family_name: Some("Fam Condensed".to_string()),
+                location: vec![(WGHT, UserCoord::new(400.0))].into(),
+                ..named("Regular")
+            },
+            NamedInstance {
+                family_name: Some("Fam SemiExpanded".to_string()),
+                location: vec![(WGHT, UserCoord::new(700.0))].into(),
+                ..named("Regular")
+            },
+        ];
+
+        let at = named_instance_at(&meta, &InstanceSpec::Location(user_bold()), &bold());
+        assert_eq!(
+            at.and_then(|instance| instance.family_name.as_deref()),
+            Some("Fam SemiExpanded")
+        );
+    }
+
+    fn user_bold() -> UserLocation {
+        vec![(WGHT, UserCoord::new(700.0))].into()
+    }
+
+    /// The instance's own PANOSE replaces the merged-across-masters one.
+    ///
+    /// This is the single biggest instancing gap in the corpus: 44 targets
+    /// differ in OS/2 alone because fontc used `instance_panose` — the
+    /// element-wise merge that zeroes any digit the masters disagree about —
+    /// where glyphsLib replays the instance's `panose` parameter over it.
+    #[test]
+    fn pin_instance_overrides_replace_the_merged_panose() {
+        let mut meta = test_static_metadata();
+        meta.misc.instance_panose = Some(crate::ir::Panose::from_digits([
+            2, 11, 0, 0, 0, 0, 0, 0, 0, 0,
+        ]));
+        let stated = crate::ir::Panose::from_digits([2, 11, 5, 2, 4, 5, 4, 2, 2, 4]);
+        let instance = NamedInstance {
+            overrides: crate::ir::InstanceOverrides {
+                panose: Some(stated.clone()),
+                ..Default::default()
+            },
+            ..named("Regular")
+        };
+        meta.named_instances = vec![instance.clone()];
+
+        let pinned = pin_static_metadata(&meta, &mid(), &user_mid(), Some(&instance)).unwrap();
+
+        assert_eq!(pinned.misc.panose, Some(stated));
+        // without an instance the merge still stands
+        let pinned = pin_static_metadata(&meta, &mid(), &user_mid(), None).unwrap();
+        assert_eq!(pinned.misc.panose, meta.misc.instance_panose);
+    }
+
+    /// The rest of the OS/2-ish parameters, and `Don't use Production Names`.
+    #[test]
+    fn pin_instance_overrides_the_rest_of_os2() {
+        let mut meta = test_static_metadata();
+        meta.misc.fs_type = Some(0);
+        meta.misc.selection_flags = SelectionFlags::REGULAR;
+        meta.postscript_names = Some(HashMap::from([("a".into(), "uni0061".into())]));
+        let instance = NamedInstance {
+            overrides: crate::ir::InstanceOverrides {
+                fs_type: Some(1 << 2),
+                is_fixed_pitch: Some(true),
+                unicode_range_bits: Some(HashSet::from([0, 1])),
+                meta_table: Some(crate::ir::MetaTableValues {
+                    dlng: vec!["Latn".into()],
+                    slng: vec!["Latn".into()],
+                }),
+                use_typo_metrics: Some(true),
+                // `Don't use Production Names = 1` negates to this
+                use_production_names: Some(false),
+                ..Default::default()
+            },
+            ..named("Regular")
+        };
+
+        let pinned = pin_static_metadata(&meta, &mid(), &user_mid(), Some(&instance)).unwrap();
+
+        assert_eq!(pinned.misc.fs_type, Some(1 << 2));
+        assert_eq!(pinned.misc.is_fixed_pitch, Some(true));
+        assert_eq!(pinned.misc.unicode_range_bits, Some(HashSet::from([0, 1])));
+        assert_eq!(
+            pinned
+                .misc
+                .meta_table
+                .as_ref()
+                .map(|meta| meta.dlng.clone()),
+            Some(vec!["Latn".into()])
+        );
+        assert!(
+            pinned
+                .misc
+                .selection_flags
+                .contains(SelectionFlags::USE_TYPO_METRICS)
+        );
+        assert_eq!(pinned.postscript_names, None, "development names, then");
+    }
+
+    /// `Name Table Entry` overrides; `preferredFamilyName` feeds the fallbacks.
+    #[test]
+    fn pin_names_applies_the_instance_name_parameters() {
+        let mut meta = test_static_metadata();
+        meta.names = HashMap::from([(NameKey::new(NameId::FAMILY_NAME, "Fam"), "Fam".to_string())]);
+        let instance = NamedInstance {
+            overrides: crate::ir::InstanceOverrides {
+                names: BTreeMap::from([
+                    (NameId::TYPOGRAPHIC_FAMILY_NAME, "Preferred".to_string()),
+                    (NameId::WWS_FAMILY_NAME, "Wws".to_string()),
+                ]),
+                // Epilogue's `25; EpilogueRoman`
+                name_records: BTreeMap::from([(
+                    NameKey::new(NameId::new(25), "FamRoman"),
+                    "FamRoman".to_string(),
+                )]),
+                ..Default::default()
+            },
+            ..named("Bold")
+        };
+
+        let names = pin_names(&meta, &instance);
+        let get = |id: NameId| {
+            names
+                .iter()
+                .find(|(key, _)| key.name_id == id)
+                .map(|(_, v)| v.clone())
+        };
+        // `preferredFamilyName` beats the instance's own family name and feeds
+        // the id 1/4/6 fallbacks, exactly as `openTypeNamePreferredFamilyName`
+        // does for an ordinary static UFO
+        assert_eq!(get(NameId::FAMILY_NAME), Some("Preferred".to_string()));
+        assert_eq!(get(NameId::FULL_NAME), Some("Preferred Bold".to_string()));
+        assert_eq!(
+            get(NameId::POSTSCRIPT_NAME),
+            Some("Preferred-Bold".to_string())
+        );
+        // and then 16/17 match 1/2, so ufo2ft drops them
+        assert_eq!(get(NameId::TYPOGRAPHIC_FAMILY_NAME), None);
+        // 21/22 are dropped unless the instance states them
+        assert_eq!(get(NameId::WWS_FAMILY_NAME), Some("Wws".to_string()));
+        assert_eq!(get(NameId::new(25)), Some("FamRoman".to_string()));
+    }
+
+    /// A metric the instance states replaces the interpolated one outright.
+    #[test]
+    fn build_pinned_prefers_an_instance_override() {
+        let meta = test_static_metadata();
+        let axes = Axes::new(vec![wght()]);
+        let mut builder = GlobalMetricsBuilder::new();
+        builder.set(GlobalMetric::HheaAscender, regular(), 900.0);
+        builder.set(GlobalMetric::HheaAscender, bold(), 1000.0);
+        for loc in [regular(), bold()] {
+            builder.populate_defaults(&loc, 1000, None, Some(800.0), None, None);
+        }
+        let overrides = BTreeMap::from([(GlobalMetric::HheaAscender, OrderedFloat(1234.0))]);
+
+        let pinned = builder
+            .build_pinned(&axes, &mid(), meta.default_location(), &overrides)
+            .unwrap();
+
+        assert_eq!(
+            pinned.at(meta.default_location()).hhea_ascender,
+            OrderedFloat(1234.0)
+        );
     }
 
     /// The two masters of the `BlueMatch` fixture, whose list lengths agree.

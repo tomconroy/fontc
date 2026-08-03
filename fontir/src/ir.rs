@@ -43,9 +43,9 @@ pub use feature_writers::{
 };
 pub use path_builder::GlyphPathBuilder;
 pub use static_metadata::{
-    Condition, ConditionSet, GdefCategories, MetaTableValues, MiscMetadata, NameKey, NamedInstance,
-    Panose, PostscriptNames, PostscriptSettings, PreliminaryGdefCategories, Rule, StaticMetadata,
-    StyleMapStyle, Substitution, VariableFeature,
+    Condition, ConditionSet, GdefCategories, InstanceOverrides, MetaTableValues, MiscMetadata,
+    NameKey, NamedInstance, Panose, PostscriptNames, PostscriptSettings, PreliminaryGdefCategories,
+    Rule, StaticMetadata, StyleMapStyle, Substitution, VariableFeature,
 };
 
 pub const DEFAULT_VENDOR_ID: &str = "NONE";
@@ -340,7 +340,7 @@ impl PartialEq for GlobalMetrics {
     }
 }
 
-#[derive(Serialize, Deserialize, Debug, Copy, Clone, PartialEq, Eq, Hash)]
+#[derive(Serialize, Deserialize, Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum GlobalMetric {
     Ascender,
     Descender,
@@ -783,6 +783,11 @@ impl GlobalMetricsBuilder {
     ///   fallback is linear in the values it reads. The same stands in when the
     ///   pin reaches none of the masters that *did* state a metric.
     ///
+    /// `overrides` are the metrics the *instance* states outright, from
+    /// [`InstanceOverrides::metrics`]. glyphsLib's `apply_instance_data_to_ufo`
+    /// writes those onto the interpolated UFO afterwards, so they replace the
+    /// interpolated value rather than joining the model.
+    ///
     /// The result is a static space: one location, `key`, with no axes, which
     /// is what a genuinely static source produces.
     ///
@@ -792,6 +797,7 @@ impl GlobalMetricsBuilder {
         axes: &Axes,
         pin: &NormalizedLocation,
         key: &NormalizedLocation,
+        overrides: &BTreeMap<GlobalMetric, OrderedFloat<f64>>,
     ) -> Result<GlobalMetrics, Error> {
         // One model over every master, not one per metric: fontMath's partial
         // sums are un-normalised precisely because every attribute is weighed
@@ -833,11 +839,15 @@ impl GlobalMetricsBuilder {
                 // glyphsLib's default if it has one for it, else the densified
                 // values, standing in for the fallback ufo2ft would compute on
                 // the instance.
-                let value = match interpolate(&point_seqs(true))? {
-                    Some(value) => value,
-                    None => match glyphs_app_instance_default(*metric) {
+                let value = match overrides.get(metric) {
+                    // the instance says so, and it says so last
+                    Some(stated) => stated.into_inner(),
+                    None => match interpolate(&point_seqs(true))? {
                         Some(value) => value,
-                        None => interpolate(&point_seqs(false))?.unwrap_or_default(),
+                        None => match glyphs_app_instance_default(*metric) {
+                            Some(value) => value,
+                            None => interpolate(&point_seqs(false))?.unwrap_or_default(),
+                        },
                     },
                 };
 
@@ -850,6 +860,23 @@ impl GlobalMetricsBuilder {
                 Ok((*metric, deltas))
             })
             .collect::<Result<HashMap<_, _>, _>>()?;
+
+        // an override for a metric no master mentioned at all: rare, since
+        // `populate_defaults` densifies nearly everything, but it is still the
+        // instance's word and there is nothing to interpolate against
+        let mut deltas = deltas;
+        for (metric, value) in overrides.iter() {
+            if deltas.contains_key(metric) {
+                continue;
+            }
+            let sources = HashMap::from([(key.clone(), vec![metric.at_pin(value.into_inner())])]);
+            deltas.insert(
+                *metric,
+                pinned
+                    .deltas_with_rounding(&sources, RoundingBehaviour::None)
+                    .map_err(|e| Error::MetricDeltaError(*metric, e))?,
+            );
+        }
 
         Ok(GlobalMetrics(deltas, RwLock::new(Default::default())))
     }
