@@ -86,8 +86,18 @@ pub(crate) fn pin_frontend(fe_root: &Context, spec: &InstanceSpec) -> Result<Pin
 
     let mut glyph_names = HashSet::new();
     for (_, glyph) in context.glyphs.all() {
-        let pinned = instance::pin_glyph(&source_metadata, &glyph, &location)
-            .map_err(fontir::error::Error::from)?;
+        let pinned = match instance::pin_glyph(&source_metadata, &glyph, &location) {
+            Ok(pinned) => pinned,
+            Err(e) if !glyph.emit_to_binary => {
+                log::warn!(
+                    "Failed to generate instance of glyph '{}', which is marked as \
+                     non-exportable. Glyph will be left empty. Failure reason: {e}",
+                    glyph.name
+                );
+                empty_glyph(&source_metadata, &glyph)?
+            }
+            Err(e) => return Err(fontir::error::Error::from(e).into()),
+        };
         glyph_names.insert(pinned.name.clone());
         context.glyphs.set(pinned);
     }
@@ -127,6 +137,38 @@ pub(crate) fn pin_frontend(fe_root: &Context, spec: &InstanceSpec) -> Result<Pin
         location,
         swaps,
     })
+}
+
+/// `glyph`, emptied, as its own pinned instance.
+///
+/// # An interpolation a non-exporting glyph fails is not an error
+///
+/// ufo2ft's instantiator generates every glyph in the UFO, non-exporting ones
+/// included, but only *raises* for a glyph that will actually be in the font:
+/// a name in `public.skipExportGlyphs` that fails to interpolate is warned
+/// about and left empty, because it "would therefore be removed from the
+/// compiled font anyway". A source is free to leave such a glyph
+/// point-incompatible across masters, and Glyphs.app users do — the variable
+/// build never notices, since `GlyphOrderWork` drops the glyph before anything
+/// asks it for deltas. Failing the *static* build on one would mean a font
+/// that builds variable but not at an instance.
+///
+/// Empty, not the default master: this is what ufo2ft ends up with, having
+/// created the glyph before the interpolation it then abandons — so width 0
+/// and no contours, not the default's.
+///
+/// <https://github.com/googlefonts/ufo2ft/blob/main/Lib/ufo2ft/instantiator.py#L613-L630>
+fn empty_glyph(source_metadata: &StaticMetadata, glyph: &Glyph) -> Result<Glyph, Error> {
+    Glyph::new(
+        glyph.name.clone(),
+        glyph.emit_to_binary,
+        glyph.codepoints.clone(),
+        HashMap::from([(
+            source_metadata.default_location().clone(),
+            GlyphInstance::default(),
+        )]),
+    )
+    .map_err(|e| fontir::error::Error::from(e).into())
 }
 
 /// Do the rules' glyph swaps, in order, each on the result of the last.

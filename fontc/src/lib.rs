@@ -6516,6 +6516,28 @@ mod tests {
         assert_eq!(bar.default_instance().width, 540.0);
     }
 
+    /// A non-exporting glyph the pin cannot interpolate is emptied, not fatal.
+    ///
+    /// `hyphen` there is `export = 0` with four points at Regular and none at
+    /// Bold, which is a thing sources really do: the glyph never reaches the
+    /// font, so nothing ever asked it to interpolate. The variable build
+    /// doesn't notice — `GlyphOrderWork` drops it long before deltas — and the
+    /// static build must not be the one place it becomes an error.
+    #[test]
+    fn instance_empties_an_incompatible_non_exporting_glyph() {
+        let result = compile_instance("glyphs3/WghtVar_NoExportIncompatible.glyphs", "wght=550");
+
+        // emptied, ufo2ft-style: not the default master, which is 4 points at 600
+        let hyphen = result.fe_context.get_glyph("hyphen");
+        assert_eq!(hyphen.sources().len(), 1);
+        assert!(hyphen.default_instance().contours.is_empty(), "{hyphen:?}");
+        assert_eq!(hyphen.default_instance().width, 0.0);
+
+        // and still dropped from the font, exactly as when it interpolates
+        assert!(!result.contains_glyph("hyphen"));
+        assert!(result.contains_glyph("manual-component"));
+    }
+
     /// No axes means no fvar/gvar/avar/STAT/HVAR/MVAR, by every backend's own
     /// `axes.is_empty()` gate.
     #[test]
