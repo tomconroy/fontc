@@ -1361,8 +1361,7 @@ dependencies = [
 [[package]]
 name = "norad"
 version = "0.18.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d223261353c1d60c5e00c3b669c6936c47b2e9dc860b5121bc57b964389c47bb"
+source = "git+https://github.com/linebender/norad.git?rev=1c8ac19b1a1a4d21bb27d72161b63043cd42cc52#1c8ac19b1a1a4d21bb27d72161b63043cd42cc52"
 dependencies = [
  "base64",
  "close_already",
@@ -1373,6 +1372,7 @@ dependencies = [
  "serde",
  "serde_derive",
  "serde_repr",
+ "smol_str",
  "thiserror",
 ]
 
