@@ -62,3 +62,6 @@ font-types = { git = "https://github.com/tomconroy/fontations.git", rev = "66820
 read-fonts = { git = "https://github.com/tomconroy/fontations.git", rev = "668202b5" }
 write-fonts = { git = "https://github.com/tomconroy/fontations.git", rev = "668202b5" }
 skrifa = { git = "https://github.com/tomconroy/fontations.git", rev = "668202b5" }
+# norad with linebender/norad#414 (empty guideline names); drop once norad
+# ships a release past 0.18.4.
+norad = { git = "https://github.com/linebender/norad.git", rev = "1c8ac19b1a1a4d21bb27d72161b63043cd42cc52" }
