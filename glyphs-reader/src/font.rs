@@ -2755,10 +2755,17 @@ impl RawFont {
         // a concatenation of three other optional attributes weirdly called
         // 'width', 'weight' and 'custom' (in exactly this order).
         // The first two can only contain few predefined values, the last one is
-        // residual and free-form. They default to 'Regular' when omitted in
-        // the source. See:
+        // residual and free-form. 'width' and 'weight' default to 'Regular'
+        // when omitted in the source, 'custom' to the empty string. See:
         // https://github.com/schriftgestalt/GlyphsSDK/blob/Glyphs3/GlyphsFileFormat/GlyphsFileFormatv2.md
-        // https://github.com/googlefonts/glyphsLib/blob/9d5828d/Lib/glyphsLib/classes.py#L1700-L1711
+        // https://github.com/googlefonts/glyphsLib/blob/6.13.1/Lib/glyphsLib/classes.py#L1605-L1610
+        //
+        // Each is one whole component of the name, never a bag of words:
+        // 'custom = "Regular Italic"' names a master "Regular Italic", not
+        // "Italic". Only a component that is *exactly* "Regular" is redundant,
+        // and even then only while another component is left to name the
+        // master. glyphsLib's GSFontMaster._joinName:
+        // https://github.com/googlefonts/glyphsLib/blob/6.13.1/Lib/glyphsLib/classes.py#L1714-L1725
         for master in self.font_master.iter_mut() {
             // Even though glyphs2 masters don't officially have a 'name' attribute,
             // some glyphs2 sources produced by more recent versions of Glyphs
@@ -2768,35 +2775,42 @@ impl RawFont {
                 continue;
             }
 
-            // Remove Nones, empty strings and redundant occurrences of 'Regular'
+            let custom = master.custom.as_deref().unwrap_or_default();
             let mut names = [
-                master.width.as_deref(),
-                master.weight.as_deref(),
-                master.custom.as_deref(),
+                master.width.as_deref().unwrap_or("Regular"),
+                master.weight.as_deref().unwrap_or("Regular"),
+                custom,
             ]
-            .iter()
-            .flatten()
-            .flat_map(|n| n.split_ascii_whitespace())
-            .filter(|x| *x != "Regular")
+            .into_iter()
+            .filter(|name| !name.is_empty())
             .collect::<Vec<_>>();
 
-            // append "Italic" if italic angle != 0
-            if let Some(italic_angle) = master.italic_angle
-                && italic_angle != 0.0
-                && (names.is_empty()
-                    || !names
-                        .iter()
-                        // https://github.com/googlefonts/glyphsLib/blob/d42d3b15/Lib/glyphsLib/classes.py#L1710
-                        .any(|name| name.contains("Italic") || name.contains("Oblique")))
+            // Drop the redundant "Regular"s, but never the last name standing
+            while names.len() > 1
+                && let Some(idx) = names.iter().position(|name| *name == "Regular")
             {
-                names.push("Italic");
+                names.remove(idx);
             }
-            // if all are empty, default to "Regular"
-            master.name = if names.is_empty() {
-                Some("Regular".into())
+
+            let is_italic = master.italic_angle.is_some_and(|angle| angle != 0.0);
+            let name = if is_italic && names == ["Regular"] {
+                // A master with nothing but an italic angle is the Italic
+                "Italic".to_string()
             } else {
-                Some(names.join(" "))
+                // glyphsLib asks only whether *custom* already says Italic or
+                // Oblique; we ask it of every component, so that a weight or
+                // width saying so doesn't earn a second "Italic" either.
+                // https://github.com/googlefonts/fontc/issues/1175
+                if is_italic
+                    && !names
+                        .iter()
+                        .any(|name| name.contains("Italic") || name.contains("Oblique"))
+                {
+                    names.push("Italic");
+                }
+                names.join(" ")
             };
+            master.name = Some(name);
         }
         Ok(())
     }
@@ -3014,6 +3028,56 @@ fn default_master_idx(raw_font: &mut RawFont) -> usize {
 
 fn whitespace_separated_tokens(s: &str) -> Vec<&str> {
     s.split_whitespace().collect()
+}
+
+/// The "linked style": what a style name has left to say once the style
+/// linking has said its piece.
+///
+/// glyphsLib walks the name in reverse and strips **one** occurrence each of
+/// `Regular`, `Bold` and `Italic`/`Oblique`, and only the ones the linking
+/// asks for: `Regular` only when the master or instance is neither bold nor
+/// italic. What survives is appended to the family name to make
+/// `styleMapFamilyName`, i.e. name ID 1. So a master called `Regular Italic`
+/// with an italic angle keeps its `Regular`, because only the `Italic` is
+/// spoken for.
+///
+/// <https://github.com/googlefonts/glyphsLib/blob/6.13.1/Lib/glyphsLib/builder/names.py#L90-L104>
+pub fn linked_style(style_name: &str, is_bold: bool, is_italic: bool) -> String {
+    let (mut wants_bold, mut wants_italic) = (is_bold, is_italic);
+    let mut wants_regular = !(wants_bold || wants_italic);
+    let mut kept: Vec<&str> = Vec::new();
+    for part in style_name.split_ascii_whitespace().rev() {
+        match part {
+            "Regular" if wants_regular => wants_regular = false,
+            "Bold" if wants_bold => wants_bold = false,
+            "Italic" | "Oblique" if wants_italic => wants_italic = false,
+            _ => kept.push(part),
+        }
+    }
+    kept.reverse();
+    kept.join(" ")
+}
+
+/// `styleMapFamilyName` for a master, i.e. name ID 1 of a variable font.
+///
+/// glyphsLib builds a master's style map names the same way it builds an
+/// instance's, but takes the linking from the master itself: italic from the
+/// italic angle, bold only from a name that is exactly one of the three bold
+/// styles.
+///
+/// <https://github.com/googlefonts/glyphsLib/blob/6.13.1/Lib/glyphsLib/builder/names.py#L21-L42>
+pub fn master_style_map_family_name(family_name: &str, master: &FontMaster) -> String {
+    let is_bold = matches!(
+        master.name.as_str(),
+        "Bold" | "Bold Italic" | "Bold Oblique"
+    );
+    let is_italic = master.italic_angle().is_some_and(|angle| angle != 0.0);
+    let linked_style = linked_style(&master.name, is_bold, is_italic);
+    if linked_style.is_empty() {
+        family_name.to_string()
+    } else {
+        format!("{family_name} {linked_style}")
+    }
 }
 
 fn axis_index(axes: &[Axis], pred: impl Fn(&Axis) -> bool) -> Option<usize> {
@@ -4102,21 +4166,9 @@ impl Instance {
         }
     }
 
-    /// glyphsLib's `_get_linked_style`, walking the style name in reverse.
+    /// glyphsLib's `_get_linked_style` for this instance's own name.
     fn linked_style_from_name(&self) -> String {
-        let (mut wants_bold, mut wants_italic) = (self.is_bold, self.is_italic);
-        let mut wants_regular = !(wants_bold || wants_italic);
-        let mut kept: Vec<&str> = Vec::new();
-        for part in self.name.split_ascii_whitespace().rev() {
-            match part {
-                "Regular" if wants_regular => wants_regular = false,
-                "Bold" if wants_bold => wants_bold = false,
-                "Italic" | "Oblique" if wants_italic => wants_italic = false,
-                _ => kept.push(part),
-            }
-        }
-        kept.reverse();
-        kept.join(" ")
+        linked_style(&self.name, self.is_bold, self.is_italic)
     }
 
     /// The CFF `FullName` for a static build of this instance, if it states one.
@@ -6375,6 +6427,169 @@ etc;
         let font = Font::load(&glyphs2_dir().join("MasterNameNotExactlyItalic.glyphs")).unwrap();
 
         assert_eq!(font.default_master().name, "ThinItalic");
+    }
+
+    /// A Glyphs 2 master's name is built from three whole components, not
+    /// from the words in them: `custom = "Regular Italic"` names a master
+    /// "Regular Italic". Only a component that is exactly "Regular" is
+    /// redundant, and only while something else is left to name the master.
+    ///
+    /// Every expectation here is what glyphsLib 6.13.1's `GSFontMaster.name`
+    /// returns for the same (width, weight, custom, italicAngle).
+    /// <https://github.com/googlefonts/glyphsLib/blob/6.13.1/Lib/glyphsLib/classes.py#L1714-L1725>
+    #[rstest]
+    #[case::nothing_at_all(None, None, None, None, "Regular")]
+    #[case::weight_only(None, Some("Bold"), None, None, "Bold")]
+    #[case::width_only(Some("Condensed"), None, None, None, "Condensed")]
+    #[case::width_and_weight(Some("Condensed"), Some("Bold"), None, None, "Condensed Bold")]
+    // a custom that is exactly "Regular" is redundant like the others...
+    #[case::custom_is_regular(None, None, Some("Regular"), None, "Regular")]
+    #[case::regular_among_three(
+        Some("Condensed"),
+        Some("Bold"),
+        Some("Regular"),
+        None,
+        "Condensed Bold"
+    )]
+    // ...but "Regular" inside a multi-word custom is part of the name.
+    // Fahkwang and Bai Jamjuree, both by cadsondemak, name their italic
+    // Regular master this way.
+    #[case::regular_italic(None, None, Some("Regular Italic"), Some(10.0), "Regular Italic")]
+    #[case::regular_lowercase_italic(
+        None,
+        None,
+        Some("Regular italic"),
+        Some(10.0),
+        // lowercase "italic" isn't the word glyphsLib looks for
+        "Regular italic Italic"
+    )]
+    #[case::regular_bold(
+        Some("Regular"),
+        Some("Regular"),
+        Some("Regular Bold"),
+        None,
+        "Regular Bold"
+    )]
+    #[case::regular_oblique(None, None, Some("Regular Oblique"), Some(12.0), "Regular Oblique")]
+    // the italic angle names the master when nothing else does...
+    #[case::italic_angle_only(None, None, None, Some(10.0), "Italic")]
+    #[case::bold_italic(None, Some("Bold"), None, Some(10.0), "Bold Italic")]
+    #[case::light_extra_italic(
+        None,
+        Some("Light"),
+        Some("Extra italic"),
+        Some(10.0),
+        "Light Extra italic Italic"
+    )]
+    // ...but never twice: https://github.com/googlefonts/fontc/issues/1175
+    #[case::already_italic(None, None, Some("Thin Italic"), Some(10.0), "Thin Italic")]
+    #[case::italic_not_a_word(None, None, Some("ThinItalic"), Some(10.0), "ThinItalic")]
+    #[case::already_oblique(None, None, Some("Oblique"), Some(12.0), "Oblique")]
+    #[case::bold_oblique(None, Some("Bold"), Some("Oblique"), Some(12.0), "Bold Oblique")]
+    // a zero italic angle is no italic angle
+    #[case::upright_zero_angle(None, Some("Bold"), None, Some(0.0), "Bold")]
+    fn v2_master_name(
+        #[case] width: Option<&str>,
+        #[case] weight: Option<&str>,
+        #[case] custom: Option<&str>,
+        #[case] italic_angle: Option<f64>,
+        #[case] expected: &str,
+    ) {
+        let mut font = RawFont {
+            font_master: vec![RawFontMaster {
+                id: "m01".into(),
+                width: width.map(String::from),
+                weight: weight.map(String::from),
+                custom: custom.map(String::from),
+                italic_angle: italic_angle.map(OrderedFloat),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        font.v2_to_v3_master_names().unwrap();
+
+        assert_eq!(font.font_master[0].name.as_deref(), Some(expected));
+    }
+
+    /// Name ID 1 is the family plus whatever the default master's style name
+    /// has left to say once the style linking has said its piece: one
+    /// `Regular`, one `Bold` and one `Italic`/`Oblique` at most, and each only
+    /// if the master is linked that way. A master called "Regular Italic"
+    /// keeps its "Regular" — that is Fahkwang's name ID 1.
+    ///
+    /// Expectations are glyphsLib 6.13.1 `build_stylemap_names(family, name,
+    /// is_bold=name in ("Bold", "Bold Italic", "Bold Oblique"),
+    /// is_italic=bool(italicAngle))`.
+    /// <https://github.com/googlefonts/glyphsLib/blob/6.13.1/Lib/glyphsLib/builder/names.py#L21-L42>
+    #[rstest]
+    #[case::regular("Regular", None, "Family")]
+    #[case::bold("Bold", None, "Family")]
+    // "Bold" is only style linking when it is the whole name
+    #[case::condensed_bold("Condensed Bold", None, "Family Condensed Bold")]
+    #[case::condensed("Condensed", None, "Family Condensed")]
+    #[case::oblique("Oblique", Some(12.0), "Family")]
+    #[case::bold_oblique("Bold Oblique", Some(12.0), "Family")]
+    #[case::condensed_oblique("Condensed Oblique", Some(12.0), "Family Condensed")]
+    #[case::condensed_bold_oblique("Condensed Bold Oblique", Some(12.0), "Family Condensed Bold")]
+    #[case::italic("Italic", Some(10.0), "Family")]
+    #[case::thin_italic("Thin Italic", Some(10.0), "Family Thin")]
+    // only the Italic is spoken for; the Regular stays
+    #[case::regular_italic("Regular Italic", Some(10.0), "Family Regular")]
+    #[case::regular_lowercase_italic("Regular italic Italic", Some(10.0), "Family Regular italic")]
+    // an upright master's Regular *is* spoken for
+    #[case::condensed_regular("Condensed Regular", None, "Family Condensed")]
+    fn master_style_map_family_names(
+        #[case] master_name: &str,
+        #[case] italic_angle: Option<f64>,
+        #[case] expected: &str,
+    ) {
+        let mut metric_values = BTreeMap::new();
+        if let Some(angle) = italic_angle {
+            metric_values.insert(
+                "italic angle".to_string(),
+                MetricValue {
+                    pos: angle.into(),
+                    over: 0.0.into(),
+                },
+            );
+        }
+        let master = FontMaster {
+            id: "m01".into(),
+            name: master_name.into(),
+            axes_values: Vec::new(),
+            metric_values,
+            alignment_zones: Vec::new(),
+            number_values: BTreeMap::new(),
+            custom_parameters: Default::default(),
+            user_data: BTreeMap::new(),
+            metrics_source_id: None,
+            horizontal_stems: Vec::new(),
+            vertical_stems: Vec::new(),
+        };
+
+        assert_eq!(master_style_map_family_name("Family", &master), expected);
+    }
+
+    /// A name the source spells out is used as is, never rebuilt.
+    #[test]
+    fn v2_master_name_from_the_source_wins() {
+        let mut font = RawFont {
+            font_master: vec![RawFontMaster {
+                id: "m01".into(),
+                name: Some("Whatever The Designer Said".into()),
+                weight: Some("Bold".into()),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        font.v2_to_v3_master_names().unwrap();
+
+        assert_eq!(
+            font.font_master[0].name.as_deref(),
+            Some("Whatever The Designer Said")
+        );
     }
 
     // We had a bug where if a master wasn't at a mapping point the Axis Mapping was modified
