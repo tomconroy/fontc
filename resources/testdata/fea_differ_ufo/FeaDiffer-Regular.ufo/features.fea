@@ -1,0 +1,7 @@
+# The default master. Only this file is compiled.
+languagesystem DFLT dflt;
+languagesystem latn dflt;
+
+feature liga {
+    substitute bar bar by plus;
+} liga;

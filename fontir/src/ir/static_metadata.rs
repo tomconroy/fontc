@@ -29,6 +29,30 @@ use crate::orchestration::Persistable;
 /// Glyph names mapped to postscript names
 pub type PostscriptNames = HashMap<GlyphName, GlyphName>;
 
+/// Glyphsapp only: the glyph attributes a FEA glyph predicate token can compare.
+///
+/// A Glyphs.app source can select glyphs into a FEA class with a predicate
+/// token, e.g. `@lc = [ $[category == "Letter" && case == lower] ];`. Every
+/// value here is the string the *source* stored (`None` when it stored
+/// nothing), because that is what glyphsLib compares: its `TokenExpander` reads
+/// plain `GSGlyph` attributes and never fontc's GlyphData-derived fallbacks.
+/// See <https://github.com/googlefonts/glyphsLib/blob/main/Lib/glyphsLib/builder/tokens.py>.
+// NOTE: no `skip_serializing_if` here. IR is also written with bincode, which
+// is not self-describing: a field skipped on the way out is still read on the
+// way back in, and the whole stream desynchronizes.
+#[derive(Serialize, Deserialize, Default, Debug, Clone, PartialEq, Eq)]
+pub struct GlyphPredicateAttrs {
+    /// `category = Letter;`
+    pub category: Option<SmolStr>,
+    /// `subCategory = Ligature;`
+    pub sub_category: Option<SmolStr>,
+    /// `case = lower;`
+    pub case: Option<SmolStr>,
+    /// The glyph's first codepoint, `%04X`-formatted like glyphsLib's
+    /// `GSGlyph.unicode`.
+    pub unicode: Option<SmolStr>,
+}
+
 /// Global font info that cannot vary across the design space.
 ///
 /// For example, upem, axis definitions, etc, as distinct from
@@ -60,6 +84,14 @@ pub struct StaticMetadata {
     pub variation_model: VariationModel,
     /// Glyphsapp only; named numbers defined per-master
     pub number_values: HashMap<NormalizedLocation, BTreeMap<SmolStr, OrderedFloat<f64>>>,
+    /// Glyphsapp only; what a FEA glyph predicate token may ask about a glyph.
+    ///
+    /// `None` for every source that is not a Glyphs.app file, so that a
+    /// predicate asking about anything but the glyph name is an error there
+    /// rather than a silent empty match. `Some` holds one entry per glyph that
+    /// sets at least one attribute; a glyph that sets none is simply absent.
+    #[serde(default)]
+    pub glyph_predicate_attrs: Option<BTreeMap<GlyphName, GlyphPredicateAttrs>>,
     /// PostScript-specific data per master, feeding the CFF table.
     ///
     /// Keyed like [`Self::number_values`]: one entry per master that defines
@@ -883,6 +915,9 @@ impl StaticMetadata {
             postscript_names,
             italic_angle: italic_angle.into(),
             number_values: glyphsapp_number_values.unwrap_or_default(),
+            // the Glyphs source sets this after construction; every other
+            // source leaves it None
+            glyph_predicate_attrs: None,
             postscript: Default::default(),
             build_vertical,
             misc: MiscMetadata {
@@ -1109,6 +1144,17 @@ mod tests {
                 }]),
             },
             number_values: Default::default(),
+            // a Glyphs source always sets this, and the round-trip tests
+            // should carry an entry through
+            glyph_predicate_attrs: Some(BTreeMap::from([(
+                GlyphName::new("a"),
+                GlyphPredicateAttrs {
+                    category: Some("Letter".into()),
+                    case: Some("lower".into()),
+                    unicode: Some("0061".into()),
+                    ..Default::default()
+                },
+            )])),
             // one entry per master, so the round-trip tests exercise a
             // multi-entry map
             postscript: HashMap::from([

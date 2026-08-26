@@ -715,6 +715,24 @@ mod tests {
     }
 
     #[test]
+    fn compile_fea_of_the_default_master_when_masters_disagree() {
+        // ufo2ft compiles exactly one feature file into a variable font, the
+        // default master's (VariableFeatureCompiler is handed
+        // designSpaceDoc.findDefault()); masters that disagree are not an
+        // error. fea_differ's default master (Regular, deliberately the second
+        // source) has 'liga'; the other master has 'dlig'.
+        let result = TestCompile::compile_source("fea_differ.designspace");
+        let gsub = result.font().gsub().unwrap();
+        let features = gsub.feature_list().unwrap();
+        let tags = features
+            .feature_records()
+            .iter()
+            .map(|rec| rec.feature_tag())
+            .collect::<Vec<_>>();
+        assert_eq!(vec![Tag::new(b"liga")], tags);
+    }
+
+    #[test]
     fn compile_fea_with_includes_no_ir() {
         assert_compiles_with_gpos_and_gsub("fea_include.designspace", |mut args| {
             args.ir_dir = None;
@@ -4877,6 +4895,33 @@ mod tests {
             .feature(feature_list.offset_data())
             .unwrap();
         assert!(ss02.feature_params().is_none());
+    }
+
+    // A Glyphs.app glyph predicate token selects glyphs by the attributes the
+    // *source* stores, so it needs `category`/`case`/`unicode` threaded all the
+    // way from glyphs-reader to fea-rs. The fixture's class is
+    //     $[category like "Letter" && case == lower && unicode != nil]
+    // which glyphsLib expands to `a a.alt`: `A` is upper, `one` is a Number,
+    // `space` sets nothing, and `a.alt` -- which has no codepoint -- is in
+    // anyway, because glyphsLib types a bare `nil` as the string "nil", making
+    // that clause true of every glyph. The whole fixture is byte-identical to
+    // fontmake under ttx_diff.
+    #[test]
+    fn glyph_predicate_class_from_source_attributes() {
+        let result = TestCompile::compile_source("glyphs3/GlyphPredicateClass.glyphs");
+        let gsub = result.font().gsub().unwrap();
+        let lookups = gsub.lookup_list().unwrap();
+        let SubstitutionLookup::Single(sub) = lookups.lookups().get(0).unwrap() else {
+            panic!("expected a single substitution lookup");
+        };
+        let coverage = match sub.subtables().get(0).unwrap() {
+            SingleSubst::Format1(sub) => sub.coverage().unwrap(),
+            SingleSubst::Format2(sub) => sub.coverage().unwrap(),
+        };
+        assert_eq!(
+            coverage.iter().collect::<Vec<_>>(),
+            vec![result.get_gid("a"), result.get_gid("a.alt")]
+        );
     }
 
     #[test]

@@ -65,7 +65,12 @@ pub struct DesignSpaceIrSource {
     designspace: Arc<DesignSpaceDocument>,
     designspace_dir: Arc<PathBuf>,
     glyphs: Arc<HashMap<GlyphName, HashMap<PathBuf, Vec<DesignLocation>>>>,
+    /// Every source's features.fea, in designspace order; sources that don't
+    /// have one are simply absent.
     fea_files: Arc<Vec<PathBuf>>,
+    /// The default master's features.fea, if it has one. This is the file that
+    /// gets compiled; see [`FeatureWork`].
+    default_fea_file: Option<PathBuf>,
 }
 
 fn glif_files(
@@ -277,14 +282,13 @@ impl Source for DesignSpaceIrSource {
         }
 
         // For compilation purposes we start from ufo dir / features.fea
-        let fea_files: Vec<_> = designspace
-            .sources
-            .iter()
-            .filter_map(|s| {
-                let fea_file = designspace_dir.join(&s.filename).join("features.fea");
-                fea_file.is_file().then_some(fea_file)
-            })
-            .collect();
+        let fea_file_of = |s: &designspace::Source| {
+            let fea_file = designspace_dir.join(&s.filename).join("features.fea");
+            fea_file.is_file().then_some(fea_file)
+        };
+        let fea_files: Vec<_> = designspace.sources.iter().filter_map(fea_file_of).collect();
+        // Only the default master's features are compiled; see [`FeatureWork`].
+        let default_fea_file = fea_file_of(&designspace.sources[default_master_idx]);
 
         // if source was a designspace we don't want to copy over keys like
         // public.skipExportGlyphs, but we do if it was a UFO. (we assume that
@@ -303,6 +307,7 @@ impl Source for DesignSpaceIrSource {
             designspace_dir: Arc::new(designspace_dir),
             glyphs: Arc::new(glyphs),
             fea_files: Arc::new(fea_files),
+            default_fea_file,
         })
     }
 
@@ -327,6 +332,7 @@ impl Source for DesignSpaceIrSource {
         Ok(Box::new(FeatureWork {
             designspace_or_ufo: self.designspace_or_ufo.clone(),
             fea_files: self.fea_files.clone(),
+            default_fea_file: self.default_fea_file.clone(),
         }))
     }
 
@@ -476,10 +482,45 @@ struct GlobalMetricsWork {
     designspace: Arc<DesignSpaceDocument>,
 }
 
+/// Produce the [`FeaturesSource`] for a designspace: the *default* master's
+/// features.fea, matching ufo2ft.
+///
+/// Line numbers below are ufo2ft 3.9.0 / fontTools 4.63.0, as shipped with
+/// fontmake 3.12.1.
+///
+/// ufo2ft compiles exactly one hand-written feature file into a variable font,
+/// the default source's, and it does so via `VariableFeatureCompiler`, which is
+/// handed `designSpaceDoc.findDefault().font`
+/// (ufo2ft/_compilers/baseCompiler.py:465-468 `compile_variable_features`, and
+/// ufo2ft/featureCompiler.py:452-480 `VariableFeatureCompiler.setupFeatures`,
+/// which reads `self.ufo.features.text`, i.e. the default UFO's). The other
+/// masters' feature *text* never reaches the variable font; only their kerning,
+/// mark/mkmk anchors and GDEF categories do, and those arrive through the
+/// feature writers, which are given the whole designspace and so see every
+/// master (ufo2ft/featureCompiler.py:469-474).
+///
+/// ufo2ft first checks whether the masters agree, with `_featuresCompatible`
+/// (ufo2ft/featureCompiler.py:483-504, called from
+/// ufo2ft/_compilers/baseCompiler.py:336-338): the sources are sorted default
+/// first and their feature files tokenized -- whitespace and comments excluded,
+/// includes followed -- and they are "compatible" when every non-default source
+/// matches the default, or when every non-default source has *no* features at
+/// all. [`fea_files_identical`] is our equivalent of that token comparison.
+///
+/// When they are *not* compatible ufo2ft takes a slower path we cannot follow:
+/// it compiles every master's features separately and lets `varLib` merge the
+/// resulting GSUB/GPOS/GDEF (fontTools/varLib/__init__.py:833-864
+/// `_merge_OTL`), which turns per-master *values* -- ligature carets, anchors,
+/// value records -- into variations. That merge only survives structurally
+/// identical layout tables; anything else raises `VarLibMergeError`. We instead
+/// compile the default master's file, which agrees with fontmake at the default
+/// location and differs only in that values the masters disagree about come out
+/// constant rather than variable. We warn, naming the masters we ignored.
 #[derive(Debug)]
 struct FeatureWork {
     designspace_or_ufo: Arc<PathBuf>,
     fea_files: Arc<Vec<PathBuf>>,
+    default_fea_file: Option<PathBuf>,
 }
 
 #[derive(Debug)]
@@ -859,6 +900,30 @@ fn fea_files_identical(f1: &Path, f2: &Path) -> Result<bool, BadSource> {
 fn ufo_parent_dir(fea_path: &Path) -> PathBuf {
     let fea_dir = fea_path.parent().unwrap_or(Path::new("."));
     fea_dir.parent().unwrap_or(fea_dir).to_path_buf()
+}
+
+/// The name of the master a features.fea belongs to: the UFO directory name,
+/// which identifies the master far more legibly than the path to features.fea.
+fn master_name(fea_file: &Path) -> Cow<'_, str> {
+    fea_file
+        .parent()
+        .and_then(Path::file_name)
+        .map(OsStr::to_string_lossy)
+        .unwrap_or_else(|| fea_file.to_string_lossy())
+}
+
+/// [`master_name`] for each of `fea_files`, comma separated, for log messages.
+///
+/// Deduplicated: a UFO used by several designspace sources (a sparse layer
+/// source names the same UFO as its full-layer sibling) has one features.fea
+/// and should be named once.
+fn master_names<'a>(fea_files: impl Iterator<Item = &'a PathBuf>) -> String {
+    let mut seen = HashSet::new();
+    fea_files
+        .filter(|fea_file| seen.insert(fea_file.as_path()))
+        .map(|fea_file| master_name(fea_file))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// Iterate the significant tokens of a features.fea for compatibility comparison:
@@ -1979,34 +2044,55 @@ impl Work<Context, WorkId, Error> for FeatureWork {
     fn exec(&self, context: &Context) -> Result<(), Error> {
         debug!("Features for {:#?}", self.designspace_or_ufo);
 
-        let fea_files = self.fea_files.as_ref();
-        for fea_file in fea_files.iter().skip(1) {
-            if !fea_files_identical(&fea_files[0], fea_file)? {
+        // ufo2ft compiles the default master's features.fea and no other; see
+        // the doc comment on [`FeatureWork`].
+        let Some(fea_file) = self.default_fea_file.clone() else {
+            // The default master has no features.fea, so the font has no
+            // hand-written features -- whatever the other masters may say.
+            let ignored = master_names(self.fea_files.iter());
+            if !ignored.is_empty() {
                 warn!(
-                    "Bailing out due to non-identical feature files. This is an unnecessary limitation."
+                    "The default master has no features.fea; ignoring the feature file(s) of {ignored}"
                 );
-                return Err(Error::NonIdenticalFea(
-                    fea_files[0].to_path_buf(),
-                    fea_file.to_path_buf(),
-                ));
+            }
+            context.features.set(FeaturesSource::empty());
+            return Ok(());
+        };
+
+        // Not fatal, but the masters disagreeing about features means we build
+        // something fontmake wouldn't: it compiles each master's features and
+        // lets varLib merge them, so values the masters disagree about (e.g.
+        // ligature carets) end up variable there and constant here.
+        let mut differing = Vec::new();
+        let mut seen = HashSet::new();
+        for other in self.fea_files.iter() {
+            // several sources can name the same UFO (a sparse layer source and
+            // its full-layer sibling), and it has only one features.fea
+            if *other == fea_file || !seen.insert(other.as_path()) {
+                continue;
+            }
+            if !fea_files_identical(&fea_file, other)? {
+                differing.push(other.clone());
             }
         }
-
-        if !fea_files.is_empty() {
-            // Fea file is required to be ufo_dir/features.fea. Includes resolve as siblings
-            // of ufo_dir.
-            let fea_file = fea_files[0].clone();
-            let include_dir = fea_file
-                .parent()
-                .and_then(|f| f.parent())
-                .map(|v| v.to_path_buf())
-                .ok_or_else(|| BadSource::new(&fea_file, BadSourceKind::ExpectedParent))?;
-            context
-                .features
-                .set(FeaturesSource::from_file(fea_file, Some(include_dir)));
-        } else {
-            context.features.set(FeaturesSource::empty());
+        if !differing.is_empty() {
+            warn!(
+                "Compiling only the default master's features ({}); the feature file(s) of {} differ and are ignored",
+                master_name(&fea_file),
+                master_names(differing.iter())
+            );
         }
+
+        // Fea file is required to be ufo_dir/features.fea. Includes resolve as siblings
+        // of ufo_dir.
+        let include_dir = fea_file
+            .parent()
+            .and_then(|f| f.parent())
+            .map(|v| v.to_path_buf())
+            .ok_or_else(|| BadSource::new(&fea_file, BadSourceKind::ExpectedParent))?;
+        context
+            .features
+            .set(FeaturesSource::from_file(fea_file, Some(include_dir)));
 
         Ok(())
     }
@@ -2607,6 +2693,74 @@ mod tests {
         let a = write_master("A.ufo", "include(../shared.fea)");
         let b = write_master("B.ufo", "include (../shared.fea)\n");
         assert!(fea_files_identical(&a, &b).unwrap());
+    }
+
+    /// The features.fea we would compile for a designspace.
+    fn features_of(name: &str) -> Arc<FeaturesSource> {
+        let _ = env_logger::builder().is_test(true).try_init();
+        let source = load_designspace(name);
+        let context = Context::new_root(Flags::default(), None, None);
+        let work = source.create_feature_ir_work().unwrap();
+        work.exec(&context.copy_for_work(work.read_access(), work.write_access()))
+            .unwrap();
+        context.features.get()
+    }
+
+    fn fea_file_of(name: &str) -> PathBuf {
+        match features_of(name).as_ref() {
+            FeaturesSource::File { fea_file, .. } => fea_file.clone(),
+            other => panic!("expected a fea file for {name}, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn compiles_the_default_masters_features() {
+        // ufo2ft hands VariableFeatureCompiler designSpaceDoc.findDefault(), so
+        // the default master's features.fea is the one that gets compiled -- in
+        // fea_differ.designspace the default is deliberately the *second*
+        // source, so taking the first source's file would be caught here.
+        assert_eq!(
+            testdata_dir().join("fea_differ_ufo/FeaDiffer-Regular.ufo/features.fea"),
+            fea_file_of("fea_differ.designspace")
+        );
+    }
+
+    #[test]
+    fn identical_features_still_compile_the_same_file() {
+        // fea_include's masters agree, and the default is also the first
+        // source: unchanged by looking the default master up.
+        assert_eq!(
+            testdata_dir().join("fea_include_ufo/FeaInc-Regular.ufo/features.fea"),
+            fea_file_of("fea_include.designspace")
+        );
+    }
+
+    #[test]
+    fn features_of_a_ufo_without_a_designspace() {
+        assert_eq!(
+            testdata_dir().join("WghtVar-Regular.ufo/features.fea"),
+            fea_file_of("WghtVar-Regular.ufo")
+        );
+    }
+
+    #[test]
+    fn no_features_when_the_default_master_has_none() {
+        // The default master having no features.fea means no hand-written
+        // features, whatever the other masters say; ufo2ft reads the default
+        // UFO's features.text and nobody else's.
+        let tmp = tempfile::tempdir().unwrap();
+        let ds = tmp.path().join("no_default_fea.designspace");
+        std::fs::copy(testdata_dir().join("fea_differ.designspace"), &ds).unwrap();
+        let ufos = tmp.path().join("fea_differ_ufo");
+        copy_dir(&testdata_dir().join("fea_differ_ufo"), &ufos);
+        std::fs::remove_file(ufos.join("FeaDiffer-Regular.ufo/features.fea")).unwrap();
+
+        let context = Context::new_root(Flags::default(), None, None);
+        let source = DesignSpaceIrSource::new(&ds).unwrap();
+        let work = source.create_feature_ir_work().unwrap();
+        work.exec(&context.copy_for_work(work.read_access(), work.write_access()))
+            .unwrap();
+        assert_eq!(FeaturesSource::Empty, *context.features.get());
     }
 
     macro_rules! plist_dict {

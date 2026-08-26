@@ -7,6 +7,7 @@ use std::{
 
 use fontdrasil::{coords::NormalizedLocation, types::Axis};
 use ordered_float::OrderedFloat;
+use smol_str::SmolStr;
 use write_fonts::{tables::variations::VariationRegion, types::Tag};
 
 type DefaultAndVariations = (i16, Vec<(VariationRegion, i16)>);
@@ -44,6 +45,68 @@ pub trait VariationInfo {
         &self,
         name: &str,
     ) -> Result<HashMap<NormalizedLocation, f64>, Self::Error>;
+
+    /// Glyphsapp only: whether glyph predicate attributes can be answered at all.
+    ///
+    /// Only a Glyphs.app source has them. When this is `false` a [glyph
+    /// predicate] token that compares anything but the glyph name is an error,
+    /// rather than a predicate that silently matches nothing.
+    ///
+    /// [glyph predicate]: https://glyphsapp.com/learn/tokens#g-glyph-predicates
+    fn has_glyph_predicate_attrs(&self) -> bool;
+
+    /// Glyphsapp only: one glyph's value for a [glyph predicate] attribute.
+    ///
+    /// `None` means the source did not set the attribute for this glyph, which
+    /// is what glyphsLib compares against (an unset `GSGlyph` attribute is
+    /// Python `None`) and is distinct from setting it to the empty string.
+    ///
+    /// [glyph predicate]: https://glyphsapp.com/learn/tokens#g-glyph-predicates
+    fn glyph_predicate_attr(&self, glyph: &str, attr: GlyphPredicateAttr) -> Option<SmolStr>;
+}
+
+/// A glyph attribute that a Glyphs.app [glyph predicate] token can compare.
+///
+/// The glyph's `name` is not here: fea-rs answers that one itself. These are
+/// the attributes it needs a Glyphs.app source to answer, and every one of them
+/// is compared as the *source stored* it, never as fontc later derived it.
+///
+/// [glyph predicate]: https://glyphsapp.com/learn/tokens#g-glyph-predicates
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum GlyphPredicateAttr {
+    /// `category`, e.g. `Letter`
+    Category,
+    /// `subCategory`, e.g. `Ligature`
+    SubCategory,
+    /// `case`, e.g. `lower`
+    Case,
+    /// `unicode`: the first codepoint, `%04X`-formatted
+    Unicode,
+}
+
+impl GlyphPredicateAttr {
+    /// Every attribute, for error messages.
+    pub(crate) const ALL: &'static [Self] =
+        &[Self::Category, Self::SubCategory, Self::Case, Self::Unicode];
+
+    /// How this attribute is spelled in a predicate token.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Category => "category",
+            Self::SubCategory => "subCategory",
+            Self::Case => "case",
+            Self::Unicode => "unicode",
+        }
+    }
+
+    /// The attribute a predicate token spells `text`, if we support it.
+    ///
+    /// Case-sensitive, because glyphsLib's object-matching regex is
+    /// (`tokens.py`, `gsglyph_predicate_object_re`): `Category` is not
+    /// `category` but an unknown attribute.
+    pub fn from_token(text: &str) -> Option<Self> {
+        Self::ALL.iter().copied().find(|attr| attr.name() == text)
+    }
 }
 
 #[derive(Debug)]
@@ -84,6 +147,14 @@ impl VariationInfo for NopVariationInfo {
     ) -> Result<HashMap<NormalizedLocation, f64>, NopError> {
         Ok(Default::default())
     }
+
+    fn has_glyph_predicate_attrs(&self) -> bool {
+        false
+    }
+
+    fn glyph_predicate_attr(&self, _: &str, _: GlyphPredicateAttr) -> Option<SmolStr> {
+        None
+    }
 }
 
 /// A type that implements [`VariationInfo`], for testing and debugging.
@@ -93,6 +164,13 @@ pub struct MockVariationInfo {
     // Note: This is not considered public API for the purposes of semvar
     #[doc(hidden)]
     pub axes: Vec<Axis>,
+    /// Glyph predicate attributes, as (glyph name, attribute) -> value.
+    ///
+    /// `None` stands for a source that is not a Glyphs.app file and so has no
+    /// such attributes at all; `Some` (even empty) for one that is.
+    // Note: This is not considered public API for the purposes of semvar
+    #[doc(hidden)]
+    pub glyph_predicate_attrs: Option<HashMap<(SmolStr, GlyphPredicateAttr), SmolStr>>,
 }
 
 /// A location on an axis, in one of three coordinate spaces, as specified in a fea file.
@@ -151,6 +229,7 @@ impl MockVariationInfo {
                     )
                 })
                 .collect(),
+            glyph_predicate_attrs: None,
         }
     }
 
@@ -204,7 +283,10 @@ impl MockVariationInfo {
             }
         }
 
-        Ok(MockVariationInfo { axes })
+        Ok(MockVariationInfo {
+            axes,
+            glyph_predicate_attrs: None,
+        })
     }
 }
 
@@ -238,6 +320,17 @@ impl VariationInfo for MockVariationInfo {
         _: &str,
     ) -> Result<HashMap<NormalizedLocation, f64>, NopError> {
         Ok(Default::default())
+    }
+
+    fn has_glyph_predicate_attrs(&self) -> bool {
+        self.glyph_predicate_attrs.is_some()
+    }
+
+    fn glyph_predicate_attr(&self, glyph: &str, attr: GlyphPredicateAttr) -> Option<SmolStr> {
+        self.glyph_predicate_attrs
+            .as_ref()?
+            .get(&(SmolStr::new(glyph), attr))
+            .cloned()
     }
 }
 

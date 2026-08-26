@@ -1,0 +1,25 @@
+# Every glyph predicate here is rejected, and each rejection names what it
+# rejected: a predicate we cannot evaluate must never quietly select nothing
+# (or everything).
+
+# `category` and friends are answered by the Glyphs.app source, and this
+# compilation has none.
+@a = [ $[category == "Letter"] ];
+
+# an attribute no toolchain here knows
+@b = [ $[colorIndex == "1"] ];
+
+# 'matches' is a Python regex search
+@c = [ $[name matches "^a"] ];
+
+# glyphsLib types these bare values as a boolean and an integer, so they can
+# never equal a glyph attribute
+@d = [ $[name == true] ];
+@e = [ $[name == 3] ];
+
+# character classes in a 'like' pattern are Python's, not ours
+@f = [ $[name like "[abc]*"] ];
+
+feature ss01 {
+    sub a by b;
+} ss01;
