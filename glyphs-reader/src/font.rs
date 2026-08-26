@@ -1178,9 +1178,44 @@ impl PlistParamsExt for Plist {
     }
 }
 
+/// Whose custom parameters a [`RawCustomParameters`] holds.
+///
+/// Only needed by the handful of parameters whose meaning, or whose warning,
+/// depends on that.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ParamOwner<'a> {
+    Font,
+    Master,
+    Instance(&'a str),
+}
+
+/// What to say about a `Replace Prefix`/`Replace Feature` we are not applying,
+/// or `None` when there is nothing to say.
+///
+/// A master's are handled: the default master's rewrite the one feature file we
+/// compile, and the rest are covered by the single warning naming them
+/// (see [`FeatureReplacements`] and `masters_with_differing_features`). A
+/// font's do nothing in glyphsLib either, so there is nothing to report.
+///
+/// An instance's are a real, silent loss. glyphsLib applies them when it builds
+/// that instance's UFO (`apply_instance_data_to_ufo` ->
+/// `to_ufo_custom_params(None, ufo, glyphs_instance)`,
+/// builder/instances.py:470), so a `fontc --instance` static build of a pinned
+/// instance that carries one compiles feature code fontmake would have
+/// replaced. Rewriting features at the pin needs the machinery we lack, so we
+/// say so instead.
+fn unapplied_replacement_warning(param: &str, owner: ParamOwner) -> Option<String> {
+    match owner {
+        ParamOwner::Font | ParamOwner::Master => None,
+        ParamOwner::Instance(instance) => Some(format!(
+            "'{param}' on instance '{instance}' is ignored: fontc does not replace features at an instance"
+        )),
+    }
+}
+
 impl RawCustomParameters {
     ////convert into the parsed params for a top-level font
-    fn to_custom_params(&self) -> Result<CustomParameters, Error> {
+    fn to_custom_params(&self, owner: ParamOwner) -> Result<CustomParameters, Error> {
         let mut params = CustomParameters::default();
         let mut virtual_masters = Vec::<BTreeMap<String, OrderedFloat<f64>>>::new();
         // PANOSE custom parameter is accessible under a short name and a long name:
@@ -1425,7 +1460,11 @@ impl RawCustomParameters {
                 // master's copies only; see [`FeatureReplacements`]. An
                 // instance's copies stay unsupported -- that is instancing
                 // territory (see `instance_overrides` in glyphs2fontir).
-                "Replace Prefix" | "Replace Feature" => (),
+                "Replace Prefix" | "Replace Feature" => {
+                    if let Some(msg) = unapplied_replacement_warning(name, owner) {
+                        log_once_warn!("{}", msg);
+                    }
+                }
                 _ => log_once_warn!("unknown custom parameter '{name}'"),
             }
         }
@@ -3968,7 +4007,9 @@ impl Instance {
             axis_mappings,
             axes_values: value.axes_values.clone(),
             properties: value.properties.clone(),
-            custom_parameters: value.custom_parameters.to_custom_params()?,
+            custom_parameters: value
+                .custom_parameters
+                .to_custom_params(ParamOwner::Instance(&value.name))?,
             is_bold: value.is_bold.unwrap_or_default() != 0,
             is_italic: value.is_italic.unwrap_or_default() != 0,
             link_style: value.link_style.clone(),
@@ -4207,7 +4248,7 @@ impl TryFrom<RawFont> for Font {
         let axis_mappings = UserToDesignMapping::new(&mut from, &instances);
         let default_master_idx = default_master_idx(&mut from);
 
-        let mut custom_parameters = from.custom_parameters.to_custom_params()?;
+        let mut custom_parameters = from.custom_parameters.to_custom_params(ParamOwner::Font)?;
 
         let glyph_order = make_glyph_order(&from.glyphs, custom_parameters.glyph_order.take());
 
@@ -4315,7 +4356,7 @@ impl TryFrom<RawFont> for Font {
             .font_master
             .into_iter()
             .map(|m| {
-                let custom_parameters = m.custom_parameters.to_custom_params()?;
+                let custom_parameters = m.custom_parameters.to_custom_params(ParamOwner::Master)?;
                 let metrics_source_id =
                     resolve_metrics_source_id(&custom_parameters, &master_ids_to_names);
                 // v2 masters carry stems directly; in v3 the font defines
@@ -7328,7 +7369,7 @@ name = _corner.hi;
             },
         ]);
 
-        let params = raw_params.to_custom_params().unwrap();
+        let params = raw_params.to_custom_params(ParamOwner::Master).unwrap();
 
         // The first value should win, not the second
         assert_eq!(
@@ -7678,6 +7719,53 @@ mod replace_prefix_and_feature_tests {
             )
             .unwrap()
             .is_empty()
+        );
+    }
+
+    /// An instance's copies are a silent loss under `fontc --instance`, so they
+    /// get a warning of their own; a master's and the font's do not.
+    #[test]
+    fn only_an_instances_replacements_are_warned_about() {
+        assert_eq!(
+            Some(
+                "'Replace Prefix' on instance 'Condensed Bold' is ignored: \
+                 fontc does not replace features at an instance"
+                    .to_string()
+            ),
+            unapplied_replacement_warning("Replace Prefix", ParamOwner::Instance("Condensed Bold"))
+        );
+        // the default master's are applied, and the rest are named by the one
+        // warning `masters_with_differing_features` feeds
+        assert_eq!(
+            None,
+            unapplied_replacement_warning("Replace Prefix", ParamOwner::Master)
+        );
+        // inert in glyphsLib too, so there is nothing to report
+        assert_eq!(
+            None,
+            unapplied_replacement_warning("Replace Feature", ParamOwner::Font)
+        );
+    }
+
+    /// The fixture's instance carries both parameters, so the feature text
+    /// asserted above is also proof we do not apply them: they would make the
+    /// `Positioning` prefix `pos a 777` and rewrite `salt`.
+    #[test]
+    fn the_fixture_has_an_instance_to_warn_about() {
+        let font = load();
+        let instance = font.instances.first().expect("an instance");
+        assert_eq!("Regular", instance.name);
+        let raw = RawFont::load(&glyphs3_dir().join("ReplacePrefixAndFeature.glyphs")).unwrap();
+        let names = raw.instances[0]
+            .custom_parameters
+            .0
+            .iter()
+            .map(|param| param.name.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(vec!["Replace Prefix", "Replace Feature"], names);
+        assert!(
+            !feature_text(&font).contains("777"),
+            "the instance's replacement must not reach the font's features"
         );
     }
 
