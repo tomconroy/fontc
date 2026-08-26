@@ -1127,6 +1127,11 @@ fn bracket_glyphs<'a>(
 }
 
 // https://github.com/googlefonts/glyphsLib/blob/c4db6b981d/Lib/glyphsLib/classes.py#L3947
+//
+// The rules are indexed by the source's own axes, but glyphsLib zips them against the
+// designspace axes - the ones that survived - so a rule for a dropped axis is read as
+// the next surviving axis' rule. Match that.
+// <https://github.com/googlefonts/glyphsLib/blob/v6.13.1/Lib/glyphsLib/classes.py#L4009-L4013>
 fn get_bracket_info(layer: &Layer, axes: &Axes) -> ConditionSet {
     assert!(
         !layer.attributes.axis_rules.is_empty(),
@@ -1134,7 +1139,6 @@ fn get_bracket_info(layer: &Layer, axes: &Axes) -> ConditionSet {
     );
 
     axes.iter()
-        .filter(|ax| !ax.is_point())
         .zip(&layer.attributes.axis_rules)
         .map(|(axis, rule)| {
             let min = rule

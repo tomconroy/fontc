@@ -205,6 +205,17 @@ mod tests {
         }
     }
 
+    /// A point axis is in fvar, so it needs a segment map, and there is only one it
+    /// could have: every position on it is the default.
+    ///
+    /// <https://github.com/googlefonts/fontc/issues/1990>
+    #[test]
+    fn point_axis_gets_the_default_segment_map() {
+        // an axis whose user:design mapping bends, but that has nowhere to bend to
+        let mappings = vec![(UserCoord::new(100.0), DesignCoord::new(5.0))];
+        assert_eq!(to_segment_map(&axis(mappings, 0)), default_segment_map());
+    }
+
     #[test]
     fn simple_functional_segment_map() {
         let mappings = vec![

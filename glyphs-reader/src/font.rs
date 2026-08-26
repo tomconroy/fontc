@@ -70,6 +70,19 @@ pub struct Font {
     format_version: FormatVersion,
     pub units_per_em: u16,
     pub axes: Vec<Axis>,
+    /// Whether the source names its own axes rather than relying on the defaults.
+    ///
+    /// glyphsLib keeps an axis that can't vary - one where every master and instance
+    /// sits at the same spot - when the font has an "Axes" custom parameter naming it,
+    /// on the grounds that the designer asked for it. A Glyphs 3 font synthesises that
+    /// parameter from its own axis list, but only when the list is more than the
+    /// default (Weight, Width) pair, and a Glyphs 2 font without the parameter falls
+    /// back to the default axis definitions. So this is true exactly when glyphsLib
+    /// would see a non-None "Axes" parameter.
+    ///
+    /// <https://github.com/googlefonts/glyphsLib/blob/v6.13.1/Lib/glyphsLib/builder/axes.py#L187-L191>
+    /// <https://github.com/googlefonts/glyphsLib/blob/v6.13.1/Lib/glyphsLib/classes.py#L4890-L4907>
+    pub declares_axes: bool,
     pub masters: Vec<FontMaster>,
     pub default_master_idx: usize,
     pub glyphs: BTreeMap<SmolStr, Glyph>,
@@ -1503,6 +1516,14 @@ impl RawCustomParameters {
         self.take("Axes").and_then(|p| p.as_axes())
     }
 
+    /// Read the "Axes" parameter without consuming it.
+    fn peek_axes(&self) -> Option<Vec<Axis>> {
+        self.0
+            .iter()
+            .find(|val| val.name == "Axes" && val.disabled != Some(true))
+            .and_then(|val| val.value.as_axes())
+    }
+
     fn take_axis_mappings(&mut self) -> Option<Vec<AxisMapping>> {
         self.take("Axis Mappings")
             .and_then(|p| p.as_axis_mappings())
@@ -1700,6 +1721,32 @@ pub struct Axis {
     #[fromplist(alt_name = "Tag")]
     pub tag: String,
     pub hidden: Option<bool>,
+}
+
+fn axis(name: &str, tag: &str) -> Axis {
+    Axis {
+        name: name.into(),
+        tag: tag.into(),
+        hidden: None,
+    }
+}
+
+/// The axes glyphsLib's `GSFont` starts life with, before any source says otherwise.
+///
+/// <https://github.com/googlefonts/glyphsLib/blob/v6.13.1/Lib/glyphsLib/classes.py#L4549>
+fn default_axis_pair() -> Vec<Axis> {
+    vec![axis("Weight", "wght"), axis("Width", "wdth")]
+}
+
+/// The axes glyphsLib considers when a font has no "Axes" custom parameter.
+///
+/// Note the third one: a Glyphs 2 master's `customValue` lands here even though the
+/// font never named a Custom axis.
+/// <https://github.com/googlefonts/glyphsLib/blob/v6.13.1/Lib/glyphsLib/builder/axes.py#L569-L572>
+fn default_axis_definitions() -> Vec<Axis> {
+    let mut axes = default_axis_pair();
+    axes.push(axis("Custom", "XXXX"));
+    axes
 }
 
 #[derive(Default, Clone, Debug, PartialEq, FromPlist)]
@@ -2562,6 +2609,34 @@ impl RawFont {
         Ok(raw_font)
     }
 
+    /// See [`Font::declares_axes`]; must be asked before [`Self::v2_to_v3_axes`] runs.
+    ///
+    /// <https://github.com/googlefonts/glyphsLib/blob/v6.13.1/Lib/glyphsLib/classes.py#L4890-L4907>
+    fn declares_axes(&self) -> bool {
+        // glyphsLib's GSFont.axes: a v3 font's own list, a v2 font's "Axes" custom
+        // parameter, or - when a v2 font has none - the default (Weight, Width) pair.
+        let axes = if self.format_version.is_v2() {
+            // GSFont.__init__ seeds a v2 font's axes with the default pair
+            self.custom_parameters
+                .peek_axes()
+                .unwrap_or_else(default_axis_pair)
+        } else {
+            self.axes.clone()
+        };
+        // ...which glyphsLib turns back into an "Axes" parameter unless it is just the
+        // default pair and nothing else bends the axes. GSAxis equality compares name
+        // and tag only, so a *hidden* Width axis still counts as the default one; that
+        // is why fontmake loses the hidden flag on such an axis.
+        // https://github.com/googlefonts/glyphsLib/blob/v6.13.1/Lib/glyphsLib/classes.py#L1262-L1263
+        let is_default_pair = matches!(
+            axes.as_slice(),
+            [weight, width]
+                if weight.name == "Weight" && weight.tag == "wght"
+                    && width.name == "Width" && width.tag == "wdth"
+        );
+        !is_default_pair || self.custom_parameters.contains("Axis Mappings")
+    }
+
     fn v2_to_v3_axes(&mut self) -> Result<Vec<String>, Error> {
         let mut tags = Vec::new();
         if let Some(v2_axes) = self.custom_parameters.take_axes() {
@@ -2574,21 +2649,7 @@ impl RawFont {
         // Match the defaults from https://github.com/googlefonts/glyphsLib/blob/f6e9c4a29ce764d34c309caef5118c48c156be36/Lib/glyphsLib/builder/axes.py#L526
         // if we have nothing
         if self.axes.is_empty() {
-            self.axes.push(Axis {
-                name: "Weight".into(),
-                tag: "wght".into(),
-                hidden: None,
-            });
-            self.axes.push(Axis {
-                name: "Width".into(),
-                tag: "wdth".into(),
-                hidden: None,
-            });
-            self.axes.push(Axis {
-                name: "Custom".into(),
-                tag: "XXXX".into(),
-                hidden: None,
-            });
+            self.axes = default_axis_definitions();
         }
 
         if self.axes.len() > 3 {
@@ -4266,6 +4327,9 @@ impl TryFrom<RawFont> for Font {
     type Error = Error;
 
     fn try_from(mut from: RawFont) -> Result<Self, Self::Error> {
+        // Ask before v2_to_v3 consumes the "Axes" parameter
+        let declares_axes = from.declares_axes();
+
         if from.format_version.is_v2() {
             from.v2_to_v3()?;
         } else {
@@ -4507,6 +4571,7 @@ impl TryFrom<RawFont> for Font {
             format_version: from.format_version,
             units_per_em,
             axes: from.axes,
+            declares_axes,
             masters,
             default_master_idx,
             glyphs,
@@ -5130,6 +5195,32 @@ mod tests {
     #[test]
     fn read_wght_var_3_metrics() {
         assert_wght_var_metrics(&Font::load(&glyphs3_dir().join("WghtVar.glyphs")).unwrap());
+    }
+
+    /// A source that lists its own axes has asked for them, whatever they do.
+    #[test]
+    fn a_source_that_names_its_axes_declares_them() {
+        // an "Axes" custom parameter, and a v3 `axes` list, that aren't the defaults
+        for path in [
+            glyphs2_dir().join("WghtVar.glyphs"),
+            glyphs3_dir().join("WghtVar.glyphs"),
+            glyphs2_dir().join("WghtVar_PointAxis.glyphs"),
+        ] {
+            assert!(Font::load(&path).unwrap().declares_axes, "{path:?}");
+        }
+    }
+
+    /// Falling back to the defaults - which every Glyphs 2 source without an "Axes"
+    /// parameter does - is not asking for anything.
+    #[test]
+    fn a_source_with_the_default_axes_declares_nothing() {
+        let font = Font::load(&glyphs2_dir().join("WghtVar_ImplicitAxes.glyphs")).unwrap();
+        assert!(!font.declares_axes);
+        assert_eq!(
+            vec!["wght", "wdth", "XXXX"],
+            font.axes.iter().map(|a| a.tag.as_str()).collect::<Vec<_>>(),
+            "the source gets the three default axis slots regardless"
+        );
     }
 
     /// So far we don't have any package-only examples
