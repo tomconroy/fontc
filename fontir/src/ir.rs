@@ -1072,6 +1072,7 @@ fn is_ribbi(style_name: &str) -> bool {
 }
 
 impl NameBuilder {
+    /// Family and subfamily, joined, e.g. "Family" and "Bold Italic".
     pub fn make_family_name(family: &str, subfamily: &str) -> String {
         let mut family = vec![family];
         family.extend(subfamily.split_ascii_whitespace());
