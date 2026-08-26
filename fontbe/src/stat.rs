@@ -299,9 +299,10 @@ mod tests {
 
     /// A source with more STAT axes than fvar axes.
     ///
-    /// This models the common Glyphs case: a wdth point axis, which fontc
-    /// prunes from fvar but Glyphs still lists in STAT, plus the STAT-only
-    /// ital axis glyphsLib synthesizes for an upright family.
+    /// This models the common Glyphs case: a wdth point axis that is not in
+    /// fvar (glyphsLib drops a Glyphs 2 axis slot sitting at its neutral
+    /// position) but Glyphs still lists in STAT, plus the STAT-only ital axis
+    /// glyphsLib synthesizes for an upright family.
     fn stat_beyond_fvar_metadata() -> StaticMetadata {
         let wght = axis("wght", 100.0, 400.0, 700.0);
         let wdth = axis("wdth", 100.0, 100.0, 100.0);
@@ -317,7 +318,8 @@ mod tests {
                     "Italic".to_string(),
                 ),
             ]),
-            vec![wght.clone(), wdth.clone()],
+            // a point axis the source keeps is an fvar axis; this one wasn't kept
+            vec![wght.clone()],
             Default::default(),
             Default::default(),
             Default::default(),

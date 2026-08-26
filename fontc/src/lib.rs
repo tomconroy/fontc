@@ -668,26 +668,42 @@ mod tests {
 
     // A point axis is not in the variation model, so it must not stop us from
     // recognizing the default master's FEA.
+    //
+    // fontmake still writes the point axis to fvar (see
+    // `point_axis_the_source_asked_for_reaches_the_font`), so the variation store's regions span it
+    // too and GDEF differs by that one region axis; GPOS is unchanged.
     #[test]
     fn merged_fea_with_point_axis() {
         let point_axis = TestCompile::compile_source("variable_fea/VarFeaPointAxis.designspace");
         let no_point_axis = TestCompile::compile_source("variable_fea/VarFea.designspace");
 
-        for tag in [Tag::new(b"GPOS"), Tag::new(b"GDEF")] {
-            let point_axis = point_axis
+        let region_axis_count = |result: &TestCompile| {
+            result
                 .font()
-                .table_data(tag)
-                .map(|d| d.as_bytes().to_vec());
-            let no_point_axis = no_point_axis
+                .gdef()
+                .unwrap()
+                .item_var_store()
+                .expect("merged GPOS needs an ItemVariationStore")
+                .unwrap()
+                .variation_region_list()
+                .unwrap()
+                .axis_count()
+        };
+        assert_eq!(region_axis_count(&no_point_axis), 1);
+        assert_eq!(region_axis_count(&point_axis), 2);
+
+        let gpos = |result: &TestCompile| {
+            result
                 .font()
-                .table_data(tag)
-                .map(|d| d.as_bytes().to_vec());
-            assert!(point_axis.is_some(), "{tag} should be present");
-            assert_eq!(
-                point_axis, no_point_axis,
-                "{tag} differs from the compile without a point axis"
-            );
-        }
+                .table_data(Tag::new(b"GPOS"))
+                .map(|d| d.as_bytes().to_vec())
+        };
+        assert!(gpos(&point_axis).is_some(), "GPOS should be present");
+        assert_eq!(
+            gpos(&point_axis),
+            gpos(&no_point_axis),
+            "GPOS differs from the compile without a point axis"
+        );
     }
 
     #[test]
@@ -1798,6 +1814,127 @@ mod tests {
                 .map(|axis| resolve_name(&name, axis.axis_name_id()).unwrap())
                 .collect::<Vec<_>>()
         )
+    }
+
+    /// (tag, min, default, max) for each fvar axis.
+    fn fvar_axes(font: &FontRef) -> Vec<(Tag, f64, f64, f64)> {
+        font.fvar()
+            .unwrap()
+            .axes()
+            .unwrap()
+            .iter()
+            .map(|a| {
+                (
+                    a.axis_tag(),
+                    a.min_value().to_f64(),
+                    a.default_value().to_f64(),
+                    a.max_value().to_f64(),
+                )
+            })
+            .collect()
+    }
+
+    /// A source that names an axis in its "Axes" custom parameter keeps that axis even
+    /// when nothing moves along it, and so must we.
+    ///
+    /// <https://github.com/googlefonts/fontc/issues/1990>
+    #[test]
+    fn point_axis_the_source_asked_for_reaches_the_font() {
+        let compile = TestCompile::compile_source("glyphs2/WghtVar_PointAxis.glyphs");
+        let font = compile.font();
+
+        assert_eq!(
+            vec![
+                (Tag::new(b"wght"), 400.0, 400.0, 700.0),
+                (Tag::new(b"ital"), 0.0, 0.0, 0.0),
+            ],
+            fvar_axes(&font)
+        );
+        // ...in STAT and name too, and with an identity avar segment
+        assert_eq!(
+            vec![Tag::new(b"wght"), Tag::new(b"ital")],
+            font.stat()
+                .unwrap()
+                .design_axes()
+                .unwrap()
+                .iter()
+                .map(|a| a.axis_tag())
+                .collect::<Vec<_>>()
+        );
+        let name = font.name().unwrap();
+        assert!(
+            font.fvar()
+                .unwrap()
+                .axes()
+                .unwrap()
+                .iter()
+                .any(|a| resolve_name(&name, a.axis_name_id()).as_deref() == Some("Italic"))
+        );
+    }
+
+    /// A Glyphs 2 source has three axis slots whether it wants them or not. The ones
+    /// it never touched are not axes.
+    #[test]
+    fn inert_axes_the_source_never_named_are_dropped() {
+        let compile = TestCompile::compile_source("glyphs2/WghtVar_ImplicitAxes.glyphs");
+        assert_eq!(
+            vec![(Tag::new(b"wght"), 400.0, 400.0, 700.0)],
+            fvar_axes(&compile.font())
+        );
+    }
+
+    /// The axis reaches as far as its user:design mapping does. Here an instance sits
+    /// at Weight 300, lighter than the lightest master, and that is the axis minimum.
+    ///
+    /// <https://github.com/googlefonts/fontc/issues/1991>
+    #[test]
+    fn axis_range_comes_from_the_mapping_not_the_masters() {
+        let compile = TestCompile::compile_source("glyphs2/WghtVar_InstanceMapping.glyphs");
+        assert_eq!(
+            vec![
+                // masters are at Weight 400 and 700; the Light instance reaches 300
+                (Tag::new(b"wght"), 300.0, 400.0, 700.0),
+                // every master and instance is at Width 100, but the mapping bends it
+                // to design 5, so the axis survives - as a point axis in user space
+                (Tag::new(b"wdth"), 100.0, 100.0, 100.0),
+            ],
+            fvar_axes(&compile.font())
+        );
+    }
+
+    /// An instance can end up outside the axes the other instances defined; varLib
+    /// leaves such an instance out of the variable font entirely.
+    #[test]
+    fn named_instance_outside_the_axes_is_not_in_fvar() {
+        // Light says Width is design 100, the others say 5. The mapping the others won
+        // puts Light at user Width 195, off the end of a Width axis that is only 100.
+        assert_named_instances(
+            "glyphs2/WghtVar_InstanceMapping.glyphs",
+            vec![
+                (
+                    "Regular".to_string(),
+                    vec![("Weight", 400.0), ("Width", 100.0)],
+                ),
+                (
+                    "Bold".to_string(),
+                    vec![("Weight", 700.0), ("Width", 100.0)],
+                ),
+            ],
+        );
+        // ...but it is still a named instance the IR knows about, so --instance can
+        // still build it
+        let compile = TestCompile::compile_source("glyphs2/WghtVar_InstanceMapping.glyphs");
+        assert_eq!(
+            vec!["Light", "Regular", "Bold"],
+            compile
+                .fe_context
+                .static_metadata
+                .get()
+                .named_instances
+                .iter()
+                .map(|ni| ni.name.to_string())
+                .collect::<Vec<_>>()
+        );
     }
 
     fn assert_named_instances(source: &str, expected: Vec<(String, Vec<(&str, f64)>)>) {
@@ -7382,14 +7519,13 @@ mod tests {
         assert!(result.font().table_data(Tag::new(b"fvar")).is_none());
     }
 
-    /// A .glyphs v2 source with no axis declarations gets three *synthetic*
-    /// axes, two of them points. That is the shape that makes glyph-source
-    /// keying interesting: the metadata's default location names all three
-    /// even though only `wght` varies, and the backend looks glyph sources up
-    /// by exactly that key.
+    /// A source can keep an axis that never varies - here a declared `ital` no master
+    /// moves along. That is the shape that makes glyph-source keying interesting: the
+    /// metadata's default location names both axes even though only `wght` varies, and
+    /// the backend looks glyph sources up by exactly that key.
     #[test]
-    fn instance_of_glyphs2_with_synthetic_point_axes() {
-        let result = compile_instance("glyphs2/WghtVar_ImplicitAxes.glyphs", "wght=500");
+    fn instance_of_glyphs2_with_point_axis() {
+        let result = compile_instance("glyphs2/WghtVar_PointAxis.glyphs", "wght=500");
 
         let static_metadata = result.fe_context.static_metadata.get();
         assert_eq!(
@@ -7398,13 +7534,13 @@ mod tests {
                 .iter()
                 .map(|axis| axis.tag)
                 .collect::<Vec<_>>(),
-            vec![Tag::new(b"wght"), Tag::new(b"wdth"), Tag::new(b"XXXX")],
-            "three axes, two of them points"
+            vec![Tag::new(b"wght"), Tag::new(b"ital")],
+            "two axes, one of them a point"
         );
         assert!(static_metadata.axes.is_empty());
         assert_eq!(
             static_metadata.default_location(),
-            &NormalizedLocation::for_pos(&[("wght", 0.0), ("wdth", 0.0), ("XXXX", 0.0)])
+            &NormalizedLocation::for_pos(&[("wght", 0.0), ("ital", 0.0)])
         );
 
         let space = result.fe_context.get_glyph("space");
