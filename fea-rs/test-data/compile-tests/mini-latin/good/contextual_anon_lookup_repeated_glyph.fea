@@ -1,0 +1,16 @@
+# reduced from the ccmp feature of Briem Hand, whose @Markscomb class repeats
+# a glyph and whose two rules share one inline replacement.
+#
+# 'acutecomb' appears twice in the target class, so the rule substitutes it by
+# 'dotbelowcomb' (the later pair wins) and the shadowed 'acutecomb ->
+# ogonekcomb' describes no substitution at all. It must not stop the second
+# rule from reusing the anonymous lookup the first rule created: this compiles
+# to two lookups, not three.
+feature ccmp {
+    lookup t {
+        @m = [acutecomb brevecomb acutecomb];
+        @c = [ogonekcomb dotbelowcomb dotbelowcomb];
+        sub @m @m' by @c;
+        sub a @m' by @c;
+    } t;
+} ccmp;
