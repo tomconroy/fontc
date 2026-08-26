@@ -477,13 +477,22 @@ impl<'a, F: FeatureProvider, V: VariationInfo> CompilationCtx<'a, F, V> {
 
         // fonttools logic here is kind of particular, so let's match it literally
         //https://github.com/fonttools/fonttools/blob/5ae2943a43/Lib/fontTools/feaLib/builder.py#L1239
+        //
+        // note that fonttools compares the whole *set* of active language
+        // systems, and that at the top of a feature block that set is the set
+        // of default language systems (builder.py, start_feature). So in a file
+        // whose only 'languagesystem' statement is 'languagesystem xxxx dflt',
+        // a leading 'script xxxx;' is a no-op: the current script stays 'DFLT'
+        // (which start_feature also assigns), and the rules that follow are
+        // registered under DFLT/dflt rather than under xxxx.
         if self
             .active_feature
             .as_ref()
             .unwrap()
-            .current_system()
-            .map(|langsys| (langsys.script, langsys.language))
-            == Some((script, tags::LANG_DFLT))
+            .active_systems_are_only(LanguageSystem {
+                script,
+                language: tags::LANG_DFLT,
+            })
         {
             return;
         }

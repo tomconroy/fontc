@@ -354,8 +354,18 @@ impl ActiveFeature {
         }
     }
 
-    pub(crate) fn current_system(&self) -> Option<LanguageSystem> {
-        self.current_lang_sys
+    /// `true` if the currently active language systems are exactly `{system}`.
+    ///
+    /// This mirrors fonttools' `Builder.language_systems`, which is a *set*:
+    /// before any `script`/`language` statement in a feature block it is the
+    /// set of default language systems (from the file's `languagesystem`
+    /// statements, or `DFLT dflt` if there are none), and after one it is
+    /// always a single system.
+    pub(crate) fn active_systems_are_only(&self, system: LanguageSystem) -> bool {
+        match self.current_lang_sys {
+            Some(current) => current == system,
+            None => self.default_systems.is_only(&system),
+        }
     }
 
     /// Change the active language system.
