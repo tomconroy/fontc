@@ -37,6 +37,15 @@ impl DefaultLanguageSystems {
         self.items.contains(key)
     }
 
+    /// `true` if `key` is the *only* default language system.
+    ///
+    /// fonttools compares the whole set of currently active language systems
+    /// against a single system when deciding whether a `script` statement is a
+    /// no-op, and at the top of a feature block that set is this one.
+    pub(crate) fn is_only(&self, key: &LanguageSystem) -> bool {
+        self.items.len() == 1 && self.items.contains(key)
+    }
+
     pub fn iter(&self) -> impl Iterator<Item = LanguageSystem> + '_ {
         self.items.iter().copied()
     }

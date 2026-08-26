@@ -1,0 +1,26 @@
+# the other half of fonttools' 'language' statement: when the defaults are
+# excluded it does not merely skip them, it removes any that a previous
+# 'language TRK' had already copied in. So latn/TRK keeps 'two' and 'three'
+# but loses 'one', which is a latn/dflt lookup.
+languagesystem DFLT dflt;
+languagesystem latn dflt;
+languagesystem latn TRK;
+
+feature test {
+    lookup one {
+        script latn;
+        language dflt;
+        sub A by B;
+    } one;
+    lookup two {
+        script latn;
+        language TRK;
+        sub C by D;
+    } two;
+    lookup three {
+        script latn;
+        language dflt;
+        language TRK exclude_dflt;
+        sub E by F;
+    } three;
+} test;
