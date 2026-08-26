@@ -1,0 +1,8 @@
+# A non-default master, disagreeing with the default. fontmake compiles each
+# master and lets varLib merge; we compile the default's and warn about this one.
+languagesystem DFLT dflt;
+languagesystem latn dflt;
+
+feature dlig {
+    substitute plus plus by bar;
+} dlig;

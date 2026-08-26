@@ -715,6 +715,24 @@ mod tests {
     }
 
     #[test]
+    fn compile_fea_of_the_default_master_when_masters_disagree() {
+        // ufo2ft compiles exactly one feature file into a variable font, the
+        // default master's (VariableFeatureCompiler is handed
+        // designSpaceDoc.findDefault()); masters that disagree are not an
+        // error. fea_differ's default master (Regular, deliberately the second
+        // source) has 'liga'; the other master has 'dlig'.
+        let result = TestCompile::compile_source("fea_differ.designspace");
+        let gsub = result.font().gsub().unwrap();
+        let features = gsub.feature_list().unwrap();
+        let tags = features
+            .feature_records()
+            .iter()
+            .map(|rec| rec.feature_tag())
+            .collect::<Vec<_>>();
+        assert_eq!(vec![Tag::new(b"liga")], tags);
+    }
+
+    #[test]
     fn compile_fea_with_includes_no_ir() {
         assert_compiles_with_gpos_and_gsub("fea_include.designspace", |mut args| {
             args.ir_dir = None;
