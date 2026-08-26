@@ -65,12 +65,11 @@ pub enum Error {
     InvalidGlobalMetadata,
     #[error("No default master")]
     NoDefaultMaster,
-    #[error("Missing mapping on {axis_name} for {field} at {value:?}. Mappings {mappings:?}")]
-    MissingMappingForDesignCoord {
+    #[error("Missing mapping on {axis_name} for default at {value:?}. Mappings {mappings:?}")]
+    MissingMappingForUserCoord {
         axis_name: String,
-        field: String,
         mappings: Vec<(UserCoord, DesignCoord)>,
-        value: DesignCoord,
+        value: UserCoord,
     },
     #[error("Invalid tag '{raw_tag}': {cause}")]
     InvalidTag { raw_tag: String, cause: InvalidTag },
