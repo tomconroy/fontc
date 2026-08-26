@@ -2248,6 +2248,7 @@ impl<'a, F: FeatureProvider, V: VariationInfo> CompilationCtx<'a, F, V> {
     ) {
         // the cached reverse map is keyed by GlyphId16, so iteration is in the
         // GID order that `evaluate_predicate` requires.
+        let variation_info = self.variation_info;
         out.extend(super::glyphsapp_syntax_ext::evaluate_predicate(
             predicate,
             self.reverse_glyph_map
@@ -2256,6 +2257,10 @@ impl<'a, F: FeatureProvider, V: VariationInfo> CompilationCtx<'a, F, V> {
                     GlyphIdent::Name(name) => Some((*id, name.as_str())),
                     GlyphIdent::Cid(_) => None,
                 }),
+            // validation rejects a non-'name' attribute when there is no
+            // variation info to answer it, so this cannot silently report every
+            // attribute as unset
+            |glyph, attr| variation_info.and_then(|info| info.glyph_predicate_attr(glyph, attr)),
         ));
     }
 

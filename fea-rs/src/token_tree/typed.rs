@@ -1931,6 +1931,25 @@ impl GlyphsAppPredicateClause {
     }
 }
 
+impl GlyphsAppPredicateOp {
+    /// The operator as it was spelled in the source.
+    pub(crate) fn text(&self) -> &SmolStr {
+        match self {
+            Self::Eq(t) => t.text(),
+            Self::Ne(t) => t.text(),
+            Self::Lt(t) => t.text(),
+            Self::Le(t) => t.text(),
+            Self::Gt(t) => t.text(),
+            Self::Ge(t) => t.text(),
+            Self::BeginsWith(t) => t.text(),
+            Self::EndsWith(t) => t.text(),
+            Self::Contains(t) => t.text(),
+            Self::Like(t) => t.text(),
+            Self::Matches(t) => t.text(),
+        }
+    }
+}
+
 impl GlyphsAppPredicateValue {
     /// The value content, without its surrounding quotes.
     pub(crate) fn text(&self) -> String {

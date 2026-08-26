@@ -12,12 +12,13 @@ use std::{
 pub use feature_variations::FeatureVariationsProvider;
 use log::{debug, error, trace, warn};
 use ordered_float::OrderedFloat;
+use smol_str::SmolStr;
 
 use fea_rs::{
     DiagnosticSet, GlyphMap, Opts, ParseTree,
     compile::{
-        Compilation, FeatureBuilder, FeatureProvider, NopFeatureProvider, PendingLookup,
-        VariationInfo, error::CompilerError,
+        Compilation, FeatureBuilder, FeatureProvider, GlyphPredicateAttr, NopFeatureProvider,
+        PendingLookup, VariationInfo, error::CompilerError,
     },
     parse::{FileSystemResolver, SourceLoadError, SourceResolver},
     typed::{AstNode, LanguageSystem},
@@ -400,6 +401,25 @@ impl VariationInfo for FeaVariationInfo<'_> {
             .iter()
             .map(|(loc, names)| (loc.clone(), names.get(name).copied().unwrap_or_default().0))
             .collect())
+    }
+
+    fn has_glyph_predicate_attrs(&self) -> bool {
+        self.static_metadata.glyph_predicate_attrs.is_some()
+    }
+
+    fn glyph_predicate_attr(&self, glyph: &str, attr: GlyphPredicateAttr) -> Option<SmolStr> {
+        // a glyph that set none of these has no entry at all
+        let attrs = self
+            .static_metadata
+            .glyph_predicate_attrs
+            .as_ref()?
+            .get(glyph)?;
+        match attr {
+            GlyphPredicateAttr::Category => attrs.category.clone(),
+            GlyphPredicateAttr::SubCategory => attrs.sub_category.clone(),
+            GlyphPredicateAttr::Case => attrs.case.clone(),
+            GlyphPredicateAttr::Unicode => attrs.unicode.clone(),
+        }
     }
 }
 

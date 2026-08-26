@@ -20,10 +20,11 @@ use fontir::{
         self, AnchorBuilder, ColorGlyphs, ColorPalettes, Condition, ConditionSet,
         DEFAULT_VENDOR_ID, FEATURE_WRITERS_LIB_KEY, FeatureWriterOptionValue, FeatureWriterSpec,
         GlobalMetric, GlobalMetrics, GlobalMetricsBuilder, GlyphAnchors, GlyphInstance, GlyphOrder,
-        InstanceOverrides, KernGroup, KernSide, KerningInstance, KerningLocations, MetaTableValues,
-        NameBuilder, NameKey, NamedInstance, Paint, PaintGlyph, Panose, PostscriptNames,
-        PostscriptSettings, PreliminaryGdefCategories, Rule, StaticMetadata, StyleMapStyle,
-        Substitution, VariableFeature, reject_duplicate_writers, validate_feature_writer,
+        GlyphPredicateAttrs, InstanceOverrides, KernGroup, KernSide, KerningInstance,
+        KerningLocations, MetaTableValues, NameBuilder, NameKey, NamedInstance, Paint, PaintGlyph,
+        Panose, PostscriptNames, PostscriptSettings, PreliminaryGdefCategories, Rule,
+        StaticMetadata, StyleMapStyle, Substitution, VariableFeature, reject_duplicate_writers,
+        validate_feature_writer,
     },
     orchestration::{Context, Flags, IrWork, WorkId},
     source::Source,
@@ -742,6 +743,10 @@ impl Work<Context, WorkId, Error> for StaticMetadataWork {
         static_metadata.misc.selection_flags = selection_flags;
         static_metadata.misc.feature_generation = feature_writers_from_user_data(&font.user_data)?;
         static_metadata.variations = variations;
+        // always Some for a Glyphs source, even when no glyph sets anything:
+        // it is what tells the FEA compiler that predicate tokens can be
+        // answered here at all
+        static_metadata.glyph_predicate_attrs = Some(make_glyph_predicate_attrs(font));
         // what `names` above already handed NameBuilder, kept so that a pin can
         // rebuild name id 3 with the same string; see `MiscMetadata::raw_vendor_id`
         static_metadata.misc.raw_vendor_id =
@@ -1189,6 +1194,36 @@ fn get_number_values(
         })
         .collect();
     Some(values)
+}
+
+/// What a FEA glyph predicate token may ask about each glyph.
+///
+/// Only glyphs that set at least one attribute get an entry; the rest answer
+/// `None` for everything, which is what glyphsLib compares against (a `GSGlyph`
+/// attribute the file never set stays Python `None`).
+///
+/// `unicode` is glyphsLib's `GSGlyph.unicode`: the glyph's first codepoint,
+/// formatted `%04X`, which is what glyphsLib stores for a Glyphs 3 file
+/// (`classes.py`, `_parse_unicode_dict`). We hold codepoints in a sorted set,
+/// so "first" here is the lowest, which differs from source order only for a
+/// glyph that lists several codepoints out of order.
+fn make_glyph_predicate_attrs(font: &Font) -> BTreeMap<GlyphName, GlyphPredicateAttrs> {
+    font.glyphs
+        .values()
+        .filter_map(|glyph| {
+            let attrs = GlyphPredicateAttrs {
+                category: glyph.source_info.category.clone(),
+                sub_category: glyph.source_info.sub_category.clone(),
+                case: glyph.source_info.case.clone(),
+                unicode: glyph
+                    .unicode
+                    .first()
+                    .map(|cp| SmolStr::new(format!("{cp:04X}"))),
+            };
+            (attrs != GlyphPredicateAttrs::default())
+                .then(|| (GlyphName::new(glyph.name.as_str()), attrs))
+        })
+        .collect()
 }
 
 /// Compute preliminary GDEF glyph category WITHOUT anchor inspection.

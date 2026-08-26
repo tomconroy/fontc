@@ -5,7 +5,8 @@ use std::path::{Path, PathBuf};
 use crate::{
     GlyphMap,
     compile::{
-        Compilation, Compiler, MockVariationInfo, NopFeatureProvider, Opts, error::CompilerError,
+        Compilation, Compiler, GlyphPredicateAttr, MockVariationInfo, NopFeatureProvider, Opts,
+        error::CompilerError,
     },
     util::ttx::{self as test_utils, Filter, Report, TestCase, TestResult},
 };
@@ -142,6 +143,62 @@ fn compile_fea_variable(fea: &str, test_name: &str) -> Compilation {
         .with_variable_info(&var_info)
         .compile()
         .expect("compilation should succeed")
+}
+
+/// Compile with a source that answers glyph predicate attributes, given as
+/// (glyph name, attribute, value) triples, returning the diagnostics on failure.
+fn compile_fea_with_glyph_attrs(
+    fea: &str,
+    test_name: &str,
+    attrs: &[(&str, GlyphPredicateAttr, &str)],
+) -> Result<Compilation, String> {
+    let fea_path = write_temp_fea(fea, test_name);
+    let mut var_info = test_utils::make_var_info();
+    var_info.glyph_predicate_attrs = Some(
+        attrs
+            .iter()
+            .map(|(glyph, attr, value)| (((*glyph).into(), *attr), (*value).into()))
+            .collect(),
+    );
+    Compiler::<'_, NopFeatureProvider, MockVariationInfo>::new(fea_path, &mini_latin_glyph_map())
+        .with_variable_info(&var_info)
+        .compile()
+        .map_err(|err| match err {
+            CompilerError::ValidationFail(errs) | CompilerError::CompilationFail(errs) => {
+                errs.to_string(false)
+            }
+            other => panic!("unexpected compiler error: {other}"),
+        })
+}
+
+// An attribute the source may not have set has no ordering: glyphsLib raises a
+// TypeError comparing Python None with `<`, so we reject the clause rather than
+// invent an answer. (The file-driven bad tests cannot reach this: their source
+// has no glyph attributes at all, so the attribute itself is rejected first.)
+#[test]
+fn glyphs_predicate_ordering_on_attribute_is_rejected() {
+    let err = compile_fea_with_glyph_attrs(
+        "@a = [ $[category < \"M\"] ];\nfeature ss01 { sub a by b; } ss01;\n",
+        "predicate_ordering",
+        &[("a", GlyphPredicateAttr::Category, "Letter")],
+    )
+    .err()
+    .expect("ordering on an attribute should be rejected");
+    assert!(
+        err.contains("'<' is only supported on 'name'"),
+        "expected an ordering diagnostic, got:\n{err}"
+    );
+}
+
+// ... but the same operators are fine on the name, which every glyph has.
+#[test]
+fn glyphs_predicate_ordering_on_name_is_allowed() {
+    compile_fea_with_glyph_attrs(
+        "@a = [ $[name < \"b\"] ];\nfeature ss01 { sub @a by b; } ss01;\n",
+        "predicate_ordering_name",
+        &[],
+    )
+    .expect("ordering on the name compiles");
 }
 
 // Regression test for https://github.com/googlefonts/fontc/issues/1847
@@ -840,14 +897,16 @@ fn predicate_validation_errors(
 // mis-compile) with each diagnostic attached to the offending child, not the
 // whole predicate. Each case is (predicate, test name, expected (child span text, message
 // fragment) pairs):
-// - `category like` is doubly out of scope (Phase 2, fontc#2052): an attribute
-//   error on `category` AND an operator error on `like`.
+// - `category` is a real attribute, but this compilation has no Glyphs.app
+//   source to answer it, and answering "unset" for every glyph would silently
+//   select nothing. (`like` is supported now, so that is the only error here.)
 // - `NAME` is rejected because glyphsLib's object regex is case-sensitive:
 //   only lowercase `name` is a supported attribute.
 // - Mixing `and`/`or` attaches to the connective that breaks the chain.
-// - Unquoted values must be quoted: glyphsLib types some bare values as
-//   booleans or integers rather than strings -- `yes`, `123`, and even `noon`,
-//   whose unanchored boolean regex match reads the leading `no`.
+// - A bare value is a string, as in glyphsLib -- except for the ones glyphsLib
+//   types as a boolean or an integer instead (`yes`, `123`, and even `noon`,
+//   whose unanchored boolean regex match reads the leading `no`), which can
+//   never equal a glyph attribute and so must be quoted.
 // - An empty quoted value is rejected (glyphsLib errors on it too), and under
 //   the substring operators it would match every glyph name.
 #[test]
@@ -858,7 +917,7 @@ fn glyphs_predicate_validation_diagnostics() {
         (
             "$[category like \"Letter\"]",
             "glyphs_predicate_bad",
-            &[("category", "2052"), ("like", "2052")],
+            &[("category", "needs Glyphs.app glyph data")],
         ),
         (
             "$[NAME == \"a\"]",
@@ -871,24 +930,19 @@ fn glyphs_predicate_validation_diagnostics() {
             &[("or", "2052")],
         ),
         (
-            "$[name == sc]",
-            "glyphs_predicate_bare_word",
-            &[("sc", "must be quoted")],
-        ),
-        (
             "$[name == yes]",
             "glyphs_predicate_bare_bool",
-            &[("yes", "must be quoted")],
+            &[("yes", "is a boolean to glyphsLib")],
         ),
         (
             "$[name == 123]",
             "glyphs_predicate_bare_number",
-            &[("123", "must be quoted")],
+            &[("123", "compared as an integer")],
         ),
         (
             "$[name == noon]",
             "glyphs_predicate_bare_bool_prefix",
-            &[("noon", "must be quoted")],
+            &[("noon", "is a boolean to glyphsLib")],
         ),
         (
             "$[name contains \"\"]",

@@ -13,7 +13,7 @@ use smol_str::SmolStr;
 use write_fonts::{read::tables::name::Encoding, types::Tag};
 
 use super::{
-    VariationInfo, glyph_range,
+    GlyphPredicateAttr, VariationInfo, glyph_range,
     tags::{self, WIN_PLATFORM_ID},
 };
 use crate::{
@@ -1267,7 +1267,7 @@ impl<'a, V: VariationInfo> ValidationCtx<'a, V> {
         }
     }
 
-    /// Enforce the Phase 1 subset of Glyphs.app glyph predicates.
+    /// Enforce the supported subset of Glyphs.app glyph predicates.
     ///
     /// The grammar accepts the structural predicate surface; here we reject the
     /// constructs deferred to fontc#2052, attaching each diagnostic to the
@@ -1276,44 +1276,112 @@ impl<'a, V: VariationInfo> ValidationCtx<'a, V> {
     /// [`crate::compile::glyphsapp_syntax_ext::evaluate_predicate`].
     fn validate_glyphs_predicate(&mut self, predicate: &typed::GlyphsAppPredicate) {
         for clause in predicate.clauses() {
-            // glyphsLib's object regex is case-sensitive: `name` is the only
-            // supported object, and `NAME` is a different (unknown) one.
+            // glyphsLib's object regex is case-sensitive: `name` is an object,
+            // `NAME` is a different (unknown) one.
             let attr = clause.attr();
-            if attr.text() != "name" {
+            // `Some(true)` = the glyph name, `Some(false)` = an attribute the
+            // source answers, `None` = already reported as unusable
+            let attr_is_name = if attr.text() == "name" {
+                Some(true)
+            } else if GlyphPredicateAttr::from_token(attr.text()).is_none() {
+                let supported = GlyphPredicateAttr::ALL
+                    .iter()
+                    .map(|attr| attr.name())
+                    .collect::<Vec<_>>()
+                    .join("', '");
                 self.error(
                     attr.range(),
                     format!(
-                        "unsupported glyphs predicate attribute '{}': only 'name' \
-                         is supported (see fontc#2052)",
+                        "unsupported glyphs predicate attribute '{}': only 'name', \
+                         '{supported}' are supported (see fontc#2052)",
                         attr.text()
                     ),
                 );
-            }
+                None
+            } else if !self
+                .variation_info
+                .is_some_and(|info| info.has_glyph_predicate_attrs())
+            {
+                // every attribute but the name is answered by the source, and a
+                // source that has none at all (anything that is not a Glyphs.app
+                // file) must not quietly answer "unset" for all of them
+                self.error(
+                    attr.range(),
+                    format!(
+                        "glyphs predicate attribute '{}' needs Glyphs.app glyph data, \
+                         which this compilation does not have",
+                        attr.text()
+                    ),
+                );
+                None
+            } else {
+                Some(false)
+            };
             use typed::GlyphsAppPredicateOp as Op;
             match clause.op() {
-                Op::BeginsWith(_)
-                | Op::EndsWith(_)
-                | Op::Contains(_)
-                | Op::Eq(_)
-                | Op::Ne(_)
-                | Op::Lt(_)
-                | Op::Le(_)
-                | Op::Gt(_)
-                | Op::Ge(_) => (),
-                op @ (Op::Like(_) | Op::Matches(_)) => self.error(
+                Op::BeginsWith(_) | Op::EndsWith(_) | Op::Contains(_) | Op::Eq(_) | Op::Ne(_) => (),
+                // an attribute the source may not have set is Python `None`,
+                // which raises a TypeError when ordered against a string; only
+                // `name`, which every glyph has, can be ordered
+                op @ (Op::Lt(_) | Op::Le(_) | Op::Gt(_) | Op::Ge(_))
+                    if attr_is_name == Some(false) =>
+                {
+                    self.error(
+                        op.range(),
+                        format!(
+                            "'{}' is only supported on 'name' in a glyphs predicate: an \
+                             attribute the source did not set has no ordering \
+                             (see fontc#2052)",
+                            op.text()
+                        ),
+                    );
+                }
+                Op::Lt(_) | Op::Le(_) | Op::Gt(_) | Op::Ge(_) => (),
+                Op::Like(_) => self.validate_glyphs_predicate_like(&clause),
+                op @ Op::Matches(_) => self.error(
                     op.range(),
-                    "unsupported glyphs predicate operator (see fontc#2052)",
+                    "unsupported glyphs predicate operator 'matches' (see fontc#2052)",
                 ),
             }
             use typed::GlyphsAppPredicateValue as Value;
             let value = clause.value();
-            if matches!(value, Value::Bare(_) | Value::Number(_)) {
-                self.error(
+            match &value {
+                // glyphsLib types a bare value that starts with a digit as an
+                // integer, which then compares unequal to every attribute
+                // string (or raises); we will not reproduce that silently
+                Value::Number(_) => self.error(
                     value.range(),
-                    "glyphs predicate values must be quoted (see fontc#2052)",
+                    "an unquoted number in a glyphs predicate is compared as an \
+                     integer by glyphsLib, and never equals a glyph attribute: \
+                     quote it to compare it as text",
+                ),
+                // ... nor the same for the words it types as booleans. Note
+                // that glyphsLib's match is a *prefix* one, so `noon` is False
+                // and not the string "noon".
+                Value::Bare(token) if is_glyphs_boolean_word(token.text()) => self.error(
+                    value.range(),
+                    format!(
+                        "the unquoted value '{}' is a boolean to glyphsLib, and never \
+                         equals a glyph attribute: quote it to compare it as text",
+                        token.text()
+                    ),
+                ),
+                _ if value.text().is_empty() => {
+                    self.error(value.range(), "empty value in glyphs predicate")
+                }
+                _ => (),
+            }
+
+            // `nil` is not a null literal in a Glyphs predicate: glyphsLib
+            // types it as the plain string "nil" (its `\w+` branch), so
+            // `unicode != nil` is true of every glyph, codepoint or not. That
+            // is what we compile, but it is almost never what was meant.
+            if matches!(value, Value::Bare(_)) && value.text() == "nil" {
+                self.warning(
+                    value.range(),
+                    "'nil' in a glyphs predicate is the string \"nil\", not a null: \
+                     glyphsLib compares it as text, so this clause matches every glyph",
                 );
-            } else if value.text().is_empty() {
-                self.error(value.range(), "empty value in glyphs predicate");
             }
         }
 
@@ -1331,6 +1399,25 @@ impl<'a, V: VariationInfo> ValidationCtx<'a, V> {
                 ),
                 Some(_) => (),
             }
+        }
+    }
+
+    /// The part of a `like` pattern we do not implement.
+    ///
+    /// glyphsLib's `like` is `fnmatch.fnmatchcase`, whose patterns are `*`, `?`
+    /// and character classes (`[abc]`, `[!a-z]`). We match `*` and `?` exactly;
+    /// a class would need Python's own bracket-parsing rules (empty classes,
+    /// unclosed brackets, `-` placement) to be reproduced faithfully, so a
+    /// pattern that opens one is rejected rather than guessed at. No real
+    /// source in the Google Fonts corpus uses one.
+    fn validate_glyphs_predicate_like(&mut self, clause: &typed::GlyphsAppPredicateClause) {
+        let value = clause.value();
+        if value.text().contains('[') {
+            self.error(
+                value.range(),
+                "character classes ('[...]') in a glyphs predicate 'like' pattern \
+                 are not supported (see fontc#2052)",
+            );
         }
     }
 
@@ -1628,9 +1715,45 @@ fn validate_os2_family_class(raw: u16) -> Result<u16, (u8, u8)> {
     }
 }
 
+/// Whether glyphsLib would type this bare predicate value as a boolean.
+///
+/// `tokens.py`'s `_parse_value` matches `(?i)\s*(yes|true)` and
+/// `(?i)\s*(no|false)` with `re.match`, which is a *prefix* match, so `noon` is
+/// `False` rather than the string "noon". Every one of these compares unequal
+/// to any glyph attribute, so we reject them all rather than silently compile a
+/// clause that can only ever be false (or, for `beginswith` and friends, raise
+/// in glyphsLib).
+fn is_glyphs_boolean_word(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    ["yes", "true", "no", "false"]
+        .iter()
+        .any(|word| lower.starts_with(word))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn glyphs_boolean_words() {
+        // the prefix match is glyphsLib's, quirks and all: `noon` and
+        // `notdef` are `False` to it, not strings
+        for boolean in [
+            "yes",
+            "YES",
+            "true",
+            "no",
+            "false",
+            "noon",
+            "notdef",
+            "yesterday",
+        ] {
+            assert!(is_glyphs_boolean_word(boolean), "{boolean}");
+        }
+        for string in ["nil", "lower", "upper", "Letter", "n", "null"] {
+            assert!(!is_glyphs_boolean_word(string), "{string}");
+        }
+    }
 
     #[test]
     fn os2_family_class() {

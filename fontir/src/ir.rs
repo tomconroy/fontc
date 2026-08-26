@@ -43,9 +43,10 @@ pub use feature_writers::{
 };
 pub use path_builder::GlyphPathBuilder;
 pub use static_metadata::{
-    Condition, ConditionSet, GdefCategories, InstanceOverrides, MetaTableValues, MiscMetadata,
-    NameKey, NamedInstance, Panose, PostscriptNames, PostscriptSettings, PreliminaryGdefCategories,
-    Rule, StaticMetadata, StyleMapStyle, Substitution, VariableFeature,
+    Condition, ConditionSet, GdefCategories, GlyphPredicateAttrs, InstanceOverrides,
+    MetaTableValues, MiscMetadata, NameKey, NamedInstance, Panose, PostscriptNames,
+    PostscriptSettings, PreliminaryGdefCategories, Rule, StaticMetadata, StyleMapStyle,
+    Substitution, VariableFeature,
 };
 
 pub const DEFAULT_VENDOR_ID: &str = "NONE";
