@@ -13,5 +13,6 @@ pub use font::{
     Anchor, Axis, AxisRule, Color, ColorStop, Component, CustomParameters, FeatureSnippet, Font,
     FontMaster, Glyph, Instance, InstanceType, Layer, LayerAttributes, NameTableEntry, Node,
     NodeType, Path, Shape, ShapeAttributes, glyphs_to_opentype_lang_id,
+    master_style_map_family_name,
 };
 pub use plist::Plist;

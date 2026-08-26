@@ -31,6 +31,7 @@ use fontir::{
 use glyphs_reader::{
     Font, FontMaster, Instance, InstanceType, Layer, Plist,
     glyphdata::{Category, Subcategory},
+    master_style_map_family_name,
 };
 use indexmap::IndexMap;
 use ordered_float::OrderedFloat;
@@ -272,13 +273,14 @@ fn names(font: &Font, flags: SelectionFlags) -> HashMap<NameKey, String> {
     };
     builder.add(NameId::SUBFAMILY_NAME, subfamily.to_string());
 
-    // Family name needs to include style, with some mutilation (drop last Regular, Bold, Italic)
-    // <https://github.com/googlefonts/glyphsLib/blob/74c63244fdbef1da540d646b0784ae6d2c3ca834/Lib/glyphsLib/builder/names.py#L92>
+    // The family name takes on whatever the default master's style name has
+    // left to say once the style linking has said its piece
+    // <https://github.com/googlefonts/glyphsLib/blob/6.13.1/Lib/glyphsLib/builder/names.py#L21-L42>
     let original_family = builder
         .get(NameId::FAMILY_NAME)
         .map(|s| s.to_string())
         .unwrap_or_default();
-    let family = NameBuilder::make_family_name(&original_family, &font.default_master().name, true);
+    let family = master_style_map_family_name(&original_family, font.default_master());
     builder.add(NameId::FAMILY_NAME, family.clone());
 
     if let Some(typographic_family) = &builder
