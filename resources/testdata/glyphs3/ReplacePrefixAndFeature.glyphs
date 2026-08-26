@@ -1,0 +1,168 @@
+{
+.appVersion = "3343";
+.formatVersion = 3;
+axes = (
+{
+name = Weight;
+tag = wght;
+}
+);
+classes = (
+{
+code = "f i a";
+name = Letters;
+}
+);
+customParameters = (
+{
+name = "Variable Font Origin";
+value = "REG-MASTER-ID";
+},
+{
+name = "Replace Prefix";
+value = "Positioning;lookup PositioningA {\012    pos a 999;\012} PositioningA;";
+}
+);
+featurePrefixes = (
+{
+automatic = 1;
+code = "lookup PositioningA {
+    pos a 10;
+} PositioningA;";
+name = Positioning;
+},
+{
+code = "lookup PositioningB {
+    pos a 20;
+} PositioningB;";
+name = Untouched;
+}
+);
+features = (
+{
+automatic = 1;
+code = "sub f i by f_i;";
+tag = liga;
+},
+{
+code = "sub a by a.alt;";
+tag = salt;
+}
+);
+fontMaster = (
+{
+axesValues = (
+700
+);
+customParameters = (
+{
+name = "Replace Prefix";
+value = "Positioning;lookup PositioningA {\012    pos a 40;\012} PositioningA;";
+}
+);
+id = "BOLD-MASTER-ID";
+name = Bold;
+},
+{
+axesValues = (
+400
+);
+customParameters = (
+{
+name = "Replace Prefix";
+value = "Positioning;lookup PositioningA {\012    pos a 30;\012} PositioningA;";
+},
+{
+name = "Replace Feature";
+value = "liga;sub f i by f_i;\012sub i f by f_i;";
+}
+);
+id = "REG-MASTER-ID";
+name = Regular;
+}
+);
+glyphs = (
+{
+glyphname = a;
+layers = (
+{
+layerId = "BOLD-MASTER-ID";
+width = 500;
+},
+{
+layerId = "REG-MASTER-ID";
+width = 500;
+}
+);
+unicode = 97;
+},
+{
+glyphname = f;
+layers = (
+{
+layerId = "BOLD-MASTER-ID";
+width = 500;
+},
+{
+layerId = "REG-MASTER-ID";
+width = 500;
+}
+);
+unicode = 102;
+},
+{
+glyphname = i;
+layers = (
+{
+layerId = "BOLD-MASTER-ID";
+width = 500;
+},
+{
+layerId = "REG-MASTER-ID";
+width = 500;
+}
+);
+unicode = 105;
+},
+{
+glyphname = f_i;
+layers = (
+{
+layerId = "BOLD-MASTER-ID";
+width = 500;
+},
+{
+layerId = "REG-MASTER-ID";
+width = 500;
+}
+);
+},
+{
+glyphname = "a.alt";
+layers = (
+{
+layerId = "BOLD-MASTER-ID";
+width = 500;
+},
+{
+layerId = "REG-MASTER-ID";
+width = 500;
+}
+);
+}
+);
+instances = (
+{
+axesValues = (
+400
+);
+instanceInterpolations = {
+"REG-MASTER-ID" = 1;
+};
+name = Regular;
+}
+);
+unitsPerEm = 1000;
+versionMajor = 1;
+versionMinor = 100;
+}

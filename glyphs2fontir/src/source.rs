@@ -358,6 +358,12 @@ fn to_ir_panose(raw: &[i64]) -> Panose {
 /// and `widthClass` are blacklisted out of the instance lib entirely
 /// (`constants.py:77-88`); the axis mapping decides those.
 ///
+/// `Replace Feature`/`Prefix` stay on that list *for instances only*: a
+/// master's copies are honored, but only the default master's, because those
+/// rewrite the one feature file fontc compiles (see `FeatureReplacements` in
+/// glyphs-reader). Honoring an instance's would mean rewriting features at the
+/// pin, which needs the same merge machinery we lack for the other masters.
+///
 /// <https://github.com/googlefonts/glyphsLib/blob/main/Lib/glyphsLib/builder/custom_params.py#L314-L448>
 fn instance_overrides(inst: &Instance) -> InstanceOverrides {
     let params = &inst.custom_parameters;

@@ -1395,6 +1395,11 @@ impl RawCustomParameters {
                     Ok(s) => params.name_table_entries.push(s),
                     Err(e) => log::warn!("bad 'Name Table Entry': {e}"),
                 },
+                // Handled where the feature text is built, from the *default*
+                // master's copies only; see [`FeatureReplacements`]. An
+                // instance's copies stay unsupported -- that is instancing
+                // territory (see `instance_overrides` in glyphs2fontir).
+                "Replace Prefix" | "Replace Feature" => (),
                 _ => log_once_warn!("unknown custom parameter '{name}'"),
             }
         }
@@ -3460,6 +3465,173 @@ pub fn glyphs_to_opentype_lang_id(lang: &str) -> Option<u16> {
         .map(|idx| GLYPHS_TO_OPENTYPE_LANGUAGE_ID[idx].1 as u16)
 }
 
+/// One master's `Replace Prefix` and `Replace Feature` custom parameters.
+///
+/// Line numbers below are glyphsLib 6.13.1, as shipped with fontmake 3.12.1.
+///
+/// glyphsLib applies these to the feature text it has just written for *that
+/// master's* UFO: `to_ufo_master_features` then `to_ufo_custom_params(ufo,
+/// master)`, in that order and for that reason
+/// (builder/builders.py:251-256). The font-level copies of the same parameters
+/// do nothing, because `to_ufo_custom_params(ufo, font)` runs earlier, in
+/// `to_ufo_font_attributes` (builder/font.py:60), when the UFO has no feature
+/// text yet and both handlers no-op on empty text
+/// (builder/custom_params.py:975-977 returns early; `replace_feature` on ""
+/// matches nothing).
+///
+/// Only the *default* master's replacements reach a fontc-built font: fontc
+/// compiles one feature file, as ufo2ft does, and the one ufo2ft compiles is
+/// the default source's. See [`Font::try_from`], and [`FeatureWork`] in
+/// ufo2fontir for the designspace counterpart of the same rule.
+///
+/// <https://github.com/googlefonts/glyphsLib/blob/682ff4b177/Lib/glyphsLib/builder/custom_params.py#L966-L1012>
+///
+/// [`FeatureWork`]: https://github.com/googlefonts/fontc/blob/main/ufo2fontir/src/source.rs
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct FeatureReplacements {
+    /// Prefix name -> replacement code, the map `ReplacePrefixParamHandler`
+    /// builds; a repeated name keeps the last value, as its own comment says
+    /// (custom_params.py:968-973).
+    prefixes: BTreeMap<String, String>,
+    /// Feature tag -> replacement *body*.
+    ///
+    /// `ReplaceFeatureParamHandler` rewrites the whole feature text once per
+    /// parameter (custom_params.py:996-1001) and `replace_feature`'s regex
+    /// always hits the first `feature <tag> {` block, `count=1`
+    /// (builder/features.py:294-308), so a second parameter for the same tag
+    /// overwrites what the first one wrote: last wins here too.
+    ///
+    /// We match the block structurally where glyphsLib matches it with a
+    /// regex, which differs in one pathological case: a `feature <tag> { ... }
+    /// <tag>;` block written *inside* a prefix's code would be the first
+    /// textual match there and is not a candidate here. Glyphs writes feature
+    /// blocks as features.
+    features: BTreeMap<String, String>,
+}
+
+impl FeatureReplacements {
+    /// The replacements one master's custom parameters ask for.
+    ///
+    /// Disabled parameters are skipped: fontmake builds are `minimal`, and
+    /// there `GlyphsObjectProxy` never even records them
+    /// (custom_params.py:94-97, and :1109-1112 for where `minimal` comes from).
+    fn new(params: &RawCustomParameters) -> Result<Self, Error> {
+        let mut result = Self::default();
+        for param in &params.0 {
+            if param.taken() || param.disabled == Some(true) {
+                continue;
+            }
+            let dest = match param.name.as_str() {
+                "Replace Prefix" => &mut result.prefixes,
+                "Replace Feature" => &mut result.features,
+                _ => continue,
+            };
+            let (target, code) = split_replacement(&param.name, &param.value)?;
+            dest.insert(target, code);
+        }
+        Ok(result)
+    }
+}
+
+/// Split a `Replace Prefix`/`Replace Feature` value into its target and its code.
+///
+/// glyphsLib does `re.split(r"\s*;\s*", value, maxsplit=1)` and unpacks the
+/// result into two names (custom_params.py:969-970 and :997), so a value with
+/// no `;` raises `ValueError` and the build stops. We stop too rather than
+/// guess what was meant.
+fn split_replacement(param: &str, value: &Plist) -> Result<(String, String), Error> {
+    let value = value
+        .as_str()
+        .ok_or_else(|| Error::BadValue(format!("'{param}' must be a string, got {value:?}")))?;
+    let semicolon = value.find(';').ok_or_else(|| {
+        Error::BadValue(format!(
+            "'{param}' must be '<target>;<code>', but '{value}' has no ';'"
+        ))
+    })?;
+    // the `\s*` on either side of the `;` in glyphsLib's pattern
+    Ok((
+        value[..semicolon].trim_end().to_string(),
+        value[semicolon + 1..].trim_start().to_string(),
+    ))
+}
+
+/// The three lists a .glyphs file's feature text is built from.
+#[derive(Clone, Copy)]
+struct RawFeatures<'a> {
+    classes: &'a [RawFeature],
+    prefixes: &'a [RawFeature],
+    features: &'a [RawFeature],
+}
+
+/// The FEA snippets of a font, with one master's replacements applied.
+///
+/// Mirrors `_to_ufo_features` (builder/features.py:83-190), which emits a
+/// snippet per class, prefix and feature.
+fn build_features(
+    raw: RawFeatures,
+    replacements: &FeatureReplacements,
+) -> Result<Vec<FeatureSnippet>, Error> {
+    let mut snippets = Vec::new();
+    for class in raw.classes {
+        // `replace_prefixes` only walks `font.featurePrefixes`
+        // (features.py:334-338), so a class is never a target
+        snippets.push(class.class_to_feature()?);
+    }
+    for prefix in raw.prefixes {
+        snippets.push(prefix.prefix_to_feature(replacements)?);
+    }
+    let mut replaced: HashSet<&str> = HashSet::new();
+    for feature in raw.features {
+        let tag = feature.name()?;
+        // `count=1`, on text that omits the blocks a `minimal` build drops
+        // (features.py:126-129), so only the first *enabled* block with this
+        // tag is rewritten
+        let body = match replacements.features.get(tag) {
+            Some(body) if !feature.disabled() && replaced.insert(tag) => Some(body.as_str()),
+            _ => None,
+        };
+        snippets.push(feature.raw_feature_to_feature(body)?);
+    }
+    Ok(snippets)
+}
+
+/// A master's name, falling back to its id when it is unnamed, for log messages.
+fn master_name(master: &RawFontMaster) -> &str {
+    master.name.as_deref().unwrap_or(&master.id)
+}
+
+/// The masters whose feature text differs from the default master's, named, in
+/// source order.
+///
+/// Only their `Replace Prefix`/`Replace Feature` can make it differ -- every
+/// other input to the text is font-wide -- but two different sets of
+/// replacements can still land on the same text, so this compares the text
+/// itself rather than the parameters.
+///
+/// Non-empty means we are building something fontmake would not: it compiles
+/// each master's features and lets varLib merge the layout tables, so values
+/// the masters disagree about become variations there and constants here. That
+/// merge is what fontc cannot follow; see [`FeatureReplacements`].
+fn masters_with_differing_features<'a>(
+    masters: &'a [RawFontMaster],
+    replacements: &[FeatureReplacements],
+    default_master_idx: usize,
+    default_replacements: &FeatureReplacements,
+    default_features: &[FeatureSnippet],
+    raw: RawFeatures,
+) -> Result<Vec<&'a str>, Error> {
+    let mut differing = Vec::new();
+    for (idx, master) in masters.iter().enumerate() {
+        if idx == default_master_idx || replacements[idx] == *default_replacements {
+            continue;
+        }
+        if build_features(raw, &replacements[idx])? != default_features {
+            differing.push(master_name(master));
+        }
+    }
+    Ok(differing)
+}
+
 impl RawFeature {
     // https://github.com/googlefonts/glyphsLib/blob/24b4d340e4c82948ba121dcfe563c1450a8e69c9/Lib/glyphsLib/builder/features.py#L43
     fn autostr(&self) -> &str {
@@ -3510,9 +3682,22 @@ impl RawFeature {
     }
 
     // https://github.com/googlefonts/glyphsLib/blob/24b4d340e4c82948ba121dcfe563c1450a8e69c9/Lib/glyphsLib/builder/features.py#L90
-    fn prefix_to_feature(&self) -> Result<FeatureSnippet, Error> {
+    fn prefix_to_feature(
+        &self,
+        replacements: &FeatureReplacements,
+    ) -> Result<FeatureSnippet, Error> {
         let name = self.name.as_deref().unwrap_or_default();
-        let code = format!("# Prefix: {}\n{}{}", name, self.autostr(), self.code);
+        // `Replace Prefix` swaps the code and nothing else: glyphsLib parses the
+        // feature text back into a temporary font, assigns `prefix.code`, and
+        // re-emits (features.py:315-340), so the `# Prefix:` header and the
+        // `# automatic` marker are written again from the prefix's own fields
+        // (features.py:100-108). A name with no prefix to match is ignored.
+        let code = replacements
+            .prefixes
+            .get(name)
+            .map(String::as_str)
+            .unwrap_or(&self.code);
+        let code = format!("# Prefix: {}\n{}{}", name, self.autostr(), code);
         Ok(FeatureSnippet::new(code, self.disabled()))
     }
 
@@ -3529,16 +3714,28 @@ impl RawFeature {
     }
 
     // https://github.com/googlefonts/glyphsLib/blob/24b4d340e4c82948ba121dcfe563c1450a8e69c9/Lib/glyphsLib/builder/features.py#L113
-    fn raw_feature_to_feature(&self) -> Result<FeatureSnippet, Error> {
+    fn raw_feature_to_feature(&self, replacement: Option<&str>) -> Result<FeatureSnippet, Error> {
         let name = self.name()?;
-        let insert_mark = self.insert_mark_if_manual_kern_feature();
-        let code = format!(
-            "feature {name} {{\n{}{}{}{insert_mark}\n}} {name};",
-            self.autostr(),
-            self.feature_names(),
-            self.code
-        );
-        Ok(FeatureSnippet::new(code, self.disabled()))
+        let body = match replacement {
+            // `_replace_block` replaces everything between `feature <tag> {\n`
+            // and the line `} <tag>;`, and newline-terminates the replacement
+            // first (features.py:294-308) -- so unlike `Replace Prefix` this
+            // takes the `# automatic` marker, the `featureNames` block and the
+            // manual-kern insert mark with it.
+            Some(repl) if repl.ends_with('\n') => repl.to_string(),
+            Some(repl) => format!("{repl}\n"),
+            None => format!(
+                "{}{}{}{}\n",
+                self.autostr(),
+                self.feature_names(),
+                self.code,
+                self.insert_mark_if_manual_kern_feature()
+            ),
+        };
+        Ok(FeatureSnippet::new(
+            format!("feature {name} {{\n{body}}} {name};"),
+            self.disabled(),
+        ))
     }
 
     //https://github.com/googlefonts/glyphsLib/blob/c4db6b981d577f4/Lib/glyphsLib/builder/features.py#L180
@@ -3994,15 +4191,40 @@ impl TryFrom<RawFont> for Font {
             glyphs.insert(glyph.name.clone(), glyph);
         }
 
-        let mut features = Vec::new();
-        for class in from.classes {
-            features.push(class.class_to_feature()?);
-        }
-        for prefix in from.feature_prefixes {
-            features.push(prefix.prefix_to_feature()?);
-        }
-        for feature in from.features {
-            features.push(feature.raw_feature_to_feature()?);
+        // Exactly one feature file reaches the font, so exactly one master's
+        // `Replace Prefix`/`Replace Feature` can be honored: the default's,
+        // which is the source ufo2ft compiles (see [`FeatureReplacements`]).
+        let replacements = from
+            .font_master
+            .iter()
+            .map(|master| FeatureReplacements::new(&master.custom_parameters))
+            .collect::<Result<Vec<_>, Error>>()?;
+        // a font with no masters at all appears in tests; it has no default
+        let default_replacements = replacements
+            .get(default_master_idx)
+            .cloned()
+            .unwrap_or_default();
+        let raw_features = RawFeatures {
+            classes: &from.classes,
+            prefixes: &from.feature_prefixes,
+            features: &from.features,
+        };
+        let features = build_features(raw_features, &default_replacements)?;
+
+        let differing = masters_with_differing_features(
+            &from.font_master,
+            &replacements,
+            default_master_idx,
+            &default_replacements,
+            &features,
+            raw_features,
+        )?;
+        if !differing.is_empty() {
+            warn!(
+                "Compiling only the default master's features ({}); the feature text of {} differs (Replace Prefix/Replace Feature) and is ignored",
+                master_name(&from.font_master[default_master_idx]),
+                differing.join(", ")
+            );
         }
 
         let units_per_em = from.units_per_em.ok_or(Error::NoUnitsPerEm)?;
@@ -5406,7 +5628,7 @@ etc;
 
         assert!(
             feature
-                .raw_feature_to_feature()
+                .raw_feature_to_feature(None)
                 .unwrap()
                 .content
                 .contains("# Automatic Code")
@@ -5423,7 +5645,7 @@ etc;
 
         assert!(
             !feature
-                .raw_feature_to_feature()
+                .raw_feature_to_feature(None)
                 .unwrap()
                 .content
                 .contains("# Automatic Code")
@@ -7255,5 +7477,166 @@ mode = append;
             writers[0].get("class").and_then(Plist::as_str),
             Some("KernFeatureWriter")
         );
+    }
+}
+
+#[cfg(test)]
+mod replace_prefix_and_feature_tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    fn glyphs3_dir() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../resources/testdata/glyphs3")
+    }
+
+    fn load() -> Font {
+        Font::load(&glyphs3_dir().join("ReplacePrefixAndFeature.glyphs")).unwrap()
+    }
+
+    fn feature_text(font: &Font) -> String {
+        font.features
+            .iter()
+            .filter_map(FeatureSnippet::str_if_enabled)
+            .collect::<Vec<_>>()
+            .join("\n\n")
+    }
+
+    /// The default master's `Replace Prefix` and `Replace Feature` are applied,
+    /// and nothing else is.
+    ///
+    /// Oracle: `glyphsLib.to_designspace(font, minimal=True)` on this same
+    /// fixture, `ds.findDefault().font.features.text`, byte for byte.
+    /// glyphsLib 6.13.1, as shipped with fontmake 3.12.1.
+    #[test]
+    fn applies_the_default_masters_replacements() {
+        let font = load();
+        assert_eq!(
+            "Regular",
+            font.default_master().name,
+            "not the first master"
+        );
+        assert_eq!(
+            // `Positioning` gets the default master's code and keeps its
+            // `# Prefix:` header and `# automatic` marker; `Untouched` and the
+            // `Letters` class are left alone; `liga`'s whole *body* is
+            // replaced, `# automatic` included; `salt` is left alone. The Bold
+            // master's `pos a 40` and the font-level `pos a 999` are nowhere.
+            concat!(
+                "@Letters = [ f i a\n];\n",
+                "\n",
+                "# Prefix: Positioning\n",
+                "# automatic\n",
+                "lookup PositioningA {\n",
+                "    pos a 30;\n",
+                "} PositioningA;\n",
+                "\n",
+                "# Prefix: Untouched\n",
+                "lookup PositioningB {\n",
+                "    pos a 20;\n",
+                "} PositioningB;\n",
+                "\n",
+                "feature liga {\n",
+                "sub f i by f_i;\n",
+                "sub i f by f_i;\n",
+                "} liga;\n",
+                "\n",
+                "feature salt {\n",
+                "sub a by a.alt;\n",
+                "} salt;",
+            ),
+            feature_text(&font)
+        );
+    }
+
+    /// Every master whose replacements would give it different feature text is
+    /// named in the one warning we emit; the default master never is.
+    #[test]
+    fn names_the_masters_it_ignores() {
+        let raw = RawFont::load(&glyphs3_dir().join("ReplacePrefixAndFeature.glyphs")).unwrap();
+        let replacements = raw
+            .font_master
+            .iter()
+            .map(|master| FeatureReplacements::new(&master.custom_parameters))
+            .collect::<Result<Vec<_>, Error>>()
+            .unwrap();
+        // Regular is the 'Variable Font Origin', Bold is source 0
+        let default_master_idx = 1;
+        let raw_features = RawFeatures {
+            classes: &raw.classes,
+            prefixes: &raw.feature_prefixes,
+            features: &raw.features,
+        };
+        let default_features =
+            build_features(raw_features, &replacements[default_master_idx]).unwrap();
+        assert_eq!(
+            vec!["Bold"],
+            masters_with_differing_features(
+                &raw.font_master,
+                &replacements,
+                default_master_idx,
+                &replacements[default_master_idx],
+                &default_features,
+                raw_features,
+            )
+            .unwrap()
+        );
+    }
+
+    /// A master that asks for the code a prefix already has changes nothing, so
+    /// it is not worth warning about.
+    #[test]
+    fn a_replacement_that_changes_nothing_is_not_named() {
+        let raw = RawFont::load(&glyphs3_dir().join("ReplacePrefixAndFeature.glyphs")).unwrap();
+        let mut replacements = vec![FeatureReplacements::default(); raw.font_master.len()];
+        replacements[0].prefixes.insert(
+            "Positioning".to_string(),
+            raw.feature_prefixes[0].code.clone(),
+        );
+        let raw_features = RawFeatures {
+            classes: &raw.classes,
+            prefixes: &raw.feature_prefixes,
+            features: &raw.features,
+        };
+        let default_features = build_features(raw_features, &replacements[1]).unwrap();
+        assert!(
+            masters_with_differing_features(
+                &raw.font_master,
+                &replacements,
+                1,
+                &replacements[1],
+                &default_features,
+                raw_features,
+            )
+            .unwrap()
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn splits_on_the_first_semicolon_only() {
+        // `re.split(r"\s*;\s*", value, maxsplit=1)`: whitespace either side of
+        // the separator goes, everything after the first ';' is code
+        assert_eq!(
+            ("liga".to_string(), "sub f i by f_i;".to_string()),
+            split_replacement(
+                "Replace Feature",
+                &Plist::String("liga ;\n sub f i by f_i;".into())
+            )
+            .unwrap()
+        );
+    }
+
+    #[test]
+    fn a_value_with_no_semicolon_is_an_error() {
+        // glyphsLib unpacks the split into two names, so this is a ValueError
+        // there; we refuse rather than guess
+        assert!(matches!(
+            split_replacement("Replace Prefix", &Plist::String("Positioning".into())),
+            Err(Error::BadValue(_))
+        ));
+        assert!(matches!(
+            split_replacement("Replace Prefix", &Plist::Integer(7)),
+            Err(Error::BadValue(_))
+        ));
     }
 }
