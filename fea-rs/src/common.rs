@@ -117,10 +117,24 @@ impl GlyphOrClass {
 
     /// Combine the glyphs from `other` into this value.
     ///
-    /// After this call, `self` contains glyphs from both operands (appended
-    /// in order) as a `Class` variant.
+    /// After this call, `self` contains the union of the glyphs of both
+    /// operands, in order of first appearance, as a `Class` variant.
+    ///
+    /// Duplicates are dropped. This matters because the result is an *input
+    /// sequence position* of a merged contextual rule, and a position that
+    /// contains more than one glyph disqualifies the whole lookup from being
+    /// encoded as a format 1 (single-glyph) subtable; a repeated glyph must
+    /// not be what makes that decision. fonttools does the same thing, by
+    /// merging the two positions as a `set`: see
+    /// `Builder._add_contextual_rule` in `fontTools/feaLib/builder.py`.
     pub(crate) fn extend(&mut self, other: &GlyphOrClass) {
-        *self = GlyphOrClass::Class(self.iter().chain(other.iter()).collect());
+        let mut seen = GlyphSet::default();
+        *self = GlyphOrClass::Class(
+            self.iter()
+                .chain(other.iter())
+                .filter(|gid| seen.insert(*gid))
+                .collect(),
+        );
     }
 
     pub(crate) fn iter(&self) -> impl Iterator<Item = GlyphId16> + '_ {
