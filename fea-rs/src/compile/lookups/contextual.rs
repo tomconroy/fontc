@@ -184,14 +184,22 @@ impl ContextualLookupBuilder<SubstitutionLookup> {
         target: GlyphOrClass,
         replacement: GlyphOrClass,
     ) -> LookupId {
+        // fonttools zips the target and the replacement into a map before it
+        // goes looking for a lookup to reuse, so a glyph that appears more than
+        // once in the target class is compared only in its final form -- and a
+        // class replaced by a single glyph is compared for every one of its
+        // members, not just the first.
+        //https://github.com/fonttools/fonttools/blob/5ae2943a43/Lib/fontTools/feaLib/ast.py#L1455
+        let mapping = target
+            .iter()
+            .zip(replacement.into_iter_for_target())
+            .collect::<BTreeMap<_, _>>();
         let (lookup, id) = self.find_or_create_anon_lookup(
             |existing| match existing {
-                SubstitutionLookup::Single(subtables) => subtables.subtables.iter().all(|subt| {
-                    target
-                        .iter()
-                        .zip(replacement.iter())
-                        .all(|(a, b)| subt.can_add(a, b))
-                }),
+                SubstitutionLookup::Single(subtables) => subtables
+                    .subtables
+                    .iter()
+                    .all(|subt| mapping.iter().all(|(a, b)| subt.can_add(*a, *b))),
                 _ => false,
             },
             |flags, mark_set| SubstitutionLookup::Single(LookupBuilder::new(flags, mark_set)),
@@ -201,7 +209,7 @@ impl ContextualLookupBuilder<SubstitutionLookup> {
             unreachable!("per logic above we only return this variant");
         };
         let sub = subtables.last_mut().unwrap();
-        for (target, replacement) in target.iter().zip(replacement.into_iter_for_target()) {
+        for (target, replacement) in mapping {
             sub.insert(target, replacement);
         }
         id
