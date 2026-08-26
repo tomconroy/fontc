@@ -156,6 +156,16 @@ instances = (
 axesValues = (
 400
 );
+customParameters = (
+{
+name = "Replace Prefix";
+value = "Positioning;lookup PositioningA {\012    pos a 777;\012} PositioningA;";
+},
+{
+name = "Replace Feature";
+value = "salt;sub a by a.alt;\012sub f by i;";
+}
+);
 instanceInterpolations = {
 "REG-MASTER-ID" = 1;
 };
