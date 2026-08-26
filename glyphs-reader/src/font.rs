@@ -334,6 +334,32 @@ pub struct Glyph {
     pub production_name: Option<SmolStr>,
     /// If this is a smart component, these are the axe names -> user coords
     pub smart_component_axes: BTreeMap<SmolStr, RangeInclusive<i64>>,
+    /// What the source itself said about this glyph, before any of our fallbacks.
+    ///
+    /// See [`SourceGlyphInfo`]: FEA glyph predicates compare these, not the
+    /// cooked [`Self::category`]/[`Self::sub_category`].
+    pub source_info: SourceGlyphInfo,
+}
+
+/// The glyph attributes a Glyphs.app source stores, exactly as it stored them.
+///
+/// [`Glyph::category`] and [`Glyph::sub_category`] are *cooked*: when the source
+/// leaves them out we fill them in by looking the glyph up in the bundled
+/// GlyphData. A FEA glyph predicate token (`$[category == "Letter"]`) must not
+/// see those fallbacks -- glyphsLib's `TokenExpander` reads plain `GSGlyph`
+/// attributes, which stay `None` unless the file sets them
+/// ([`tokens.py`], `_get_value_for_glyph`) -- so the raw strings are kept here.
+/// `case` is here for the same reason and has no other use in fontc.
+///
+/// [`tokens.py`]: https://github.com/googlefonts/glyphsLib/blob/main/Lib/glyphsLib/builder/tokens.py
+#[derive(Clone, Default, Debug, PartialEq, Eq, Hash)]
+pub struct SourceGlyphInfo {
+    /// `category = Letter;`, unparsed; `None` if the source did not set it.
+    pub category: Option<SmolStr>,
+    /// `subCategory = Ligature;`, unparsed; `None` if the source did not set it.
+    pub sub_category: Option<SmolStr>,
+    /// `case = lower;`, unparsed; `None` if the source did not set it.
+    pub case: Option<SmolStr>,
 }
 
 impl Glyph {
@@ -1644,6 +1670,8 @@ struct RawGlyph {
     unicode: Option<String>,
     category: Option<SmolStr>,
     sub_category: Option<SmolStr>,
+    // glyphs 3 only; we have no use for it except FEA glyph predicates
+    case: Option<SmolStr>,
     #[fromplist(alt_name = "production")]
     production_name: Option<SmolStr>,
     parts_settings: Vec<RawPartSetting>,
@@ -3376,6 +3404,12 @@ impl RawGlyph {
         let mut category = parse_category(self.category.as_deref(), &self.glyphname);
         let mut sub_category = parse_category(self.sub_category.as_deref(), &self.glyphname);
         let mut production_name = self.production_name;
+        // keep what the source said, before any GlyphData fallback below
+        let source_info = SourceGlyphInfo {
+            category: self.category.clone(),
+            sub_category: self.sub_category.clone(),
+            case: self.case,
+        };
 
         // Whether the source explicitly set a non-empty category/subCategory. A value that
         // was set but not recognized parses to None (parse_category logs and drops it), so
@@ -3425,6 +3459,7 @@ impl RawGlyph {
             sub_category,
             production_name,
             smart_component_axes: part_settings,
+            source_info,
         })
     }
 }
@@ -5940,6 +5975,40 @@ etc;
 
         let cooked = raw.build(FormatVersion::V2, &GlyphData::default()).unwrap();
         assert_eq!((cooked.category, cooked.sub_category), (None, None));
+    }
+
+    // FEA glyph predicates compare what the source stored, so `source_info` keeps the raw
+    // strings even where cooking dropped (an unknown category) or invented (a GlyphData
+    // fallback) a value. `case` has no cooked counterpart at all.
+    #[test]
+    fn source_info_is_what_the_source_said() {
+        let raw = super::RawGlyph {
+            glyphname: "A".into(),
+            category: Some("Fake".into()),
+            case: Some("upper".into()),
+            ..Default::default()
+        };
+
+        let cooked = raw.build(FormatVersion::V2, &GlyphData::default()).unwrap();
+        assert_eq!(cooked.category, None, "'Fake' is not a category we know");
+        assert_eq!(
+            cooked.source_info,
+            SourceGlyphInfo {
+                category: Some("Fake".into()),
+                sub_category: None,
+                case: Some("upper".into()),
+            }
+        );
+
+        // a glyph the source said nothing about says nothing here either, even
+        // when GlyphData fills the cooked category in
+        let raw = super::RawGlyph {
+            glyphname: "A".into(),
+            ..Default::default()
+        };
+        let cooked = raw.build(FormatVersion::V2, &GlyphData::default()).unwrap();
+        assert_eq!(cooked.category, Some(Category::Letter));
+        assert_eq!(cooked.source_info, SourceGlyphInfo::default());
     }
 
     // An unrecognized *explicit* subCategory on an underscore-named glyph must not fall

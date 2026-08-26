@@ -2232,11 +2232,45 @@ impl<'a, F: FeatureProvider, V: VariationInfo> CompilationCtx<'a, F, V> {
                 self.add_glyphs_from_range(&range, &mut glyphs);
             } else if let Some(alias) = typed::GlyphClassName::cast(item) {
                 glyphs.extend(self.resolve_named_glyph_class(&alias).items());
+            } else if let Some(predicate) = typed::GlyphsAppPredicate::cast(item) {
+                self.resolve_glyphs_predicate(&predicate, &mut glyphs);
             } else {
                 panic!("unexptected kind in class literal: '{}'", item.kind());
             }
         }
         glyphs.into()
+    }
+
+    /// Expand a Glyphs.app glyph predicate token (`$[...]`) into glyphs.
+    ///
+    /// See [`crate::compile::glyphsapp_syntax_ext::evaluate_predicate`]. We evaluate the
+    /// predicate against the (export-filtered) glyph order fontc hands us, in
+    /// GID order, which matches glyphsLib's source-order, exported-glyphs-only
+    /// output. The glyph set may also contain synthesized glyphs (bracket
+    /// glyphs, a synthesized `.notdef`, decomposition derivatives) absent from
+    /// glyphsLib's predicate set -- a rare divergence checked against the
+    /// reference toolchain.
+    fn resolve_glyphs_predicate(
+        &mut self,
+        predicate: &typed::GlyphsAppPredicate,
+        out: &mut Vec<GlyphId16>,
+    ) {
+        // the cached reverse map is keyed by GlyphId16, so iteration is in the
+        // GID order that `evaluate_predicate` requires.
+        let variation_info = self.variation_info;
+        out.extend(super::glyphsapp_syntax_ext::evaluate_predicate(
+            predicate,
+            self.reverse_glyph_map
+                .iter()
+                .filter_map(|(id, ident)| match ident {
+                    GlyphIdent::Name(name) => Some((*id, name.as_str())),
+                    GlyphIdent::Cid(_) => None,
+                }),
+            // validation rejects a non-'name' attribute when there is no
+            // variation info to answer it, so this cannot silently report every
+            // attribute as unset
+            |glyph, attr| variation_info.and_then(|info| info.glyph_predicate_attr(glyph, attr)),
+        ));
     }
 
     fn resolve_named_glyph_class(&mut self, name: &typed::GlyphClassName) -> GlyphClass {
