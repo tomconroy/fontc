@@ -184,14 +184,32 @@ impl ContextualLookupBuilder<SubstitutionLookup> {
         target: GlyphOrClass,
         replacement: GlyphOrClass,
     ) -> LookupId {
+        // Resolve the two classes into the mapping they actually produce
+        // *before* deciding which lookup can hold it. A glyph repeated in the
+        // target class is substituted by whichever replacement comes last, so
+        // the pair it shadows describes no substitution at all and must not be
+        // what stops us from sharing an existing lookup.
+        //
+        // fonttools resolves at the same point, one level up: the parser hands
+        // the builder an `OrderedDict(zip(originals, replaces))`
+        // (`SingleSubstStatement.build`, fontTools/feaLib/ast.py:1443-1457, which
+        // also expands a single replacement glyph to the length of the target),
+        // so `find_chainable_subst` (fontTools/otlLib/builder.py:824-835) only
+        // ever compares resolved mappings.
+        //
+        // Resolving also makes us check every pair we are about to insert: the
+        // old check zipped against `replacement.iter()`, which for the common
+        // `sub [a b c] x' by y;` shape stopped after the first glyph.
+        let mapping = target
+            .iter()
+            .zip(replacement.into_iter_for_target())
+            .collect::<BTreeMap<_, _>>();
         let (lookup, id) = self.find_or_create_anon_lookup(
             |existing| match existing {
-                SubstitutionLookup::Single(subtables) => subtables.subtables.iter().all(|subt| {
-                    target
-                        .iter()
-                        .zip(replacement.iter())
-                        .all(|(a, b)| subt.can_add(a, b))
-                }),
+                SubstitutionLookup::Single(subtables) => subtables
+                    .subtables
+                    .iter()
+                    .all(|subt| mapping.iter().all(|(a, b)| subt.can_add(*a, *b))),
                 _ => false,
             },
             |flags, mark_set| SubstitutionLookup::Single(LookupBuilder::new(flags, mark_set)),
@@ -201,7 +219,7 @@ impl ContextualLookupBuilder<SubstitutionLookup> {
             unreachable!("per logic above we only return this variant");
         };
         let sub = subtables.last_mut().unwrap();
-        for (target, replacement) in target.iter().zip(replacement.into_iter_for_target()) {
+        for (target, replacement) in mapping {
             sub.insert(target, replacement);
         }
         id
