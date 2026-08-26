@@ -410,34 +410,50 @@ impl ActiveFeature {
         // but if this is a fully-resolved language system, we add the default
         // lookups now, when we have access to the 'exclude_dflt' flag.
         if system.language != tags::LANG_DFLT {
-            let mut lookups = Vec::new();
-            if !exclude_dflt {
-                let script_dflt = LanguageSystem {
-                    script: system.script,
-                    language: tags::LANG_DFLT,
-                };
-                // if *either* this is an explicit default, or this is part of
-                // a script where script/dflt is an explicit default, and we have
-                // seen a script keyword, add the default lookups
-                if self.default_systems.contains(&system)
-                    || (self.default_systems.contains(&script_dflt)
-                        && self.script_default_lookups.contains_key(&system.script))
-                {
-                    lookups.extend(
-                        self.lookups
-                            .get(&LanguageSystem::default())
-                            .into_iter()
-                            .flat_map(|v| v.iter().copied()),
-                    );
-                }
-                lookups.extend(
-                    self.script_default_lookups
-                        .get(&system.script)
+            let script_dflt = LanguageSystem {
+                script: system.script,
+                language: tags::LANG_DFLT,
+            };
+            // the lookups this script has collected under its default language;
+            // fonttools' features_[(script, 'dflt', feature)]
+            let mut dflt_lookups = Vec::new();
+            // if *either* this is an explicit default, or this is part of
+            // a script where script/dflt is an explicit default, and we have
+            // seen a script keyword, add the default lookups
+            if self.default_systems.contains(&system)
+                || (self.default_systems.contains(&script_dflt)
+                    && self.script_default_lookups.contains_key(&system.script))
+            {
+                dflt_lookups.extend(
+                    self.lookups
+                        .get(&LanguageSystem::default())
                         .into_iter()
                         .flat_map(|v| v.iter().copied()),
                 );
             }
-            self.lookups.entry(system).or_insert_with(|| lookups);
+            dflt_lookups.extend(
+                self.script_default_lookups
+                    .get(&system.script)
+                    .into_iter()
+                    .flat_map(|v| v.iter().copied()),
+            );
+
+            // fonttools only ever adds or removes the default lookups here,
+            // never replaces the list: a repeated 'language xxx' statement
+            // keeps what the first one accumulated, gains any defaults it is
+            // missing, and 'exclude_dflt' removes the defaults from what has
+            // accumulated so far.
+            //https://github.com/fonttools/fonttools/blob/4.66.1/Lib/fontTools/feaLib/builder.py#L1193-L1204
+            let lookups = self.lookups.entry(system).or_default();
+            if exclude_dflt {
+                lookups.retain(|lookup| !dflt_lookups.contains(lookup));
+            } else {
+                for lookup in dflt_lookups {
+                    if !lookups.contains(&lookup) {
+                        lookups.push(lookup);
+                    }
+                }
+            }
         }
     }
 
