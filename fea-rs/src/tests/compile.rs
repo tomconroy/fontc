@@ -5,7 +5,8 @@ use std::path::{Path, PathBuf};
 use crate::{
     GlyphMap,
     compile::{
-        Compilation, Compiler, MockVariationInfo, NopFeatureProvider, Opts, error::CompilerError,
+        Compilation, Compiler, GlyphPredicateAttr, MockVariationInfo, NopFeatureProvider, Opts,
+        error::CompilerError,
     },
     util::ttx::{self as test_utils, Filter, Report, TestCase, TestResult},
 };
@@ -146,6 +147,62 @@ fn compile_fea_variable(fea: &str, test_name: &str) -> Compilation {
         .with_variable_info(&var_info)
         .compile()
         .expect("compilation should succeed")
+}
+
+/// Compile with a source that answers glyph predicate attributes, given as
+/// (glyph name, attribute, value) triples, returning the diagnostics on failure.
+fn compile_fea_with_glyph_attrs(
+    fea: &str,
+    test_name: &str,
+    attrs: &[(&str, GlyphPredicateAttr, &str)],
+) -> Result<Compilation, String> {
+    let fea_path = write_temp_fea(fea, test_name);
+    let mut var_info = test_utils::make_var_info();
+    var_info.glyph_predicate_attrs = Some(
+        attrs
+            .iter()
+            .map(|(glyph, attr, value)| (((*glyph).into(), *attr), (*value).into()))
+            .collect(),
+    );
+    Compiler::<'_, NopFeatureProvider, MockVariationInfo>::new(fea_path, &mini_latin_glyph_map())
+        .with_variable_info(&var_info)
+        .compile()
+        .map_err(|err| match err {
+            CompilerError::ValidationFail(errs) | CompilerError::CompilationFail(errs) => {
+                errs.to_string(false)
+            }
+            other => panic!("unexpected compiler error: {other}"),
+        })
+}
+
+// An attribute the source may not have set has no ordering: glyphsLib raises a
+// TypeError comparing Python None with `<`, so we reject the clause rather than
+// invent an answer. (The file-driven bad tests cannot reach this: their source
+// has no glyph attributes at all, so the attribute itself is rejected first.)
+#[test]
+fn glyphs_predicate_ordering_on_attribute_is_rejected() {
+    let err = compile_fea_with_glyph_attrs(
+        "@a = [ $[category < \"M\"] ];\nfeature ss01 { sub a by b; } ss01;\n",
+        "predicate_ordering",
+        &[("a", GlyphPredicateAttr::Category, "Letter")],
+    )
+    .err()
+    .expect("ordering on an attribute should be rejected");
+    assert!(
+        err.contains("'<' is only supported on 'name'"),
+        "expected an ordering diagnostic, got:\n{err}"
+    );
+}
+
+// ... but the same operators are fine on the name, which every glyph has.
+#[test]
+fn glyphs_predicate_ordering_on_name_is_allowed() {
+    compile_fea_with_glyph_attrs(
+        "@a = [ $[name < \"b\"] ];\nfeature ss01 { sub @a by b; } ss01;\n",
+        "predicate_ordering_name",
+        &[],
+    )
+    .expect("ordering on the name compiles");
 }
 
 // Regression test for https://github.com/googlefonts/fontc/issues/1847

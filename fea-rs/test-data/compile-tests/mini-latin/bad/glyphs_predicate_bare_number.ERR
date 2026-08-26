@@ -1,4 +1,4 @@
-error: glyphs predicate values must be quoted (see fontc#2052)
+error: an unquoted number in a glyphs predicate is compared as an integer by glyphsLib, and never equals a glyph attribute: quote it to compare it as text
 in ./test-data/compile-tests/mini-latin/bad/glyphs_predicate_bare_number.fea at 3:17
   | 
 3 | @x = [ $[name == 123] ];

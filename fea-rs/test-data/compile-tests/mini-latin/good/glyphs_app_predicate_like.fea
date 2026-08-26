@@ -1,0 +1,14 @@
+# glyphsLib's `like` is a shell-style pattern (`fnmatch.fnmatchcase`), so this
+# selects the same glyphs as `name endswith ".osf"`, and an unquoted value is
+# compared as a string.
+@digits = [zero one two three four five six seven eight nine];
+@old_style = [ $[name like "*.osf"] ];
+@zero_only = [ $[name == zero] ];
+
+feature onum {
+    sub @digits by @old_style;
+} onum;
+
+feature ss01 {
+    sub @zero_only by zero.osf;
+} ss01;
