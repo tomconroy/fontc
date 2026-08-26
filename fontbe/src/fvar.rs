@@ -53,8 +53,7 @@ fn generate_fvar(static_metadata: &StaticMetadata) -> Option<Fvar> {
     // instances have one.
     // https://github.com/googlefonts/fontations/blob/b4136692/write-fonts/src/tables/fvar.rs#L13-L21
     let has_postscript_names = static_metadata
-        .named_instances
-        .iter()
+        .fvar_instances()
         .any(|instance| instance.postscript_name.is_some());
 
     let default_instance_location: UserLocation = static_metadata
@@ -86,8 +85,7 @@ fn generate_fvar(static_metadata: &StaticMetadata) -> Option<Fvar> {
             })
             .collect(),
         static_metadata
-            .named_instances
-            .iter()
+            .fvar_instances()
             .map(|ni| {
                 // "The values 2 or 17 should only be used if the named instance corresponds
                 // to the font’s default instance."
@@ -187,15 +185,18 @@ mod tests {
         assert!(fvar.is_none());
     }
 
+    /// A point axis rides along in a font that varies on some other axis.
+    ///
+    /// fontmake writes it, so we do too: <https://github.com/googlefonts/fontc/issues/1990>
     #[test]
-    fn fvar_includes_only_variable_axes() {
+    fn fvar_includes_point_axes_of_a_variable_font() {
         let static_metadata = create_static_metadata(&[
             axis("wght", 400.0, 400.0, 700.0),
             axis("wdth", 400.0, 400.0, 400.0),
         ]);
         let fvar = generate_fvar(&static_metadata).unwrap();
         assert_eq!(
-            vec![(400.0, 400.0, 700.0),],
+            vec![(400.0, 400.0, 700.0), (400.0, 400.0, 400.0)],
             fvar.axis_instance_arrays
                 .axes
                 .iter()
