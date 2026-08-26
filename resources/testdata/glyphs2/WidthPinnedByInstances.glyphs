@@ -1,0 +1,136 @@
+{
+familyName = PinnedWidth;
+fontMaster = (
+{
+ascender = 800;
+descender = -200;
+id = "upright-regular";
+weightValue = 400;
+widthValue = 0;
+},
+{
+ascender = 800;
+descender = -200;
+id = "upright-bold";
+weight = Bold;
+weightValue = 700;
+widthValue = 0;
+},
+{
+ascender = 800;
+custom = Italic;
+descender = -200;
+id = "italic-regular";
+italicAngle = 10;
+weightValue = 400;
+widthValue = 1;
+},
+{
+ascender = 800;
+custom = Italic;
+descender = -200;
+id = "italic-bold";
+italicAngle = 10;
+weight = Bold;
+weightValue = 700;
+widthValue = 1;
+}
+);
+glyphs = (
+{
+glyphname = hyphen;
+layers = (
+{
+layerId = "upright-regular";
+paths = (
+{
+closed = 1;
+nodes = (
+"131 250 LINE",
+"470 250 LINE",
+"470 330 LINE",
+"131 330 LINE"
+);
+}
+);
+width = 600;
+},
+{
+layerId = "upright-bold";
+paths = (
+{
+closed = 1;
+nodes = (
+"92 224 LINE",
+"508 224 LINE",
+"508 356 LINE",
+"92 356 LINE"
+);
+}
+);
+width = 600;
+},
+{
+layerId = "italic-regular";
+paths = (
+{
+closed = 1;
+nodes = (
+"151 250 LINE",
+"490 250 LINE",
+"490 330 LINE",
+"151 330 LINE"
+);
+}
+);
+width = 620;
+},
+{
+layerId = "italic-bold";
+paths = (
+{
+closed = 1;
+nodes = (
+"112 224 LINE",
+"528 224 LINE",
+"528 356 LINE",
+"112 356 LINE"
+);
+}
+);
+width = 620;
+}
+);
+unicode = 002D;
+}
+);
+instances = (
+{
+interpolationWeight = 400;
+interpolationWidth = 0;
+name = Regular;
+},
+{
+interpolationWeight = 700;
+interpolationWidth = 0;
+isBold = 1;
+name = Bold;
+weightClass = Bold;
+},
+{
+interpolationWeight = 400;
+interpolationWidth = 1;
+isItalic = 1;
+name = Italic;
+},
+{
+interpolationWeight = 700;
+interpolationWidth = 1;
+isBold = 1;
+isItalic = 1;
+name = "Bold Italic";
+weightClass = Bold;
+}
+);
+unitsPerEm = 1000;
+}
