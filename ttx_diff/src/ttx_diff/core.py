@@ -83,7 +83,9 @@ FLAGS = flags.FLAGS
 MARK_KERN_NAME = "(mark/kern)"
 LIG_CARET_NAME = "ligcaret"
 # outline flavors we can compare; the value doubles as the file extension
-# and as fontmake's `-o` build type for a static source
+# and, for a static output, as fontmake's `-o` build type. A variable output
+# has its own build type on both sides: `variable` for glyf, `variable-cff2`
+# for PostScript.
 FLAVOR_TTF = "ttf"
 FLAVOR_OTF = "otf"
 # maximum chars of stderr to include when reporting errors; prevents
@@ -97,7 +99,6 @@ INSTANCE_DEFAULT = "@default"
 # Reasons we decline to compare a target. These are a contract with
 # fontc_crater (see `skip`): keep them short, stable, and free of paths, so a
 # report can group targets by reason.
-SKIP_OTF_VARIABLE = "variable source (fontc cannot write CFF2)"
 SKIP_INSTANCE_STATIC = "static source (instance mode requires a variable source)"
 SKIP_NO_INSTANCES = "source has no named instances"
 SKIP_NO_DEFAULT_INSTANCE = "no named instance at the default location"
@@ -340,11 +341,12 @@ def build_fontmake(
     # overlaps -- fontmake removes them for static builds and fontc cannot, so
     # keying this off the source would make every outline differ
     variable_output = instance is None and source_is_variable(source)
+    # PostScript outlines come in two tables: a static build is CFF, a variable
+    # one is CFF2, and fontmake spells them as different build types. This
+    # mirrors the glyf side, where a variable build is `-o variable` rather
+    # than `-o ttf`.
     if FLAGS.flavor == FLAVOR_OTF:
-        # guarded in main(), but this is the only place that knows the
-        # buildtype so be explicit rather than silently building something else
-        assert not variable_output, "otf flavor requires a static output"
-        buildtype = "otf"
+        buildtype = "variable-cff2" if variable_output else "otf"
     elif variable_output:
         buildtype = "variable"
     else:
@@ -367,7 +369,9 @@ def build_fontmake(
         # fontc's CFF writer specializes too; subroutinization (the default, 2)
         # rewrites the whole table via cffsubr/compreffor purely to save space,
         # so leaving it on would make every charstring differ for reasons that
-        # have nothing to do with correctness.
+        # have nothing to do with correctness. The same value is right for
+        # variable-cff2, where the merge specializes unconditionally and 0 and
+        # 1 produce identical bytes.
         cmd += ["--optimize-cff", "1"]
     if FLAGS.keep_direction:
         cmd.append("--keep-direction")
@@ -2020,16 +2024,9 @@ def main(argv):
         )
 
     if FLAGS.flavor == FLAVOR_OTF:
-        # CFF (flavor otf) is static-only on both sides for now: fontc has no
-        # CFF2 writer, so there is nothing to compare a variable build against.
-        # Instance mode is exempt: the output is static even though the source
-        # is variable, so CFF is exactly as comparable as it is for a static.
-        if source is not None and instance is None and source_is_variable(source):
-            skip(
-                SKIP_OTF_VARIABLE,
-                f"--flavor otf requires a static source, but '{rel_user(source)}' is "
-                "variable (fontc cannot write CFF2 yet)",
-            )
+        # A variable source is fine here: it builds CFF2 on both sides, the way
+        # a variable ttf build produces glyf plus gvar. Only gftools mode is
+        # out, since its config picks its own build type.
         if FLAGS.compare != "default":
             sys.exit(
                 f"--flavor otf is only supported with --compare default, not "

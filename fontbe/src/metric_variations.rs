@@ -178,3 +178,129 @@ impl AdvanceDeltas {
         self.deltas.iter()
     }
 }
+
+/// Helper to collect vertical origin deltas for all glyphs in a font, for VVAR's `VOrgMap`.
+///
+/// Only CFF flavored builds have a VORG for these to vary; see [`crate::vvar`].
+///
+/// Unlike an advance, a vertical origin is never missing as far as fontTools is
+/// concerned: it reads them back out of each master's VORG, and a glyph with no record
+/// there simply gets that master's `defaultVertOriginY`. So every master participates
+/// for every glyph and the full model is always the right one, where
+/// [`AdvanceDeltas`] has to build a sparse model per glyph.
+/// <https://github.com/fonttools/fonttools/blob/03a3c8ed/Lib/fontTools/varLib/__init__.py#L718-L731>
+pub(crate) struct VerticalOriginDeltas {
+    /// Vertical origin deltas per glyph, in glyph order
+    deltas: Vec<Vec<(VariationRegion, i16)>>,
+}
+
+impl VerticalOriginDeltas {
+    /// Compute the vertical origin deltas of every glyph, in glyph order.
+    pub(crate) fn new(
+        static_metadata: &StaticMetadata,
+        global_metrics: &GlobalMetrics,
+        glyphs: &[impl AsRef<Glyph>],
+    ) -> Result<Self, Error> {
+        let axes = &static_metadata.axes;
+        let model = &static_metadata.variation_model;
+        let locations: Vec<NormalizedLocation> = model.locations().cloned().collect();
+        let metrics: HashMap<&NormalizedLocation, GlobalMetricsInstance> = locations
+            .iter()
+            .map(|loc| (loc, global_metrics.at(loc)))
+            .collect();
+
+        // The vertical origin each glyph has at each master location, where it has one
+        let per_glyph: Vec<HashMap<&NormalizedLocation, i16>> = glyphs
+            .iter()
+            .enumerate()
+            .map(|(i, glyph)| {
+                let glyph = glyph.as_ref();
+                // ufo2ft compiles a .notdef into *every* master, so a .notdef fontir
+                // synthesized — which exists only at the default location — is dense
+                // as far as VORG is concerned, and its stub, having no vertical origin
+                // of its own, takes each master's typo ascender. Same reasoning as
+                // the densification in `AdvanceDeltas::add`.
+                if i == 0 && glyph.name == GlyphName::NOTDEF && glyph.sources().len() == 1 {
+                    let instance = glyph.default_instance();
+                    return metrics
+                        .iter()
+                        .map(|(loc, metrics)| (*loc, instance.vertical_origin(metrics)))
+                        .collect();
+                }
+                glyph
+                    .sources()
+                    .iter()
+                    .filter_map(|(gloc, instance)| {
+                        let gloc = gloc.subset_axes(axes);
+                        let (loc, metrics) = metrics.get_key_value(&gloc)?;
+                        Some((*loc, instance.vertical_origin(metrics)))
+                    })
+                    .collect()
+            })
+            .collect();
+
+        // What a master's VORG says for a glyph it doesn't have: its defaultVertOriginY,
+        // the most common vertical origin among the glyphs it does have, ties going to
+        // the first seen. Same rule as VORG itself, see `vertical_metrics::build_vorg_table`.
+        let mut fallbacks: HashMap<&NormalizedLocation, i16> = HashMap::new();
+        for loc in locations.iter() {
+            let mut counts: Vec<(i16, usize)> = Vec::new();
+            for origins in per_glyph.iter() {
+                let Some(origin) = origins.get(loc).copied() else {
+                    continue;
+                };
+                match counts.iter().position(|(o, _)| *o == origin) {
+                    Some(i) => counts[i].1 += 1,
+                    None => counts.push((origin, 1)),
+                }
+            }
+            // NOT max_by_key: that returns the *last* maximum, Python's max the first
+            if let Some((origin, _)) = counts
+                .iter()
+                .reduce(|best, next| if next.1 > best.1 { next } else { best })
+            {
+                fallbacks.insert(loc, *origin);
+            }
+        }
+
+        let mut deltas = Vec::with_capacity(glyphs.len());
+        for (glyph, origins) in glyphs.iter().zip(per_glyph.iter()) {
+            let glyph = glyph.as_ref();
+            let origins: HashMap<NormalizedLocation, Vec<f64>> = locations
+                .iter()
+                .map(|loc| {
+                    let origin = origins
+                        .get(loc)
+                        .or_else(|| fallbacks.get(loc))
+                        .copied()
+                        .unwrap_or_default();
+                    (loc.clone(), vec![origin as f64])
+                })
+                .collect();
+            deltas.push(
+                model
+                    .deltas(&origins)
+                    .map_err(|e| Error::GlyphDeltaError(glyph.name.clone(), e))?
+                    .into_iter()
+                    .filter_map(|(region, values)| {
+                        if region.is_default() {
+                            return None;
+                        }
+                        // Only 1 value per region for our input
+                        assert!(values.len() == 1, "{} values?!", values.len());
+                        Some((
+                            region.to_write_fonts_variation_region(axes),
+                            values[0].ot_round(),
+                        ))
+                    })
+                    .collect(),
+            );
+        }
+
+        Ok(VerticalOriginDeltas { deltas })
+    }
+
+    pub(crate) fn iter(&self) -> impl Iterator<Item = &Vec<(VariationRegion, i16)>> {
+        self.deltas.iter()
+    }
+}

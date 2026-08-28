@@ -387,6 +387,11 @@ impl Persistable for Glyph {
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub struct CffOutput {
     pub table: Vec<u8>,
+    /// Whether [`Self::table`] is a `CFF2` table rather than a `CFF `.
+    ///
+    /// A font has one PostScript outline table; which one depends on whether
+    /// the source is variable, and only the tag differs downstream.
+    pub cff2: bool,
     /// `[x_min, y_min, x_max, y_max]` per glyph, in glyph order, each side
     /// rounded like ufo2ft's `glyphBoundingBoxes`; `None` for glyphs with no
     /// outline, or whose box rounds to all zeros. Side bearings come from

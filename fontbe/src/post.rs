@@ -88,9 +88,13 @@ impl Work<Context, AnyWorkId, Error> for PostWork {
             .at(static_metadata.default_location());
         let glyph_order = context.ir.glyph_order.get();
 
-        let mut post = if context.flags.contains(Flags::CFF_OUTLINES) {
-            // CFF fonts carry glyph names in the CFF charset; like ufo2ft we
-            // emit a nameless format 3.0 post
+        // A CFF font carries its glyph names in the CFF charset, but a CFF2 has
+        // no charset, so a variable PostScript font needs post to hold them
+        // after all — which is what ufo2ft's variable-cff2 output does.
+        let names_are_in_the_cff_charset =
+            context.flags.contains(Flags::CFF_OUTLINES) && static_metadata.axes.is_empty();
+        let mut post = if names_are_in_the_cff_charset {
+            // like ufo2ft, a nameless format 3.0 post
             Post::new_v3()
         } else {
             // For TrueType we build a v2 table by default, like fontmake does.

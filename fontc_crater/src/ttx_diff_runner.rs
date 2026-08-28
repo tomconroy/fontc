@@ -48,7 +48,9 @@ pub(super) fn run_ttx_diff(ctx: &TtxContext, target: &Target) -> RunResult<DiffO
     .arg(&ctx.normalizer_path)
     .args(["--rebuild", "fontc"]);
     if ctx.flavor != Flavor::Ttf {
-        cmd.args(["--flavor", "otf"]);
+        // CFF and CFF2 are one ttx_diff mode; it picks the table from whether
+        // the output is variable
+        cmd.args(["--flavor", ctx.flavor.ttx_diff_arg()]);
     }
     if let Some(instance) = &ctx.instance {
         cmd.arg("--instance").arg(instance);
@@ -412,11 +414,6 @@ mod tests {
         assert_eq!(
             skip_reason("SKIP: static source (instance mode requires a variable source)"),
             Some("static source (instance mode requires a variable source)")
-        );
-        // the pre-existing flavor skip is unchanged in the report
-        assert_eq!(
-            skip_reason("SKIP: variable source (fontc cannot write CFF2)"),
-            Some("variable source (fontc cannot write CFF2)")
         );
     }
 
