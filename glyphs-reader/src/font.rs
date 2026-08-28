@@ -65,6 +65,9 @@ pub struct AxisUserToDesignMap(Vec<(OrderedFloat<f64>, OrderedFloat<f64>)>);
 /// Normalized representation of Glyphs 2/3 content
 #[derive(Clone, Debug, Default, PartialEq, Hash)]
 pub struct Font {
+    /// Needed after parsing because a v2 layer's shape order differs from ours;
+    /// see `shapes_in_file_order`.
+    format_version: FormatVersion,
     pub units_per_em: u16,
     pub axes: Vec<Axis>,
     pub masters: Vec<FontMaster>,
@@ -845,7 +848,7 @@ impl Shape {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, PartialOrd)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, PartialOrd, Hash)]
 enum FormatVersion {
     #[default]
     V2,
@@ -3227,6 +3230,29 @@ fn map_and_push_if_present<T, U>(dest: &mut Vec<T>, src: Vec<U>, map: fn(U) -> T
     src.into_iter().map(map).for_each(|v| dest.push(v));
 }
 
+/// Walk shapes in the order glyphsLib's `GSLayer._shapes` holds them.
+///
+/// glyphsLib fills `_shapes` in the order the keys appear in the file. A v3
+/// layer has one interleaved `shapes` key, which is the order we store; a v2
+/// layer has separate `components` and `paths` keys written alphabetically, so
+/// there components come first, while we store paths first (see
+/// [`RawLayer::build`]).
+fn shapes_in_file_order(shapes: &[Shape], v2: bool) -> impl Iterator<Item = &Shape> {
+    let (components, paths): (Box<dyn Iterator<Item = &Shape>>, _) = if v2 {
+        (
+            Box::new(shapes.iter().filter(|s| s.as_component().is_some())),
+            Box::new(shapes.iter().filter(|s| s.as_component().is_none()))
+                as Box<dyn Iterator<Item = &Shape>>,
+        )
+    } else {
+        (
+            Box::new(shapes.iter()),
+            Box::new(std::iter::empty()) as Box<dyn Iterator<Item = &Shape>>,
+        )
+    };
+    components.chain(paths)
+}
+
 impl RawLayer {
     fn build(self, format_version: FormatVersion) -> Result<Layer, Error> {
         // we do what glyphsLib does:
@@ -3237,7 +3263,15 @@ impl RawLayer {
         const DEFAULT_LAYER_WIDTH: f64 = 600.;
         let mut shapes = Vec::new();
 
-        // Glyphs v2 uses paths and components
+        // Glyphs v2 uses paths and components.
+        //
+        // NOTE: glyphsLib keeps one ordered `_shapes` list, filled in the order
+        // the keys appear in the file, and a v2 layer's keys are written
+        // alphabetically, so there `components` precedes `paths`. We keep the
+        // opposite order because path indices are referenced by hints; the one
+        // place where the file order is observable (decomposing a glyph that is
+        // used as a smart component) asks for it explicitly, see
+        // `ShapeOrder::AsInFile`.
         map_and_push_if_present(&mut shapes, self.paths, Shape::Path);
         map_and_push_if_present(&mut shapes, self.components, Shape::Component);
 
@@ -4120,6 +4154,7 @@ impl TryFrom<RawFont> for Font {
 
         let virtual_masters = custom_parameters.virtual_masters.take().unwrap_or_default();
         Ok(Font {
+            format_version: from.format_version,
             units_per_em,
             axes: from.axes,
             masters,
@@ -4131,7 +4166,13 @@ impl TryFrom<RawFont> for Font {
             features,
             all_names,
             instances,
-            version_major: from.versionMajor.unwrap_or_default() as i32,
+            // glyphsLib's GSFont.__init__ seeds versionMajor with 1 and only
+            // the plist overwrites it, so a source that says nothing is 1.0,
+            // not 0.0 (versionMinor really is 0).
+            // https://github.com/googlefonts/glyphsLib/blob/c4db6b981d577f4/Lib/glyphsLib/classes.py#L4585-L4615
+            // Measured: `fontmake -o variable` on a .glyphs with both keys
+            // deleted writes head.fontRevision 1.0.
+            version_major: from.versionMajor.unwrap_or(1) as i32,
             version_minor: from.versionMinor.unwrap_or_default() as u32,
             date: from.date,
             kerning_ltr: from.kerning_LTR,
@@ -4325,20 +4366,45 @@ impl Font {
 
         glyphs_with_smart_components.sort_by_key(|g| depth_ranked.get(&g.name).unwrap());
 
+        // glyphsLib flattens a glyph that uses smart components twice, in two
+        // different orders, and both are observable:
+        //
+        // * the glyph's own outline comes from to_ufo_paths followed by
+        //   to_ufo_components, so its own paths come first and the contours
+        //   contributed by its smart components follow, in component order:
+        //   <https://github.com/googlefonts/glyphsLib/blob/c4db6b981d577f4/Lib/glyphsLib/builder/glyph.py#L207-L208>
+        // * a glyph *referenced* as a smart component is flattened by
+        //   decompose_smart_components_in_layer, which walks the layer's
+        //   `_shapes` in file order:
+        //   <https://github.com/googlefonts/glyphsLib/blob/c4db6b981d577f4/Lib/glyphsLib/builder/smart_components.py#L95-L129>
+        //   In a v2 file that is components before paths, because a layer's
+        //   keys are written alphabetically; we store the opposite order (see
+        //   `RawLayer::build`), so walk it accordingly.
+        //
+        // Keep both: `self.glyphs` gets the first, `as_referenced` the second,
+        // and a smart component reference resolves against `as_referenced`.
+        let v2 = self.format_version.is_v2();
+        let mut as_referenced: BTreeMap<SmolStr, Glyph> = BTreeMap::new();
+
         // convert the smart components to normal outlines, per-glyph
         for mut glyph in glyphs_with_smart_components {
-            for layer in glyph.layers.iter_mut() {
+            let mut referenced = glyph.clone();
+            for (layer, ref_layer) in glyph.layers.iter_mut().zip(referenced.layers.iter_mut()) {
                 // Snapshot the glyph's own explicit anchors which represent the designer's
                 // intent and must not be overridden by interpolated smart component anchors.
                 let explicit_anchor_names: HashSet<SmolStr> =
                     layer.anchors.iter().map(|a| a.name.clone()).collect();
                 let old_shapes = std::mem::take(&mut layer.shapes);
-                let mut new_shapes = Vec::new();
-                for shape in old_shapes {
+                // the glyph's own paths, and everything the components turn
+                // into, kept apart so we can assemble both orders
+                let mut own_paths = Vec::new();
+                let mut from_components = Vec::new();
+                let mut in_file_order = Vec::new();
+                for shape in shapes_in_file_order(&old_shapes, v2) {
                     if let Some(comp) = shape.as_component()
-                        && let Some(ref_glyph) = self
-                            .glyphs
+                        && let Some(ref_glyph) = as_referenced
                             .get(&comp.name)
+                            .or_else(|| self.glyphs.get(&comp.name))
                             .filter(|g| !g.smart_component_axes.is_empty())
                     {
                         log::debug!(
@@ -4356,7 +4422,8 @@ impl Font {
                             component: comp.name.clone(),
                             issue,
                         })?;
-                        new_shapes.extend(instance.shapes);
+                        from_components.extend(instance.shapes.iter().cloned());
+                        in_file_order.extend(instance.shapes);
                         // Add anchors from smart component, skipping any that
                         // would override the glyph's explicit anchors.
                         let new_anchors: Vec<_> = instance
@@ -4370,12 +4437,20 @@ impl Font {
                             new_anchors.iter().map(|a| &a.name).collect();
                         layer.anchors.retain(|a| !new_names.contains(&a.name));
                         layer.anchors.extend(new_anchors);
+                    } else if shape.as_component().is_some() {
+                        from_components.push(shape.clone());
+                        in_file_order.push(shape.clone());
                     } else {
-                        layer.shapes.push(shape);
+                        own_paths.push(shape.clone());
+                        in_file_order.push(shape.clone());
                     }
                 }
-                layer.shapes.extend(new_shapes);
+                layer.shapes = own_paths;
+                layer.shapes.extend(from_components);
+                ref_layer.shapes = in_file_order;
+                ref_layer.anchors = layer.anchors.clone();
             }
+            as_referenced.insert(glyph.name.clone(), referenced);
             // replace the old glyph with the new, component-free glyph
             self.glyphs.insert(glyph.name.clone(), glyph);
         }
@@ -4719,6 +4794,8 @@ mod tests {
     fn assert_fonts_equal_sans_localized_names(f1: &Font, f2: &Font, context: &str) {
         let mut f1_clone = f1.clone();
         let mut f2_clone = f2.clone();
+        // the source format is of course expected to differ
+        f2_clone.format_version = f1_clone.format_version;
         // Filter all_names to keep only default entries (dflt/default/ENG)
         for all_names in [&mut f1_clone.all_names, &mut f2_clone.all_names] {
             for values in all_names.values_mut() {
@@ -6661,6 +6738,16 @@ etc;
     fn nested_smart_components() {
         // ensure that if a smart component has its own smart components, those
         // get instantiated first.
+        //
+        // `_part.two` is `[component _part.one, path]` in the file and is used
+        // here as a smart component, so it is flattened in file order:
+        // components before paths, because glyphsLib walks GSLayer._shapes and
+        // a v2 layer's keys are written alphabetically.
+        //
+        // Expectation taken from glyphsLib rather than reasoning:
+        // `glyphsLib.to_ufos(GSFont("NestedSmartComponent.glyphs"))[0]["w"]`
+        // has contours with bboxes (0,0,400,100), (0,200,400,400),
+        // (500,0,550,100), (500,200,550,400).
         let font = Font::load(&glyphs2_dir().join("NestedSmartComponent.glyphs")).unwrap();
         let glyph = font.glyphs.get("w").unwrap();
         let shapes = &glyph.layers[0].shapes;
@@ -6671,11 +6758,36 @@ etc;
         assert_eq!(
             rects,
             [
-                Rect::new(0., 200., 400., 400.),
                 Rect::new(0., 0., 400., 100.),
-                Rect::new(500., 200., 550., 400.),
+                Rect::new(0., 200., 400., 400.),
                 Rect::new(500., 0., 550., 100.),
+                Rect::new(500., 200., 550., 400.),
             ]
+        );
+    }
+
+    /// The same glyph is flattened in *two* orders and both are observable.
+    ///
+    /// `_part.two`'s own outline comes from to_ufo_paths then to_ufo_components,
+    /// so its own path comes first and the contour contributed by its smart
+    /// component `_part.one` follows — the opposite of the file order used when
+    /// it is itself referenced as a smart component, see
+    /// [`nested_smart_components`].
+    ///
+    /// Expectation from glyphsLib: `to_ufos(...)[0]["_part.two"]` has contours
+    /// with bboxes (0,200,50,400) then (0,0,50,100).
+    #[test]
+    fn smart_component_own_outline_keeps_its_paths_first() {
+        let font = Font::load(&glyphs2_dir().join("NestedSmartComponent.glyphs")).unwrap();
+        let glyph = font.glyphs.get("_part.two").unwrap();
+        let rects = glyph.layers[0]
+            .shapes
+            .iter()
+            .map(|s| s.as_path().unwrap().bbox().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            rects,
+            [Rect::new(0., 200., 50., 400.), Rect::new(0., 0., 50., 100.)]
         );
     }
 
@@ -7080,6 +7192,31 @@ name = _corner.hi;
                 ))
                 .collect::<Vec<_>>()
         );
+    }
+
+    /// A `.glyphs` that states no version is 1.0, not 0.0.
+    ///
+    /// glyphsLib's `GSFont.__init__` sets `versionMajor = 1` before parsing
+    /// (classes.py:4615) and `_versionMinor = 0` (classes.py:4585); the plist
+    /// only overwrites what it mentions. Oracle: `fontmake -o variable` on
+    /// `glyphs3/WghtVar.glyphs` with both keys deleted writes
+    /// `head.fontRevision = 1.0`.
+    #[test]
+    fn absent_version_is_one_point_zero() {
+        let font = Font::load_from_string(
+            r#"{
+.formatVersion = 3;
+familyName = "No Version";
+fontMaster = (
+{
+id = "m01";
+}
+);
+unitsPerEm = 1000;
+}"#,
+        )
+        .unwrap();
+        assert_eq!((font.version_major, font.version_minor), (1, 0));
     }
 
     #[test]

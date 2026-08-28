@@ -1,13 +1,20 @@
 //! Generates the [vmtx](https://learn.microsoft.com/en-us/typography/opentype/spec/vmtx),
-//! and [vhea](https://learn.microsoft.com/en-us/typography/opentype/spec/vhea) tables.
+//! [vhea](https://learn.microsoft.com/en-us/typography/opentype/spec/vhea) and
+//! [VORG](https://learn.microsoft.com/en-us/typography/opentype/spec/vorg) tables.
+
+use std::collections::HashMap;
 
 use fontdrasil::orchestration::{Access, AccessBuilder, Work};
 use fontir::orchestration::{Flags, WorkId as FeWorkId};
 use log::trace;
 use write_fonts::{
     OtRound, dump_table,
-    tables::{vhea::Vhea, vmtx::Vmtx},
-    types::{FWord, Version16Dot16},
+    tables::{
+        vhea::Vhea,
+        vmtx::Vmtx,
+        vorg::{VertOriginYMetrics, Vorg},
+    },
+    types::{FWord, GlyphId16, Version16Dot16},
 };
 
 use crate::{
@@ -48,17 +55,19 @@ impl Work<Context, AnyWorkId, Error> for VerticalMetricsWork {
         AccessBuilder::new()
             .variant(WorkId::Vmtx)
             .variant(WorkId::Vhea)
+            .variant(WorkId::Vorg)
             .build()
     }
 
     fn also_completes(&self) -> Vec<AnyWorkId> {
-        vec![WorkId::Vhea.into()]
+        vec![WorkId::Vhea.into(), WorkId::Vorg.into()]
     }
 
     /// Generate:
     ///
     /// * [vmtx](https://learn.microsoft.com/en-us/typography/opentype/spec/vmtx)
     /// * [vhea](https://learn.microsoft.com/en-us/typography/opentype/spec/vhea)
+    /// * [VORG](https://learn.microsoft.com/en-us/typography/opentype/spec/vorg), for CFF builds
     fn exec(&self, context: &Context) -> Result<(), Error> {
         let static_metadata = context.ir.static_metadata.get();
 
@@ -82,6 +91,10 @@ impl Work<Context, AnyWorkId, Error> for VerticalMetricsWork {
 
         // Collate vertical metrics
         let mut builder = MetricsBuilder::default();
+        // VORG is a CFF-only table; ufo2ft only lists it in OutlineOTFCompiler.tables
+        // https://github.com/googlefonts/ufo2ft/blob/2f11b0ff/Lib/ufo2ft/outlineCompiler.py#L1321
+        let build_vorg = context.flags.contains(Flags::CFF_OUTLINES);
+        let mut vertical_origins = Vec::new();
         for (gid, gn) in glyph_order.iter() {
             let glyph = context.ir.get_glyph(gn.clone());
             let instance = glyph.default_instance();
@@ -89,6 +102,9 @@ impl Work<Context, AnyWorkId, Error> for VerticalMetricsWork {
             // https://github.com/googlefonts/ufo2ft/blob/2f11b0ff/Lib/ufo2ft/outlineCompiler.py#L882-L890
             let advance = instance.height(&default_metrics);
             let vertical_origin = instance.vertical_origin(&default_metrics);
+            if build_vorg {
+                vertical_origins.push((gid, vertical_origin));
+            }
 
             let glyf_bbox = || {
                 context
@@ -168,6 +184,56 @@ impl Work<Context, AnyWorkId, Error> for VerticalMetricsWork {
             .into();
         context.vmtx.set(raw_vmtx);
 
+        if build_vorg && let Some(vorg) = build_vorg_table(&vertical_origins) {
+            context.vorg.set(vorg);
+        }
+
         Ok(())
     }
+}
+
+/// Build VORG from the vertical origin of every glyph, in glyph order.
+///
+/// Port of ufo2ft's `setupTable_VORG`:
+/// <https://github.com/googlefonts/ufo2ft/blob/2f11b0ff/Lib/ufo2ft/outlineCompiler.py#L912-L936>
+///
+/// The default is the most common vertical origin, ties broken in favour of the
+/// first one seen (`Counter.most_common(1)` returns the first maximum). Records
+/// are only written when more than one distinct origin exists, and only for the
+/// glyphs that differ from the default; fontTools sorts them by glyph id
+/// (`fontTools/ttLib/tables/V_O_R_G_.py`, `compile`), which is the order we
+/// collect them in.
+fn build_vorg_table(vertical_origins: &[(GlyphId16, i16)]) -> Option<Vorg> {
+    if vertical_origins.is_empty() {
+        return None;
+    }
+    // insertion-ordered so first-seen wins ties, like Python's Counter
+    let mut counts: Vec<(i16, usize)> = Vec::new();
+    let mut index: HashMap<i16, usize> = HashMap::new();
+    for (_, origin) in vertical_origins {
+        match index.get(origin) {
+            Some(i) => counts[*i].1 += 1,
+            None => {
+                index.insert(*origin, counts.len());
+                counts.push((*origin, 1));
+            }
+        }
+    }
+    // NOT max_by_key: that returns the *last* maximum, Python's max the first
+    let default_vert_origin_y = counts
+        .iter()
+        .reduce(|best, next| if next.1 > best.1 { next } else { best })
+        .map(|(origin, _)| *origin)
+        .unwrap();
+
+    let metrics = if counts.len() > 1 {
+        vertical_origins
+            .iter()
+            .filter(|(_, origin)| *origin != default_vert_origin_y)
+            .map(|(gid, origin)| VertOriginYMetrics::new(*gid, *origin))
+            .collect()
+    } else {
+        Vec::new()
+    };
+    Some(Vorg::new(default_vert_origin_y, metrics))
 }

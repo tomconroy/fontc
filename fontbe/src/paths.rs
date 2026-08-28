@@ -70,6 +70,7 @@ impl Paths {
             WorkId::Meta => dir.join("meta.table"),
             WorkId::Vhea => dir.join("vhea.table"),
             WorkId::Vmtx => dir.join("vmtx.table"),
+            WorkId::Vorg => dir.join("VORG.table"),
             WorkId::Vvar => dir.join("vvar.table"),
             WorkId::ExtraFeaTables => dir.join("extra_tables.bin"),
             WorkId::Font => dir.join("font.ttf"),

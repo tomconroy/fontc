@@ -964,6 +964,12 @@ fn postscript_settings(font: &Font, master: &FontMaster) -> PostscriptSettings {
             .as_ref()
             .or(font_params.postscript_weight_name.as_ref())
             .map(|name| name.to_string()),
+        // A glyphsLib master UFO states no openTypeOS2WeightClass — the axis
+        // mapping supplies one later, per instance — so fontMath has nothing to
+        // interpolate and an interpolated instance gets no CFF `Weight`.
+        // Verified with `glyphsLib.to_ufos` on Literata and Chivo: every master
+        // UFO has `info.openTypeOS2WeightClass is None`.
+        os2_weight_class: None,
         // a font-level property/parameter, normalized into the name bag for
         // both Glyphs 2 and 3; deliberately not a name table entry, since
         // ufo2ft reads it only when it builds the CFF Top DICT
@@ -3319,11 +3325,16 @@ mod tests {
         );
     }
 
+    /// A source that states no version is 1.000, matching glyphsLib's
+    /// `GSFont.versionMajor = 1` default.
+    ///
+    /// Oracle: `fontmake -o ttf --keep-overlaps infinity.glyphs` writes
+    /// `head.fontRevision = 1.0` and name id 5 "Version 1.000".
     #[test]
     fn version_default() {
         let font = Font::load(&glyphs3_dir().join("infinity.glyphs")).unwrap();
         assert_eq!(
-            "Version 0.000",
+            "Version 1.000",
             names(&font, SelectionFlags::empty())
                 .get(&NameKey::new_bmp_only(NameId::VERSION_STRING))
                 .unwrap()

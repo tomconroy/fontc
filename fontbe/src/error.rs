@@ -53,6 +53,12 @@ pub enum Error {
         e: write_fonts::error::Error,
         context: String,
     },
+    #[error(
+        "the name table is not writable: {0}\n\
+         (fontc cannot encode name records for the Mac platform with a \
+         non-Roman encoding; see googlefonts/fontc)"
+    )]
+    UnencodableNames(String),
     #[error("{what} out of bounds: {value}")]
     OutOfBounds { what: String, value: String },
     #[error("CFF output is only supported for static fonts; this font has variable axes")]
