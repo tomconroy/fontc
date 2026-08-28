@@ -43,9 +43,10 @@ pub use feature_writers::{
 };
 pub use path_builder::GlyphPathBuilder;
 pub use static_metadata::{
-    Condition, ConditionSet, GdefCategories, InstanceOverrides, MetaTableValues, MiscMetadata,
-    NameKey, NamedInstance, Panose, PostscriptNames, PostscriptSettings, PreliminaryGdefCategories,
-    Rule, StaticMetadata, StyleMapStyle, Substitution, VariableFeature,
+    Condition, ConditionSet, GdefCategories, GlyphPredicateAttrs, InstanceOverrides,
+    MetaTableValues, MiscMetadata, NameKey, NamedInstance, Panose, PostscriptNames,
+    PostscriptSettings, PreliminaryGdefCategories, Rule, StaticMetadata, StyleMapStyle,
+    Substitution, VariableFeature,
 };
 
 pub const DEFAULT_VENDOR_ID: &str = "NONE";
@@ -1083,19 +1084,10 @@ fn is_ribbi(style_name: &str) -> bool {
 }
 
 impl NameBuilder {
-    /// If drop_rbbi_suffix remove trailing Regular, Bold, or Italic, e.g. convert Family Regular to just Family
-    pub fn make_family_name(family: &str, subfamily: &str, drop_rbbi_suffix: bool) -> String {
+    /// Family and subfamily, joined, e.g. "Family" and "Bold Italic".
+    pub fn make_family_name(family: &str, subfamily: &str) -> String {
         let mut family = vec![family];
         family.extend(subfamily.split_ascii_whitespace());
-        if drop_rbbi_suffix {
-            while let Some(last) = family.last().copied() {
-                if matches!(last, "Regular" | "Bold" | "Italic") {
-                    family.pop();
-                } else {
-                    break;
-                }
-            }
-        }
         family.join(" ")
     }
 
@@ -1228,7 +1220,6 @@ impl NameBuilder {
                         .unwrap_or_default(),
                     self.get(NameId::TYPOGRAPHIC_SUBFAMILY_NAME)
                         .unwrap_or_default(),
-                    false,
                 ),
             );
         }
@@ -1245,7 +1236,7 @@ impl NameBuilder {
             if !subfamily.is_empty() {
                 family += "-";
             }
-            let mut value = NameBuilder::make_family_name(&family, subfamily, false);
+            let mut value = NameBuilder::make_family_name(&family, subfamily);
             normalize_for_postscript(&mut value, false);
             self.add(NameId::POSTSCRIPT_NAME, value);
         }

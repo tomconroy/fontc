@@ -70,6 +70,19 @@ pub struct Font {
     format_version: FormatVersion,
     pub units_per_em: u16,
     pub axes: Vec<Axis>,
+    /// Whether the source names its own axes rather than relying on the defaults.
+    ///
+    /// glyphsLib keeps an axis that can't vary - one where every master and instance
+    /// sits at the same spot - when the font has an "Axes" custom parameter naming it,
+    /// on the grounds that the designer asked for it. A Glyphs 3 font synthesises that
+    /// parameter from its own axis list, but only when the list is more than the
+    /// default (Weight, Width) pair, and a Glyphs 2 font without the parameter falls
+    /// back to the default axis definitions. So this is true exactly when glyphsLib
+    /// would see a non-None "Axes" parameter.
+    ///
+    /// <https://github.com/googlefonts/glyphsLib/blob/v6.13.1/Lib/glyphsLib/builder/axes.py#L187-L191>
+    /// <https://github.com/googlefonts/glyphsLib/blob/v6.13.1/Lib/glyphsLib/classes.py#L4890-L4907>
+    pub declares_axes: bool,
     pub masters: Vec<FontMaster>,
     pub default_master_idx: usize,
     pub glyphs: BTreeMap<SmolStr, Glyph>,
@@ -334,6 +347,32 @@ pub struct Glyph {
     pub production_name: Option<SmolStr>,
     /// If this is a smart component, these are the axe names -> user coords
     pub smart_component_axes: BTreeMap<SmolStr, RangeInclusive<i64>>,
+    /// What the source itself said about this glyph, before any of our fallbacks.
+    ///
+    /// See [`SourceGlyphInfo`]: FEA glyph predicates compare these, not the
+    /// cooked [`Self::category`]/[`Self::sub_category`].
+    pub source_info: SourceGlyphInfo,
+}
+
+/// The glyph attributes a Glyphs.app source stores, exactly as it stored them.
+///
+/// [`Glyph::category`] and [`Glyph::sub_category`] are *cooked*: when the source
+/// leaves them out we fill them in by looking the glyph up in the bundled
+/// GlyphData. A FEA glyph predicate token (`$[category == "Letter"]`) must not
+/// see those fallbacks -- glyphsLib's `TokenExpander` reads plain `GSGlyph`
+/// attributes, which stay `None` unless the file sets them
+/// ([`tokens.py`], `_get_value_for_glyph`) -- so the raw strings are kept here.
+/// `case` is here for the same reason and has no other use in fontc.
+///
+/// [`tokens.py`]: https://github.com/googlefonts/glyphsLib/blob/main/Lib/glyphsLib/builder/tokens.py
+#[derive(Clone, Default, Debug, PartialEq, Eq, Hash)]
+pub struct SourceGlyphInfo {
+    /// `category = Letter;`, unparsed; `None` if the source did not set it.
+    pub category: Option<SmolStr>,
+    /// `subCategory = Ligature;`, unparsed; `None` if the source did not set it.
+    pub sub_category: Option<SmolStr>,
+    /// `case = lower;`, unparsed; `None` if the source did not set it.
+    pub case: Option<SmolStr>,
 }
 
 impl Glyph {
@@ -1152,9 +1191,44 @@ impl PlistParamsExt for Plist {
     }
 }
 
+/// Whose custom parameters a [`RawCustomParameters`] holds.
+///
+/// Only needed by the handful of parameters whose meaning, or whose warning,
+/// depends on that.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ParamOwner<'a> {
+    Font,
+    Master,
+    Instance(&'a str),
+}
+
+/// What to say about a `Replace Prefix`/`Replace Feature` we are not applying,
+/// or `None` when there is nothing to say.
+///
+/// A master's are handled: the default master's rewrite the one feature file we
+/// compile, and the rest are covered by the single warning naming them
+/// (see [`FeatureReplacements`] and `masters_with_differing_features`). A
+/// font's do nothing in glyphsLib either, so there is nothing to report.
+///
+/// An instance's are a real, silent loss. glyphsLib applies them when it builds
+/// that instance's UFO (`apply_instance_data_to_ufo` ->
+/// `to_ufo_custom_params(None, ufo, glyphs_instance)`,
+/// builder/instances.py:470), so a `fontc --instance` static build of a pinned
+/// instance that carries one compiles feature code fontmake would have
+/// replaced. Rewriting features at the pin needs the machinery we lack, so we
+/// say so instead.
+fn unapplied_replacement_warning(param: &str, owner: ParamOwner) -> Option<String> {
+    match owner {
+        ParamOwner::Font | ParamOwner::Master => None,
+        ParamOwner::Instance(instance) => Some(format!(
+            "'{param}' on instance '{instance}' is ignored: fontc does not replace features at an instance"
+        )),
+    }
+}
+
 impl RawCustomParameters {
     ////convert into the parsed params for a top-level font
-    fn to_custom_params(&self) -> Result<CustomParameters, Error> {
+    fn to_custom_params(&self, owner: ParamOwner) -> Result<CustomParameters, Error> {
         let mut params = CustomParameters::default();
         let mut virtual_masters = Vec::<BTreeMap<String, OrderedFloat<f64>>>::new();
         // PANOSE custom parameter is accessible under a short name and a long name:
@@ -1395,6 +1469,15 @@ impl RawCustomParameters {
                     Ok(s) => params.name_table_entries.push(s),
                     Err(e) => log::warn!("bad 'Name Table Entry': {e}"),
                 },
+                // Handled where the feature text is built, from the *default*
+                // master's copies only; see [`FeatureReplacements`]. An
+                // instance's copies stay unsupported -- that is instancing
+                // territory (see `instance_overrides` in glyphs2fontir).
+                "Replace Prefix" | "Replace Feature" => {
+                    if let Some(msg) = unapplied_replacement_warning(name, owner) {
+                        log_once_warn!("{}", msg);
+                    }
+                }
                 _ => log_once_warn!("unknown custom parameter '{name}'"),
             }
         }
@@ -1431,6 +1514,14 @@ impl RawCustomParameters {
 
     fn take_axes(&mut self) -> Option<Vec<Axis>> {
         self.take("Axes").and_then(|p| p.as_axes())
+    }
+
+    /// Read the "Axes" parameter without consuming it.
+    fn peek_axes(&self) -> Option<Vec<Axis>> {
+        self.0
+            .iter()
+            .find(|val| val.name == "Axes" && val.disabled != Some(true))
+            .and_then(|val| val.value.as_axes())
     }
 
     fn take_axis_mappings(&mut self) -> Option<Vec<AxisMapping>> {
@@ -1632,6 +1723,32 @@ pub struct Axis {
     pub hidden: Option<bool>,
 }
 
+fn axis(name: &str, tag: &str) -> Axis {
+    Axis {
+        name: name.into(),
+        tag: tag.into(),
+        hidden: None,
+    }
+}
+
+/// The axes glyphsLib's `GSFont` starts life with, before any source says otherwise.
+///
+/// <https://github.com/googlefonts/glyphsLib/blob/v6.13.1/Lib/glyphsLib/classes.py#L4549>
+fn default_axis_pair() -> Vec<Axis> {
+    vec![axis("Weight", "wght"), axis("Width", "wdth")]
+}
+
+/// The axes glyphsLib considers when a font has no "Axes" custom parameter.
+///
+/// Note the third one: a Glyphs 2 master's `customValue` lands here even though the
+/// font never named a Custom axis.
+/// <https://github.com/googlefonts/glyphsLib/blob/v6.13.1/Lib/glyphsLib/builder/axes.py#L569-L572>
+fn default_axis_definitions() -> Vec<Axis> {
+    let mut axes = default_axis_pair();
+    axes.push(axis("Custom", "XXXX"));
+    axes
+}
+
 #[derive(Default, Clone, Debug, PartialEq, FromPlist)]
 struct RawGlyph {
     layers: Vec<RawLayer>,
@@ -1644,6 +1761,8 @@ struct RawGlyph {
     unicode: Option<String>,
     category: Option<SmolStr>,
     sub_category: Option<SmolStr>,
+    // glyphs 3 only; we have no use for it except FEA glyph predicates
+    case: Option<SmolStr>,
     #[fromplist(alt_name = "production")]
     production_name: Option<SmolStr>,
     parts_settings: Vec<RawPartSetting>,
@@ -2490,6 +2609,34 @@ impl RawFont {
         Ok(raw_font)
     }
 
+    /// See [`Font::declares_axes`]; must be asked before [`Self::v2_to_v3_axes`] runs.
+    ///
+    /// <https://github.com/googlefonts/glyphsLib/blob/v6.13.1/Lib/glyphsLib/classes.py#L4890-L4907>
+    fn declares_axes(&self) -> bool {
+        // glyphsLib's GSFont.axes: a v3 font's own list, a v2 font's "Axes" custom
+        // parameter, or - when a v2 font has none - the default (Weight, Width) pair.
+        let axes = if self.format_version.is_v2() {
+            // GSFont.__init__ seeds a v2 font's axes with the default pair
+            self.custom_parameters
+                .peek_axes()
+                .unwrap_or_else(default_axis_pair)
+        } else {
+            self.axes.clone()
+        };
+        // ...which glyphsLib turns back into an "Axes" parameter unless it is just the
+        // default pair and nothing else bends the axes. GSAxis equality compares name
+        // and tag only, so a *hidden* Width axis still counts as the default one; that
+        // is why fontmake loses the hidden flag on such an axis.
+        // https://github.com/googlefonts/glyphsLib/blob/v6.13.1/Lib/glyphsLib/classes.py#L1262-L1263
+        let is_default_pair = matches!(
+            axes.as_slice(),
+            [weight, width]
+                if weight.name == "Weight" && weight.tag == "wght"
+                    && width.name == "Width" && width.tag == "wdth"
+        );
+        !is_default_pair || self.custom_parameters.contains("Axis Mappings")
+    }
+
     fn v2_to_v3_axes(&mut self) -> Result<Vec<String>, Error> {
         let mut tags = Vec::new();
         if let Some(v2_axes) = self.custom_parameters.take_axes() {
@@ -2502,21 +2649,7 @@ impl RawFont {
         // Match the defaults from https://github.com/googlefonts/glyphsLib/blob/f6e9c4a29ce764d34c309caef5118c48c156be36/Lib/glyphsLib/builder/axes.py#L526
         // if we have nothing
         if self.axes.is_empty() {
-            self.axes.push(Axis {
-                name: "Weight".into(),
-                tag: "wght".into(),
-                hidden: None,
-            });
-            self.axes.push(Axis {
-                name: "Width".into(),
-                tag: "wdth".into(),
-                hidden: None,
-            });
-            self.axes.push(Axis {
-                name: "Custom".into(),
-                tag: "XXXX".into(),
-                hidden: None,
-            });
+            self.axes = default_axis_definitions();
         }
 
         if self.axes.len() > 3 {
@@ -2683,10 +2816,17 @@ impl RawFont {
         // a concatenation of three other optional attributes weirdly called
         // 'width', 'weight' and 'custom' (in exactly this order).
         // The first two can only contain few predefined values, the last one is
-        // residual and free-form. They default to 'Regular' when omitted in
-        // the source. See:
+        // residual and free-form. 'width' and 'weight' default to 'Regular'
+        // when omitted in the source, 'custom' to the empty string. See:
         // https://github.com/schriftgestalt/GlyphsSDK/blob/Glyphs3/GlyphsFileFormat/GlyphsFileFormatv2.md
-        // https://github.com/googlefonts/glyphsLib/blob/9d5828d/Lib/glyphsLib/classes.py#L1700-L1711
+        // https://github.com/googlefonts/glyphsLib/blob/6.13.1/Lib/glyphsLib/classes.py#L1605-L1610
+        //
+        // Each is one whole component of the name, never a bag of words:
+        // 'custom = "Regular Italic"' names a master "Regular Italic", not
+        // "Italic". Only a component that is *exactly* "Regular" is redundant,
+        // and even then only while another component is left to name the
+        // master. glyphsLib's GSFontMaster._joinName:
+        // https://github.com/googlefonts/glyphsLib/blob/6.13.1/Lib/glyphsLib/classes.py#L1714-L1725
         for master in self.font_master.iter_mut() {
             // Even though glyphs2 masters don't officially have a 'name' attribute,
             // some glyphs2 sources produced by more recent versions of Glyphs
@@ -2696,35 +2836,42 @@ impl RawFont {
                 continue;
             }
 
-            // Remove Nones, empty strings and redundant occurrences of 'Regular'
+            let custom = master.custom.as_deref().unwrap_or_default();
             let mut names = [
-                master.width.as_deref(),
-                master.weight.as_deref(),
-                master.custom.as_deref(),
+                master.width.as_deref().unwrap_or("Regular"),
+                master.weight.as_deref().unwrap_or("Regular"),
+                custom,
             ]
-            .iter()
-            .flatten()
-            .flat_map(|n| n.split_ascii_whitespace())
-            .filter(|x| *x != "Regular")
+            .into_iter()
+            .filter(|name| !name.is_empty())
             .collect::<Vec<_>>();
 
-            // append "Italic" if italic angle != 0
-            if let Some(italic_angle) = master.italic_angle
-                && italic_angle != 0.0
-                && (names.is_empty()
-                    || !names
-                        .iter()
-                        // https://github.com/googlefonts/glyphsLib/blob/d42d3b15/Lib/glyphsLib/classes.py#L1710
-                        .any(|name| name.contains("Italic") || name.contains("Oblique")))
+            // Drop the redundant "Regular"s, but never the last name standing
+            while names.len() > 1
+                && let Some(idx) = names.iter().position(|name| *name == "Regular")
             {
-                names.push("Italic");
+                names.remove(idx);
             }
-            // if all are empty, default to "Regular"
-            master.name = if names.is_empty() {
-                Some("Regular".into())
+
+            let is_italic = master.italic_angle.is_some_and(|angle| angle != 0.0);
+            let name = if is_italic && names == ["Regular"] {
+                // A master with nothing but an italic angle is the Italic
+                "Italic".to_string()
             } else {
-                Some(names.join(" "))
+                // glyphsLib asks only whether *custom* already says Italic or
+                // Oblique; we ask it of every component, so that a weight or
+                // width saying so doesn't earn a second "Italic" either.
+                // https://github.com/googlefonts/fontc/issues/1175
+                if is_italic
+                    && !names
+                        .iter()
+                        .any(|name| name.contains("Italic") || name.contains("Oblique"))
+                {
+                    names.push("Italic");
+                }
+                names.join(" ")
             };
+            master.name = Some(name);
         }
         Ok(())
     }
@@ -2942,6 +3089,56 @@ fn default_master_idx(raw_font: &mut RawFont) -> usize {
 
 fn whitespace_separated_tokens(s: &str) -> Vec<&str> {
     s.split_whitespace().collect()
+}
+
+/// The "linked style": what a style name has left to say once the style
+/// linking has said its piece.
+///
+/// glyphsLib walks the name in reverse and strips **one** occurrence each of
+/// `Regular`, `Bold` and `Italic`/`Oblique`, and only the ones the linking
+/// asks for: `Regular` only when the master or instance is neither bold nor
+/// italic. What survives is appended to the family name to make
+/// `styleMapFamilyName`, i.e. name ID 1. So a master called `Regular Italic`
+/// with an italic angle keeps its `Regular`, because only the `Italic` is
+/// spoken for.
+///
+/// <https://github.com/googlefonts/glyphsLib/blob/6.13.1/Lib/glyphsLib/builder/names.py#L90-L104>
+pub fn linked_style(style_name: &str, is_bold: bool, is_italic: bool) -> String {
+    let (mut wants_bold, mut wants_italic) = (is_bold, is_italic);
+    let mut wants_regular = !(wants_bold || wants_italic);
+    let mut kept: Vec<&str> = Vec::new();
+    for part in style_name.split_ascii_whitespace().rev() {
+        match part {
+            "Regular" if wants_regular => wants_regular = false,
+            "Bold" if wants_bold => wants_bold = false,
+            "Italic" | "Oblique" if wants_italic => wants_italic = false,
+            _ => kept.push(part),
+        }
+    }
+    kept.reverse();
+    kept.join(" ")
+}
+
+/// `styleMapFamilyName` for a master, i.e. name ID 1 of a variable font.
+///
+/// glyphsLib builds a master's style map names the same way it builds an
+/// instance's, but takes the linking from the master itself: italic from the
+/// italic angle, bold only from a name that is exactly one of the three bold
+/// styles.
+///
+/// <https://github.com/googlefonts/glyphsLib/blob/6.13.1/Lib/glyphsLib/builder/names.py#L21-L42>
+pub fn master_style_map_family_name(family_name: &str, master: &FontMaster) -> String {
+    let is_bold = matches!(
+        master.name.as_str(),
+        "Bold" | "Bold Italic" | "Bold Oblique"
+    );
+    let is_italic = master.italic_angle().is_some_and(|angle| angle != 0.0);
+    let linked_style = linked_style(&master.name, is_bold, is_italic);
+    if linked_style.is_empty() {
+        family_name.to_string()
+    } else {
+        format!("{family_name} {linked_style}")
+    }
 }
 
 fn axis_index(axes: &[Axis], pred: impl Fn(&Axis) -> bool) -> Option<usize> {
@@ -3376,6 +3573,12 @@ impl RawGlyph {
         let mut category = parse_category(self.category.as_deref(), &self.glyphname);
         let mut sub_category = parse_category(self.sub_category.as_deref(), &self.glyphname);
         let mut production_name = self.production_name;
+        // keep what the source said, before any GlyphData fallback below
+        let source_info = SourceGlyphInfo {
+            category: self.category.clone(),
+            sub_category: self.sub_category.clone(),
+            case: self.case,
+        };
 
         // Whether the source explicitly set a non-empty category/subCategory. A value that
         // was set but not recognized parses to None (parse_category logs and drops it), so
@@ -3425,6 +3628,7 @@ impl RawGlyph {
             sub_category,
             production_name,
             smart_component_axes: part_settings,
+            source_info,
         })
     }
 }
@@ -3458,6 +3662,173 @@ pub fn glyphs_to_opentype_lang_id(lang: &str) -> Option<u16> {
         .binary_search_by_key(&lang, |entry| entry.0)
         .ok()
         .map(|idx| GLYPHS_TO_OPENTYPE_LANGUAGE_ID[idx].1 as u16)
+}
+
+/// One master's `Replace Prefix` and `Replace Feature` custom parameters.
+///
+/// Line numbers below are glyphsLib 6.13.1, as shipped with fontmake 3.12.1.
+///
+/// glyphsLib applies these to the feature text it has just written for *that
+/// master's* UFO: `to_ufo_master_features` then `to_ufo_custom_params(ufo,
+/// master)`, in that order and for that reason
+/// (builder/builders.py:251-256). The font-level copies of the same parameters
+/// do nothing, because `to_ufo_custom_params(ufo, font)` runs earlier, in
+/// `to_ufo_font_attributes` (builder/font.py:60), when the UFO has no feature
+/// text yet and both handlers no-op on empty text
+/// (builder/custom_params.py:975-977 returns early; `replace_feature` on ""
+/// matches nothing).
+///
+/// Only the *default* master's replacements reach a fontc-built font: fontc
+/// compiles one feature file, as ufo2ft does, and the one ufo2ft compiles is
+/// the default source's. See [`Font::try_from`], and [`FeatureWork`] in
+/// ufo2fontir for the designspace counterpart of the same rule.
+///
+/// <https://github.com/googlefonts/glyphsLib/blob/682ff4b177/Lib/glyphsLib/builder/custom_params.py#L966-L1012>
+///
+/// [`FeatureWork`]: https://github.com/googlefonts/fontc/blob/main/ufo2fontir/src/source.rs
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct FeatureReplacements {
+    /// Prefix name -> replacement code, the map `ReplacePrefixParamHandler`
+    /// builds; a repeated name keeps the last value, as its own comment says
+    /// (custom_params.py:968-973).
+    prefixes: BTreeMap<String, String>,
+    /// Feature tag -> replacement *body*.
+    ///
+    /// `ReplaceFeatureParamHandler` rewrites the whole feature text once per
+    /// parameter (custom_params.py:996-1001) and `replace_feature`'s regex
+    /// always hits the first `feature <tag> {` block, `count=1`
+    /// (builder/features.py:294-308), so a second parameter for the same tag
+    /// overwrites what the first one wrote: last wins here too.
+    ///
+    /// We match the block structurally where glyphsLib matches it with a
+    /// regex, which differs in one pathological case: a `feature <tag> { ... }
+    /// <tag>;` block written *inside* a prefix's code would be the first
+    /// textual match there and is not a candidate here. Glyphs writes feature
+    /// blocks as features.
+    features: BTreeMap<String, String>,
+}
+
+impl FeatureReplacements {
+    /// The replacements one master's custom parameters ask for.
+    ///
+    /// Disabled parameters are skipped: fontmake builds are `minimal`, and
+    /// there `GlyphsObjectProxy` never even records them
+    /// (custom_params.py:94-97, and :1109-1112 for where `minimal` comes from).
+    fn new(params: &RawCustomParameters) -> Result<Self, Error> {
+        let mut result = Self::default();
+        for param in &params.0 {
+            if param.taken() || param.disabled == Some(true) {
+                continue;
+            }
+            let dest = match param.name.as_str() {
+                "Replace Prefix" => &mut result.prefixes,
+                "Replace Feature" => &mut result.features,
+                _ => continue,
+            };
+            let (target, code) = split_replacement(&param.name, &param.value)?;
+            dest.insert(target, code);
+        }
+        Ok(result)
+    }
+}
+
+/// Split a `Replace Prefix`/`Replace Feature` value into its target and its code.
+///
+/// glyphsLib does `re.split(r"\s*;\s*", value, maxsplit=1)` and unpacks the
+/// result into two names (custom_params.py:969-970 and :997), so a value with
+/// no `;` raises `ValueError` and the build stops. We stop too rather than
+/// guess what was meant.
+fn split_replacement(param: &str, value: &Plist) -> Result<(String, String), Error> {
+    let value = value
+        .as_str()
+        .ok_or_else(|| Error::BadValue(format!("'{param}' must be a string, got {value:?}")))?;
+    let semicolon = value.find(';').ok_or_else(|| {
+        Error::BadValue(format!(
+            "'{param}' must be '<target>;<code>', but '{value}' has no ';'"
+        ))
+    })?;
+    // the `\s*` on either side of the `;` in glyphsLib's pattern
+    Ok((
+        value[..semicolon].trim_end().to_string(),
+        value[semicolon + 1..].trim_start().to_string(),
+    ))
+}
+
+/// The three lists a .glyphs file's feature text is built from.
+#[derive(Clone, Copy)]
+struct RawFeatures<'a> {
+    classes: &'a [RawFeature],
+    prefixes: &'a [RawFeature],
+    features: &'a [RawFeature],
+}
+
+/// The FEA snippets of a font, with one master's replacements applied.
+///
+/// Mirrors `_to_ufo_features` (builder/features.py:83-190), which emits a
+/// snippet per class, prefix and feature.
+fn build_features(
+    raw: RawFeatures,
+    replacements: &FeatureReplacements,
+) -> Result<Vec<FeatureSnippet>, Error> {
+    let mut snippets = Vec::new();
+    for class in raw.classes {
+        // `replace_prefixes` only walks `font.featurePrefixes`
+        // (features.py:334-338), so a class is never a target
+        snippets.push(class.class_to_feature()?);
+    }
+    for prefix in raw.prefixes {
+        snippets.push(prefix.prefix_to_feature(replacements)?);
+    }
+    let mut replaced: HashSet<&str> = HashSet::new();
+    for feature in raw.features {
+        let tag = feature.name()?;
+        // `count=1`, on text that omits the blocks a `minimal` build drops
+        // (features.py:126-129), so only the first *enabled* block with this
+        // tag is rewritten
+        let body = match replacements.features.get(tag) {
+            Some(body) if !feature.disabled() && replaced.insert(tag) => Some(body.as_str()),
+            _ => None,
+        };
+        snippets.push(feature.raw_feature_to_feature(body)?);
+    }
+    Ok(snippets)
+}
+
+/// A master's name, falling back to its id when it is unnamed, for log messages.
+fn master_name(master: &RawFontMaster) -> &str {
+    master.name.as_deref().unwrap_or(&master.id)
+}
+
+/// The masters whose feature text differs from the default master's, named, in
+/// source order.
+///
+/// Only their `Replace Prefix`/`Replace Feature` can make it differ -- every
+/// other input to the text is font-wide -- but two different sets of
+/// replacements can still land on the same text, so this compares the text
+/// itself rather than the parameters.
+///
+/// Non-empty means we are building something fontmake would not: it compiles
+/// each master's features and lets varLib merge the layout tables, so values
+/// the masters disagree about become variations there and constants here. That
+/// merge is what fontc cannot follow; see [`FeatureReplacements`].
+fn masters_with_differing_features<'a>(
+    masters: &'a [RawFontMaster],
+    replacements: &[FeatureReplacements],
+    default_master_idx: usize,
+    default_replacements: &FeatureReplacements,
+    default_features: &[FeatureSnippet],
+    raw: RawFeatures,
+) -> Result<Vec<&'a str>, Error> {
+    let mut differing = Vec::new();
+    for (idx, master) in masters.iter().enumerate() {
+        if idx == default_master_idx || replacements[idx] == *default_replacements {
+            continue;
+        }
+        if build_features(raw, &replacements[idx])? != default_features {
+            differing.push(master_name(master));
+        }
+    }
+    Ok(differing)
 }
 
 impl RawFeature {
@@ -3510,9 +3881,22 @@ impl RawFeature {
     }
 
     // https://github.com/googlefonts/glyphsLib/blob/24b4d340e4c82948ba121dcfe563c1450a8e69c9/Lib/glyphsLib/builder/features.py#L90
-    fn prefix_to_feature(&self) -> Result<FeatureSnippet, Error> {
+    fn prefix_to_feature(
+        &self,
+        replacements: &FeatureReplacements,
+    ) -> Result<FeatureSnippet, Error> {
         let name = self.name.as_deref().unwrap_or_default();
-        let code = format!("# Prefix: {}\n{}{}", name, self.autostr(), self.code);
+        // `Replace Prefix` swaps the code and nothing else: glyphsLib parses the
+        // feature text back into a temporary font, assigns `prefix.code`, and
+        // re-emits (features.py:315-340), so the `# Prefix:` header and the
+        // `# automatic` marker are written again from the prefix's own fields
+        // (features.py:100-108). A name with no prefix to match is ignored.
+        let code = replacements
+            .prefixes
+            .get(name)
+            .map(String::as_str)
+            .unwrap_or(&self.code);
+        let code = format!("# Prefix: {}\n{}{}", name, self.autostr(), code);
         Ok(FeatureSnippet::new(code, self.disabled()))
     }
 
@@ -3529,16 +3913,28 @@ impl RawFeature {
     }
 
     // https://github.com/googlefonts/glyphsLib/blob/24b4d340e4c82948ba121dcfe563c1450a8e69c9/Lib/glyphsLib/builder/features.py#L113
-    fn raw_feature_to_feature(&self) -> Result<FeatureSnippet, Error> {
+    fn raw_feature_to_feature(&self, replacement: Option<&str>) -> Result<FeatureSnippet, Error> {
         let name = self.name()?;
-        let insert_mark = self.insert_mark_if_manual_kern_feature();
-        let code = format!(
-            "feature {name} {{\n{}{}{}{insert_mark}\n}} {name};",
-            self.autostr(),
-            self.feature_names(),
-            self.code
-        );
-        Ok(FeatureSnippet::new(code, self.disabled()))
+        let body = match replacement {
+            // `_replace_block` replaces everything between `feature <tag> {\n`
+            // and the line `} <tag>;`, and newline-terminates the replacement
+            // first (features.py:294-308) -- so unlike `Replace Prefix` this
+            // takes the `# automatic` marker, the `featureNames` block and the
+            // manual-kern insert mark with it.
+            Some(repl) if repl.ends_with('\n') => repl.to_string(),
+            Some(repl) => format!("{repl}\n"),
+            None => format!(
+                "{}{}{}{}\n",
+                self.autostr(),
+                self.feature_names(),
+                self.code,
+                self.insert_mark_if_manual_kern_feature()
+            ),
+        };
+        Ok(FeatureSnippet::new(
+            format!("feature {name} {{\n{body}}} {name};"),
+            self.disabled(),
+        ))
     }
 
     //https://github.com/googlefonts/glyphsLib/blob/c4db6b981d577f4/Lib/glyphsLib/builder/features.py#L180
@@ -3736,7 +4132,9 @@ impl Instance {
             axis_mappings,
             axes_values: value.axes_values.clone(),
             properties: value.properties.clone(),
-            custom_parameters: value.custom_parameters.to_custom_params()?,
+            custom_parameters: value
+                .custom_parameters
+                .to_custom_params(ParamOwner::Instance(&value.name))?,
             is_bold: value.is_bold.unwrap_or_default() != 0,
             is_italic: value.is_italic.unwrap_or_default() != 0,
             link_style: value.link_style.clone(),
@@ -3829,21 +4227,9 @@ impl Instance {
         }
     }
 
-    /// glyphsLib's `_get_linked_style`, walking the style name in reverse.
+    /// glyphsLib's `_get_linked_style` for this instance's own name.
     fn linked_style_from_name(&self) -> String {
-        let (mut wants_bold, mut wants_italic) = (self.is_bold, self.is_italic);
-        let mut wants_regular = !(wants_bold || wants_italic);
-        let mut kept: Vec<&str> = Vec::new();
-        for part in self.name.split_ascii_whitespace().rev() {
-            match part {
-                "Regular" if wants_regular => wants_regular = false,
-                "Bold" if wants_bold => wants_bold = false,
-                "Italic" | "Oblique" if wants_italic => wants_italic = false,
-                _ => kept.push(part),
-            }
-        }
-        kept.reverse();
-        kept.join(" ")
+        linked_style(&self.name, self.is_bold, self.is_italic)
     }
 
     /// The CFF `FullName` for a static build of this instance, if it states one.
@@ -3941,6 +4327,9 @@ impl TryFrom<RawFont> for Font {
     type Error = Error;
 
     fn try_from(mut from: RawFont) -> Result<Self, Self::Error> {
+        // Ask before v2_to_v3 consumes the "Axes" parameter
+        let declares_axes = from.declares_axes();
+
         if from.format_version.is_v2() {
             from.v2_to_v3()?;
         } else {
@@ -3975,7 +4364,7 @@ impl TryFrom<RawFont> for Font {
         let axis_mappings = UserToDesignMapping::new(&mut from, &instances);
         let default_master_idx = default_master_idx(&mut from);
 
-        let mut custom_parameters = from.custom_parameters.to_custom_params()?;
+        let mut custom_parameters = from.custom_parameters.to_custom_params(ParamOwner::Font)?;
 
         let glyph_order = make_glyph_order(&from.glyphs, custom_parameters.glyph_order.take());
 
@@ -3994,15 +4383,40 @@ impl TryFrom<RawFont> for Font {
             glyphs.insert(glyph.name.clone(), glyph);
         }
 
-        let mut features = Vec::new();
-        for class in from.classes {
-            features.push(class.class_to_feature()?);
-        }
-        for prefix in from.feature_prefixes {
-            features.push(prefix.prefix_to_feature()?);
-        }
-        for feature in from.features {
-            features.push(feature.raw_feature_to_feature()?);
+        // Exactly one feature file reaches the font, so exactly one master's
+        // `Replace Prefix`/`Replace Feature` can be honored: the default's,
+        // which is the source ufo2ft compiles (see [`FeatureReplacements`]).
+        let replacements = from
+            .font_master
+            .iter()
+            .map(|master| FeatureReplacements::new(&master.custom_parameters))
+            .collect::<Result<Vec<_>, Error>>()?;
+        // a font with no masters at all appears in tests; it has no default
+        let default_replacements = replacements
+            .get(default_master_idx)
+            .cloned()
+            .unwrap_or_default();
+        let raw_features = RawFeatures {
+            classes: &from.classes,
+            prefixes: &from.feature_prefixes,
+            features: &from.features,
+        };
+        let features = build_features(raw_features, &default_replacements)?;
+
+        let differing = masters_with_differing_features(
+            &from.font_master,
+            &replacements,
+            default_master_idx,
+            &default_replacements,
+            &features,
+            raw_features,
+        )?;
+        if !differing.is_empty() {
+            warn!(
+                "Compiling only the default master's features ({}); the feature text of {} differs (Replace Prefix/Replace Feature) and is ignored",
+                master_name(&from.font_master[default_master_idx]),
+                differing.join(", ")
+            );
         }
 
         let units_per_em = from.units_per_em.ok_or(Error::NoUnitsPerEm)?;
@@ -4058,7 +4472,7 @@ impl TryFrom<RawFont> for Font {
             .font_master
             .into_iter()
             .map(|m| {
-                let custom_parameters = m.custom_parameters.to_custom_params()?;
+                let custom_parameters = m.custom_parameters.to_custom_params(ParamOwner::Master)?;
                 let metrics_source_id =
                     resolve_metrics_source_id(&custom_parameters, &master_ids_to_names);
                 // v2 masters carry stems directly; in v3 the font defines
@@ -4157,6 +4571,7 @@ impl TryFrom<RawFont> for Font {
             format_version: from.format_version,
             units_per_em,
             axes: from.axes,
+            declares_axes,
             masters,
             default_master_idx,
             glyphs,
@@ -4780,6 +5195,32 @@ mod tests {
     #[test]
     fn read_wght_var_3_metrics() {
         assert_wght_var_metrics(&Font::load(&glyphs3_dir().join("WghtVar.glyphs")).unwrap());
+    }
+
+    /// A source that lists its own axes has asked for them, whatever they do.
+    #[test]
+    fn a_source_that_names_its_axes_declares_them() {
+        // an "Axes" custom parameter, and a v3 `axes` list, that aren't the defaults
+        for path in [
+            glyphs2_dir().join("WghtVar.glyphs"),
+            glyphs3_dir().join("WghtVar.glyphs"),
+            glyphs2_dir().join("WghtVar_PointAxis.glyphs"),
+        ] {
+            assert!(Font::load(&path).unwrap().declares_axes, "{path:?}");
+        }
+    }
+
+    /// Falling back to the defaults - which every Glyphs 2 source without an "Axes"
+    /// parameter does - is not asking for anything.
+    #[test]
+    fn a_source_with_the_default_axes_declares_nothing() {
+        let font = Font::load(&glyphs2_dir().join("WghtVar_ImplicitAxes.glyphs")).unwrap();
+        assert!(!font.declares_axes);
+        assert_eq!(
+            vec!["wght", "wdth", "XXXX"],
+            font.axes.iter().map(|a| a.tag.as_str()).collect::<Vec<_>>(),
+            "the source gets the three default axis slots regardless"
+        );
     }
 
     /// So far we don't have any package-only examples
@@ -5406,7 +5847,7 @@ etc;
 
         assert!(
             feature
-                .raw_feature_to_feature()
+                .raw_feature_to_feature(None)
                 .unwrap()
                 .content
                 .contains("# Automatic Code")
@@ -5423,7 +5864,7 @@ etc;
 
         assert!(
             !feature
-                .raw_feature_to_feature()
+                .raw_feature_to_feature(None)
                 .unwrap()
                 .content
                 .contains("# Automatic Code")
@@ -5942,6 +6383,40 @@ etc;
         assert_eq!((cooked.category, cooked.sub_category), (None, None));
     }
 
+    // FEA glyph predicates compare what the source stored, so `source_info` keeps the raw
+    // strings even where cooking dropped (an unknown category) or invented (a GlyphData
+    // fallback) a value. `case` has no cooked counterpart at all.
+    #[test]
+    fn source_info_is_what_the_source_said() {
+        let raw = super::RawGlyph {
+            glyphname: "A".into(),
+            category: Some("Fake".into()),
+            case: Some("upper".into()),
+            ..Default::default()
+        };
+
+        let cooked = raw.build(FormatVersion::V2, &GlyphData::default()).unwrap();
+        assert_eq!(cooked.category, None, "'Fake' is not a category we know");
+        assert_eq!(
+            cooked.source_info,
+            SourceGlyphInfo {
+                category: Some("Fake".into()),
+                sub_category: None,
+                case: Some("upper".into()),
+            }
+        );
+
+        // a glyph the source said nothing about says nothing here either, even
+        // when GlyphData fills the cooked category in
+        let raw = super::RawGlyph {
+            glyphname: "A".into(),
+            ..Default::default()
+        };
+        let cooked = raw.build(FormatVersion::V2, &GlyphData::default()).unwrap();
+        assert_eq!(cooked.category, Some(Category::Letter));
+        assert_eq!(cooked.source_info, SourceGlyphInfo::default());
+    }
+
     // An unrecognized *explicit* subCategory on an underscore-named glyph must not fall
     // through to the name-based Ligature guess: the author set something, so we leave the
     // slot None (which later resolves to Base from anchors) instead of guessing Ligature.
@@ -6043,6 +6518,169 @@ etc;
         let font = Font::load(&glyphs2_dir().join("MasterNameNotExactlyItalic.glyphs")).unwrap();
 
         assert_eq!(font.default_master().name, "ThinItalic");
+    }
+
+    /// A Glyphs 2 master's name is built from three whole components, not
+    /// from the words in them: `custom = "Regular Italic"` names a master
+    /// "Regular Italic". Only a component that is exactly "Regular" is
+    /// redundant, and only while something else is left to name the master.
+    ///
+    /// Every expectation here is what glyphsLib 6.13.1's `GSFontMaster.name`
+    /// returns for the same (width, weight, custom, italicAngle).
+    /// <https://github.com/googlefonts/glyphsLib/blob/6.13.1/Lib/glyphsLib/classes.py#L1714-L1725>
+    #[rstest]
+    #[case::nothing_at_all(None, None, None, None, "Regular")]
+    #[case::weight_only(None, Some("Bold"), None, None, "Bold")]
+    #[case::width_only(Some("Condensed"), None, None, None, "Condensed")]
+    #[case::width_and_weight(Some("Condensed"), Some("Bold"), None, None, "Condensed Bold")]
+    // a custom that is exactly "Regular" is redundant like the others...
+    #[case::custom_is_regular(None, None, Some("Regular"), None, "Regular")]
+    #[case::regular_among_three(
+        Some("Condensed"),
+        Some("Bold"),
+        Some("Regular"),
+        None,
+        "Condensed Bold"
+    )]
+    // ...but "Regular" inside a multi-word custom is part of the name.
+    // Fahkwang and Bai Jamjuree, both by cadsondemak, name their italic
+    // Regular master this way.
+    #[case::regular_italic(None, None, Some("Regular Italic"), Some(10.0), "Regular Italic")]
+    #[case::regular_lowercase_italic(
+        None,
+        None,
+        Some("Regular italic"),
+        Some(10.0),
+        // lowercase "italic" isn't the word glyphsLib looks for
+        "Regular italic Italic"
+    )]
+    #[case::regular_bold(
+        Some("Regular"),
+        Some("Regular"),
+        Some("Regular Bold"),
+        None,
+        "Regular Bold"
+    )]
+    #[case::regular_oblique(None, None, Some("Regular Oblique"), Some(12.0), "Regular Oblique")]
+    // the italic angle names the master when nothing else does...
+    #[case::italic_angle_only(None, None, None, Some(10.0), "Italic")]
+    #[case::bold_italic(None, Some("Bold"), None, Some(10.0), "Bold Italic")]
+    #[case::light_extra_italic(
+        None,
+        Some("Light"),
+        Some("Extra italic"),
+        Some(10.0),
+        "Light Extra italic Italic"
+    )]
+    // ...but never twice: https://github.com/googlefonts/fontc/issues/1175
+    #[case::already_italic(None, None, Some("Thin Italic"), Some(10.0), "Thin Italic")]
+    #[case::italic_not_a_word(None, None, Some("ThinItalic"), Some(10.0), "ThinItalic")]
+    #[case::already_oblique(None, None, Some("Oblique"), Some(12.0), "Oblique")]
+    #[case::bold_oblique(None, Some("Bold"), Some("Oblique"), Some(12.0), "Bold Oblique")]
+    // a zero italic angle is no italic angle
+    #[case::upright_zero_angle(None, Some("Bold"), None, Some(0.0), "Bold")]
+    fn v2_master_name(
+        #[case] width: Option<&str>,
+        #[case] weight: Option<&str>,
+        #[case] custom: Option<&str>,
+        #[case] italic_angle: Option<f64>,
+        #[case] expected: &str,
+    ) {
+        let mut font = RawFont {
+            font_master: vec![RawFontMaster {
+                id: "m01".into(),
+                width: width.map(String::from),
+                weight: weight.map(String::from),
+                custom: custom.map(String::from),
+                italic_angle: italic_angle.map(OrderedFloat),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        font.v2_to_v3_master_names().unwrap();
+
+        assert_eq!(font.font_master[0].name.as_deref(), Some(expected));
+    }
+
+    /// Name ID 1 is the family plus whatever the default master's style name
+    /// has left to say once the style linking has said its piece: one
+    /// `Regular`, one `Bold` and one `Italic`/`Oblique` at most, and each only
+    /// if the master is linked that way. A master called "Regular Italic"
+    /// keeps its "Regular" — that is Fahkwang's name ID 1.
+    ///
+    /// Expectations are glyphsLib 6.13.1 `build_stylemap_names(family, name,
+    /// is_bold=name in ("Bold", "Bold Italic", "Bold Oblique"),
+    /// is_italic=bool(italicAngle))`.
+    /// <https://github.com/googlefonts/glyphsLib/blob/6.13.1/Lib/glyphsLib/builder/names.py#L21-L42>
+    #[rstest]
+    #[case::regular("Regular", None, "Family")]
+    #[case::bold("Bold", None, "Family")]
+    // "Bold" is only style linking when it is the whole name
+    #[case::condensed_bold("Condensed Bold", None, "Family Condensed Bold")]
+    #[case::condensed("Condensed", None, "Family Condensed")]
+    #[case::oblique("Oblique", Some(12.0), "Family")]
+    #[case::bold_oblique("Bold Oblique", Some(12.0), "Family")]
+    #[case::condensed_oblique("Condensed Oblique", Some(12.0), "Family Condensed")]
+    #[case::condensed_bold_oblique("Condensed Bold Oblique", Some(12.0), "Family Condensed Bold")]
+    #[case::italic("Italic", Some(10.0), "Family")]
+    #[case::thin_italic("Thin Italic", Some(10.0), "Family Thin")]
+    // only the Italic is spoken for; the Regular stays
+    #[case::regular_italic("Regular Italic", Some(10.0), "Family Regular")]
+    #[case::regular_lowercase_italic("Regular italic Italic", Some(10.0), "Family Regular italic")]
+    // an upright master's Regular *is* spoken for
+    #[case::condensed_regular("Condensed Regular", None, "Family Condensed")]
+    fn master_style_map_family_names(
+        #[case] master_name: &str,
+        #[case] italic_angle: Option<f64>,
+        #[case] expected: &str,
+    ) {
+        let mut metric_values = BTreeMap::new();
+        if let Some(angle) = italic_angle {
+            metric_values.insert(
+                "italic angle".to_string(),
+                MetricValue {
+                    pos: angle.into(),
+                    over: 0.0.into(),
+                },
+            );
+        }
+        let master = FontMaster {
+            id: "m01".into(),
+            name: master_name.into(),
+            axes_values: Vec::new(),
+            metric_values,
+            alignment_zones: Vec::new(),
+            number_values: BTreeMap::new(),
+            custom_parameters: Default::default(),
+            user_data: BTreeMap::new(),
+            metrics_source_id: None,
+            horizontal_stems: Vec::new(),
+            vertical_stems: Vec::new(),
+        };
+
+        assert_eq!(master_style_map_family_name("Family", &master), expected);
+    }
+
+    /// A name the source spells out is used as is, never rebuilt.
+    #[test]
+    fn v2_master_name_from_the_source_wins() {
+        let mut font = RawFont {
+            font_master: vec![RawFontMaster {
+                id: "m01".into(),
+                name: Some("Whatever The Designer Said".into()),
+                weight: Some("Bold".into()),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        font.v2_to_v3_master_names().unwrap();
+
+        assert_eq!(
+            font.font_master[0].name.as_deref(),
+            Some("Whatever The Designer Said")
+        );
     }
 
     // We had a bug where if a master wasn't at a mapping point the Axis Mapping was modified
@@ -7037,7 +7675,7 @@ name = _corner.hi;
             },
         ]);
 
-        let params = raw_params.to_custom_params().unwrap();
+        let params = raw_params.to_custom_params(ParamOwner::Master).unwrap();
 
         // The first value should win, not the second
         assert_eq!(
@@ -7255,5 +7893,213 @@ mode = append;
             writers[0].get("class").and_then(Plist::as_str),
             Some("KernFeatureWriter")
         );
+    }
+}
+
+#[cfg(test)]
+mod replace_prefix_and_feature_tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    fn glyphs3_dir() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../resources/testdata/glyphs3")
+    }
+
+    fn load() -> Font {
+        Font::load(&glyphs3_dir().join("ReplacePrefixAndFeature.glyphs")).unwrap()
+    }
+
+    fn feature_text(font: &Font) -> String {
+        font.features
+            .iter()
+            .filter_map(FeatureSnippet::str_if_enabled)
+            .collect::<Vec<_>>()
+            .join("\n\n")
+    }
+
+    /// The default master's `Replace Prefix` and `Replace Feature` are applied,
+    /// and nothing else is.
+    ///
+    /// Oracle: `glyphsLib.to_designspace(font, minimal=True)` on this same
+    /// fixture, `ds.findDefault().font.features.text`, byte for byte.
+    /// glyphsLib 6.13.1, as shipped with fontmake 3.12.1.
+    #[test]
+    fn applies_the_default_masters_replacements() {
+        let font = load();
+        assert_eq!(
+            "Regular",
+            font.default_master().name,
+            "not the first master"
+        );
+        assert_eq!(
+            // `Positioning` gets the default master's code and keeps its
+            // `# Prefix:` header and `# automatic` marker; `Untouched` and the
+            // `Letters` class are left alone; `liga`'s whole *body* is
+            // replaced, `# automatic` included; `salt` is left alone. The Bold
+            // master's `pos a 40` and the font-level `pos a 999` are nowhere.
+            concat!(
+                "@Letters = [ f i a\n];\n",
+                "\n",
+                "# Prefix: Positioning\n",
+                "# automatic\n",
+                "lookup PositioningA {\n",
+                "    pos a 30;\n",
+                "} PositioningA;\n",
+                "\n",
+                "# Prefix: Untouched\n",
+                "lookup PositioningB {\n",
+                "    pos a 20;\n",
+                "} PositioningB;\n",
+                "\n",
+                "feature liga {\n",
+                "sub f i by f_i;\n",
+                "sub i f by f_i;\n",
+                "} liga;\n",
+                "\n",
+                "feature salt {\n",
+                "sub a by a.alt;\n",
+                "} salt;",
+            ),
+            feature_text(&font)
+        );
+    }
+
+    /// Every master whose replacements would give it different feature text is
+    /// named in the one warning we emit; the default master never is.
+    #[test]
+    fn names_the_masters_it_ignores() {
+        let raw = RawFont::load(&glyphs3_dir().join("ReplacePrefixAndFeature.glyphs")).unwrap();
+        let replacements = raw
+            .font_master
+            .iter()
+            .map(|master| FeatureReplacements::new(&master.custom_parameters))
+            .collect::<Result<Vec<_>, Error>>()
+            .unwrap();
+        // Regular is the 'Variable Font Origin', Bold is source 0
+        let default_master_idx = 1;
+        let raw_features = RawFeatures {
+            classes: &raw.classes,
+            prefixes: &raw.feature_prefixes,
+            features: &raw.features,
+        };
+        let default_features =
+            build_features(raw_features, &replacements[default_master_idx]).unwrap();
+        assert_eq!(
+            vec!["Bold"],
+            masters_with_differing_features(
+                &raw.font_master,
+                &replacements,
+                default_master_idx,
+                &replacements[default_master_idx],
+                &default_features,
+                raw_features,
+            )
+            .unwrap()
+        );
+    }
+
+    /// A master that asks for the code a prefix already has changes nothing, so
+    /// it is not worth warning about.
+    #[test]
+    fn a_replacement_that_changes_nothing_is_not_named() {
+        let raw = RawFont::load(&glyphs3_dir().join("ReplacePrefixAndFeature.glyphs")).unwrap();
+        let mut replacements = vec![FeatureReplacements::default(); raw.font_master.len()];
+        replacements[0].prefixes.insert(
+            "Positioning".to_string(),
+            raw.feature_prefixes[0].code.clone(),
+        );
+        let raw_features = RawFeatures {
+            classes: &raw.classes,
+            prefixes: &raw.feature_prefixes,
+            features: &raw.features,
+        };
+        let default_features = build_features(raw_features, &replacements[1]).unwrap();
+        assert!(
+            masters_with_differing_features(
+                &raw.font_master,
+                &replacements,
+                1,
+                &replacements[1],
+                &default_features,
+                raw_features,
+            )
+            .unwrap()
+            .is_empty()
+        );
+    }
+
+    /// An instance's copies are a silent loss under `fontc --instance`, so they
+    /// get a warning of their own; a master's and the font's do not.
+    #[test]
+    fn only_an_instances_replacements_are_warned_about() {
+        assert_eq!(
+            Some(
+                "'Replace Prefix' on instance 'Condensed Bold' is ignored: \
+                 fontc does not replace features at an instance"
+                    .to_string()
+            ),
+            unapplied_replacement_warning("Replace Prefix", ParamOwner::Instance("Condensed Bold"))
+        );
+        // the default master's are applied, and the rest are named by the one
+        // warning `masters_with_differing_features` feeds
+        assert_eq!(
+            None,
+            unapplied_replacement_warning("Replace Prefix", ParamOwner::Master)
+        );
+        // inert in glyphsLib too, so there is nothing to report
+        assert_eq!(
+            None,
+            unapplied_replacement_warning("Replace Feature", ParamOwner::Font)
+        );
+    }
+
+    /// The fixture's instance carries both parameters, so the feature text
+    /// asserted above is also proof we do not apply them: they would make the
+    /// `Positioning` prefix `pos a 777` and rewrite `salt`.
+    #[test]
+    fn the_fixture_has_an_instance_to_warn_about() {
+        let font = load();
+        let instance = font.instances.first().expect("an instance");
+        assert_eq!("Regular", instance.name);
+        let raw = RawFont::load(&glyphs3_dir().join("ReplacePrefixAndFeature.glyphs")).unwrap();
+        let names = raw.instances[0]
+            .custom_parameters
+            .0
+            .iter()
+            .map(|param| param.name.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(vec!["Replace Prefix", "Replace Feature"], names);
+        assert!(
+            !feature_text(&font).contains("777"),
+            "the instance's replacement must not reach the font's features"
+        );
+    }
+
+    #[test]
+    fn splits_on_the_first_semicolon_only() {
+        // `re.split(r"\s*;\s*", value, maxsplit=1)`: whitespace either side of
+        // the separator goes, everything after the first ';' is code
+        assert_eq!(
+            ("liga".to_string(), "sub f i by f_i;".to_string()),
+            split_replacement(
+                "Replace Feature",
+                &Plist::String("liga ;\n sub f i by f_i;".into())
+            )
+            .unwrap()
+        );
+    }
+
+    #[test]
+    fn a_value_with_no_semicolon_is_an_error() {
+        // glyphsLib unpacks the split into two names, so this is a ValueError
+        // there; we refuse rather than guess
+        assert!(matches!(
+            split_replacement("Replace Prefix", &Plist::String("Positioning".into())),
+            Err(Error::BadValue(_))
+        ));
+        assert!(matches!(
+            split_replacement("Replace Prefix", &Plist::Integer(7)),
+            Err(Error::BadValue(_))
+        ));
     }
 }

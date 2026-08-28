@@ -5,11 +5,11 @@ use std::path::{Path, PathBuf};
 use crate::{
     GlyphMap,
     compile::{
-        Compilation, Compiler, MockVariationInfo, NopFeatureProvider, Opts, error::CompilerError,
+        Compilation, Compiler, GlyphPredicateAttr, MockVariationInfo, NopFeatureProvider, Opts,
+        error::CompilerError,
     },
     util::ttx::{self as test_utils, Filter, Report, TestCase, TestResult},
 };
-use fontdrasil::types::GlyphName;
 
 static ROOT_TEST_DIR: &str = "./test-data/compile-tests";
 static GOOD_DIR: &str = "good";
@@ -109,42 +109,96 @@ fn run_bad_test(
     }
 }
 
-/// Compile a FEA string using the mini-latin glyph order.
-fn compile_fea(fea: &str, test_name: &str) -> Compilation {
+/// Write `fea` to a temp file named after the test, returning its path.
+fn write_temp_fea(fea: &str, test_name: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!("fea_rs_test_{test_name}"));
     std::fs::create_dir_all(&dir).unwrap();
     let fea_path = dir.join(format!("{test_name}.fea"));
     std::fs::write(&fea_path, fea).unwrap();
+    fea_path
+}
 
+/// The mini-latin glyph order used by most compile tests.
+fn mini_latin_glyph_map() -> GlyphMap {
     let glyph_order_path = Path::new(ROOT_TEST_DIR)
         .join("mini-latin")
         .join(GLYPH_ORDER);
     let glyph_order = std::fs::read_to_string(glyph_order_path).unwrap();
-    let glyph_map = GlyphMap::new(glyph_order.lines()).unwrap();
+    GlyphMap::new(glyph_order.lines()).unwrap()
+}
 
-    Compiler::<'_, NopFeatureProvider, MockVariationInfo>::new(fea_path, &glyph_map)
+/// Compile a FEA string using the mini-latin glyph order.
+fn compile_fea(fea: &str, test_name: &str) -> Compilation {
+    let fea_path = write_temp_fea(fea, test_name);
+    Compiler::<'_, NopFeatureProvider, MockVariationInfo>::new(fea_path, &mini_latin_glyph_map())
         .compile()
         .expect("compilation should succeed")
 }
 
 /// Like [`compile_fea`], but with variable font info.
 fn compile_fea_variable(fea: &str, test_name: &str) -> Compilation {
-    let dir = std::env::temp_dir().join(format!("fea_rs_test_{test_name}"));
-    std::fs::create_dir_all(&dir).unwrap();
-    let fea_path = dir.join(format!("{test_name}.fea"));
-    std::fs::write(&fea_path, fea).unwrap();
-
-    let glyph_order_path = Path::new(ROOT_TEST_DIR)
-        .join("mini-latin")
-        .join(GLYPH_ORDER);
-    let glyph_order = std::fs::read_to_string(glyph_order_path).unwrap();
-    let glyph_map = GlyphMap::new(glyph_order.lines()).unwrap();
+    let fea_path = write_temp_fea(fea, test_name);
     let var_info = test_utils::make_var_info();
-
-    Compiler::<'_, NopFeatureProvider, MockVariationInfo>::new(fea_path, &glyph_map)
+    Compiler::<'_, NopFeatureProvider, MockVariationInfo>::new(fea_path, &mini_latin_glyph_map())
         .with_variable_info(&var_info)
         .compile()
         .expect("compilation should succeed")
+}
+
+/// Compile with a source that answers glyph predicate attributes, given as
+/// (glyph name, attribute, value) triples, returning the diagnostics on failure.
+fn compile_fea_with_glyph_attrs(
+    fea: &str,
+    test_name: &str,
+    attrs: &[(&str, GlyphPredicateAttr, &str)],
+) -> Result<Compilation, String> {
+    let fea_path = write_temp_fea(fea, test_name);
+    let mut var_info = test_utils::make_var_info();
+    var_info.glyph_predicate_attrs = Some(
+        attrs
+            .iter()
+            .map(|(glyph, attr, value)| (((*glyph).into(), *attr), (*value).into()))
+            .collect(),
+    );
+    Compiler::<'_, NopFeatureProvider, MockVariationInfo>::new(fea_path, &mini_latin_glyph_map())
+        .with_variable_info(&var_info)
+        .compile()
+        .map_err(|err| match err {
+            CompilerError::ValidationFail(errs) | CompilerError::CompilationFail(errs) => {
+                errs.to_string(false)
+            }
+            other => panic!("unexpected compiler error: {other}"),
+        })
+}
+
+// An attribute the source may not have set has no ordering: glyphsLib raises a
+// TypeError comparing Python None with `<`, so we reject the clause rather than
+// invent an answer. (The file-driven bad tests cannot reach this: their source
+// has no glyph attributes at all, so the attribute itself is rejected first.)
+#[test]
+fn glyphs_predicate_ordering_on_attribute_is_rejected() {
+    let err = compile_fea_with_glyph_attrs(
+        "@a = [ $[category < \"M\"] ];\nfeature ss01 { sub a by b; } ss01;\n",
+        "predicate_ordering",
+        &[("a", GlyphPredicateAttr::Category, "Letter")],
+    )
+    .err()
+    .expect("ordering on an attribute should be rejected");
+    assert!(
+        err.contains("'<' is only supported on 'name'"),
+        "expected an ordering diagnostic, got:\n{err}"
+    );
+}
+
+// ... but the same operators are fine on the name, which every glyph has.
+#[test]
+fn glyphs_predicate_ordering_on_name_is_allowed() {
+    compile_fea_with_glyph_attrs(
+        "@a = [ $[name < \"b\"] ];\nfeature ss01 { sub @a by b; } ss01;\n",
+        "predicate_ordering_name",
+        &[],
+    )
+    .expect("ordering on the name compiles");
 }
 
 // Regression test for https://github.com/googlefonts/fontc/issues/1847
@@ -308,12 +362,7 @@ fn compile_debg(fea: &str, test_name: &str) -> Option<serde_json::Value> {
     use std::sync::Arc;
 
     let fea_path = format!("{test_name}.fea");
-
-    let glyph_order_path = Path::new(ROOT_TEST_DIR)
-        .join("mini-latin")
-        .join(GLYPH_ORDER);
-    let glyph_order = std::fs::read_to_string(glyph_order_path).unwrap();
-    let glyph_map = GlyphMap::new(glyph_order.lines().map(GlyphName::new)).unwrap();
+    let glyph_map = mini_latin_glyph_map();
 
     let fea = fea.to_string();
     Compiler::<NopFeatureProvider, MockVariationInfo>::new(fea_path, &glyph_map)
@@ -806,4 +855,120 @@ markClass a <anchor 150 -10> @top;
 ",
         "mark_class_in_glyph_class",
     );
+}
+
+/// Compile a FEA string against an explicit glyph order.
+fn compile_fea_with_glyphs(
+    fea: &str,
+    glyph_names: &[&str],
+    test_name: &str,
+) -> Result<Vec<u8>, CompilerError> {
+    let fea_path = write_temp_fea(fea, test_name);
+    let glyph_map = GlyphMap::new(glyph_names.iter().copied()).unwrap();
+    Compiler::<'_, NopFeatureProvider, MockVariationInfo>::new(fea_path, &glyph_map)
+        .compile_binary()
+}
+
+// Compile a predicate-bearing source that must be rejected at validation, and
+// return the (message, source-range) of each error diagnostic. Panics on any
+// other outcome: an out-of-scope predicate has to fail *validation*, not parse,
+// build, or panic. The returned ranges let a caller assert that each diagnostic
+// is attached to the offending child rather than the whole predicate.
+fn predicate_validation_errors(
+    fea: &str,
+    test_name: &str,
+) -> Vec<(String, std::ops::Range<usize>)> {
+    let glyphs = ["a", "b", "a.sc"];
+    let result = compile_fea_with_glyphs(fea, &glyphs, test_name);
+    let Err(CompilerError::ValidationFail(errs)) = result else {
+        panic!(
+            "expected ValidationFail, got {:?}",
+            result.map(|bytes| bytes.len())
+        );
+    };
+    errs.diagnostics()
+        .iter()
+        .filter(|diag| diag.is_error())
+        .map(|diag| (diag.text().to_string(), diag.span()))
+        .collect()
+}
+
+// A predicate rejected at validation fails cleanly (no panic, no silent
+// mis-compile) with each diagnostic attached to the offending child, not the
+// whole predicate. Each case is (predicate, test name, expected (child span text, message
+// fragment) pairs):
+// - `category` is a real attribute, but this compilation has no Glyphs.app
+//   source to answer it, and answering "unset" for every glyph would silently
+//   select nothing. (`like` is supported now, so that is the only error here.)
+// - `NAME` is rejected because glyphsLib's object regex is case-sensitive:
+//   only lowercase `name` is a supported attribute.
+// - Mixing `and`/`or` attaches to the connective that breaks the chain.
+// - A bare value is a string, as in glyphsLib -- except for the ones glyphsLib
+//   types as a boolean or an integer instead (`yes`, `123`, and even `noon`,
+//   whose unanchored boolean regex match reads the leading `no`), which can
+//   never equal a glyph attribute and so must be quoted.
+// - An empty quoted value is rejected (glyphsLib errors on it too), and under
+//   the substring operators it would match every glyph name.
+#[test]
+fn glyphs_predicate_validation_diagnostics() {
+    // (child span text, message fragment) pairs expected for one predicate
+    type ExpectedErrors = &'static [(&'static str, &'static str)];
+    let cases: &[(&str, &str, ExpectedErrors)] = &[
+        (
+            "$[category like \"Letter\"]",
+            "glyphs_predicate_bad",
+            &[("category", "needs Glyphs.app glyph data")],
+        ),
+        (
+            "$[NAME == \"a\"]",
+            "glyphs_predicate_upper_name",
+            &[("NAME", "2052")],
+        ),
+        (
+            "$[name == \"a\" and name == \"b\" or name == \"c\"]",
+            "glyphs_predicate_mixed",
+            &[("or", "2052")],
+        ),
+        (
+            "$[name == yes]",
+            "glyphs_predicate_bare_bool",
+            &[("yes", "is a boolean to glyphsLib")],
+        ),
+        (
+            "$[name == 123]",
+            "glyphs_predicate_bare_number",
+            &[("123", "compared as an integer")],
+        ),
+        (
+            "$[name == noon]",
+            "glyphs_predicate_bare_bool_prefix",
+            &[("noon", "is a boolean to glyphsLib")],
+        ),
+        (
+            "$[name contains \"\"]",
+            "glyphs_predicate_empty_value",
+            &[("\"\"", "empty value")],
+        ),
+    ];
+    for (predicate, test_name, expected) in cases {
+        let fea = format!("@x = [ {predicate} ]; feature test {{ sub @x by a; }} test;");
+        let errs = predicate_validation_errors(&fea, test_name);
+        assert_eq!(
+            errs.len(),
+            expected.len(),
+            "wrong error count for `{predicate}`: {errs:?}"
+        );
+        for (span_text, msg_fragment) in *expected {
+            let (msg, _) = errs
+                .iter()
+                .find(|(_, span)| &fea[span.clone()] == *span_text)
+                .unwrap_or_else(|| {
+                    panic!("expected an error attached to `{span_text}` for `{predicate}`, got {errs:?}")
+                });
+            assert!(
+                msg.contains(msg_fragment),
+                "error on `{span_text}` should contain {msg_fragment:?}, got: {msg}"
+            );
+        }
+    }
 }

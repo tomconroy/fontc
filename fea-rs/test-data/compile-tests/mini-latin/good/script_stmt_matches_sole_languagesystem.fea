@@ -1,0 +1,26 @@
+# fonttools treats a 'script' statement as a no-op when the currently active
+# language systems are exactly '<script> dflt'; at the top of a feature block
+# the active systems are the file's default language systems.
+#
+# So in a file whose only 'languagesystem' statement is 'languagesystem latn
+# dflt', the leading 'script latn' below does nothing at all: the current script
+# stays 'DFLT', and 'sub A by B' is registered under DFLT/dflt. Only the rules
+# following the *second* 'script latn' land under latn. (The third 'script latn'
+# is a genuine no-op: latn/dflt is already active.)
+#
+# This is what fontmake produces for sources like Chathura, whose Glyphs feature
+# prefix declares a single 'languagesystem telu dflt' and whose feature blocks
+# each open with 'script telu; language dflt;'.
+languagesystem latn dflt;
+
+feature test {
+script latn;
+language dflt;
+sub A by B;
+script latn;
+language dflt;
+sub C by D;
+script latn;
+language dflt;
+sub E by F;
+} test;

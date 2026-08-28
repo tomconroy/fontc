@@ -1,0 +1,34 @@
+# fonttools *assigns* the script's default lookups when it sees a 'language'
+# statement, rather than merging them in, so a second 'language TRK' throws
+# away what the first one accumulated and starts again from latn/dflt: the
+# 'two' lookup below is registered under latn/TRK and then dropped again,
+# and only 'four' survives alongside the latn/dflt lookups.
+#
+# Estedad is a source that hits this: glyphsLib emits one lookup block per
+# generated lookup, each repeating 'script latn; language ...;'.
+languagesystem DFLT dflt;
+languagesystem latn dflt;
+languagesystem latn TRK;
+
+feature test {
+    lookup one {
+        script latn;
+        language dflt;
+        sub A by B;
+    } one;
+    lookup two {
+        script latn;
+        language TRK;
+        sub C by D;
+    } two;
+    lookup three {
+        script latn;
+        language dflt;
+        sub E by F;
+    } three;
+    lookup four {
+        script latn;
+        language TRK;
+        sub G by H;
+    } four;
+} test;

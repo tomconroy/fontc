@@ -1,0 +1,146 @@
+{
+.appVersion = "3343";
+.formatVersion = 3;
+axes = (
+{
+name = Weight;
+tag = wght;
+}
+);
+fontMaster = (
+{
+axesValues = (
+100
+);
+id = "FF2DC345-5101-49B6-97F3-57A040F7C387";
+name = Regular;
+}
+);
+glyphs = (
+{
+glyphname = A;
+kernLeft = A;
+kernRight = A;
+layers = (
+{
+layerId = "FF2DC345-5101-49B6-97F3-57A040F7C387";
+width = 608;
+}
+);
+unicode = 65;
+},
+{
+glyphname = E;
+kernLeft = E;
+kernRight = E;
+layers = (
+{
+layerId = "FF2DC345-5101-49B6-97F3-57A040F7C387";
+width = 560;
+}
+);
+unicode = 69;
+},
+{
+glyphname = AE;
+kernLeft = A;
+kernRight = E;
+layers = (
+{
+layerId = "FF2DC345-5101-49B6-97F3-57A040F7C387";
+width = 900;
+}
+);
+unicode = 198;
+},
+{
+glyphname = V;
+kernLeft = V;
+kernRight = V;
+layers = (
+{
+layerId = "FF2DC345-5101-49B6-97F3-57A040F7C387";
+width = 604;
+}
+);
+unicode = 86;
+},
+{
+glyphname = a;
+kernLeft = a;
+layers = (
+{
+layerId = "FF2DC345-5101-49B6-97F3-57A040F7C387";
+width = 520;
+}
+);
+unicode = 97;
+},
+{
+glyphname = o;
+kernLeft = o;
+layers = (
+{
+layerId = "FF2DC345-5101-49B6-97F3-57A040F7C387";
+width = 540;
+}
+);
+unicode = 111;
+}
+);
+instances = (
+{
+axesValues = (
+100
+);
+instanceInterpolations = {
+"FF2DC345-5101-49B6-97F3-57A040F7C387" = 1;
+};
+name = Regular;
+}
+);
+kerningLTR = {
+"FF2DC345-5101-49B6-97F3-57A040F7C387" = {
+"@MMK_L_A" = {
+"@MMK_R_o" = -60;
+};
+"@MMK_L_E" = {
+"@MMK_R_a" = -40;
+};
+};
+};
+kerningRTL = {
+"FF2DC345-5101-49B6-97F3-57A040F7C387" = {
+"@MMK_R_A" = {
+"@MMK_L_V" = -70;
+};
+};
+};
+unitsPerEm = 1000;
+userData = {
+"com.schriftgestaltung.Glyphs.originalKerningGroups" = {
+"public.kern1.A" = (
+A
+);
+"public.kern1.E" = (
+AE,
+E
+);
+"public.kern2.A" = (
+A,
+Aacute
+);
+"public.kern2.AE" = (
+AE
+);
+"public.kern2.a" = (
+a
+);
+"public.kern2.o" = (
+o
+);
+};
+};
+versionMajor = 1;
+versionMinor = 100;
+}

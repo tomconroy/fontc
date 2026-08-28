@@ -39,8 +39,6 @@ pub enum Error {
         #[source]
         VariationModelError,
     ),
-    #[error("feature files are non-identical: {0}, {1}")]
-    NonIdenticalFea(PathBuf, PathBuf),
     #[error("axis '{0}' missing at least one of default/min/max mapping")]
     MissingAxisMapping(Tag),
     #[error("no glyph for name '{0}'")]
@@ -67,12 +65,11 @@ pub enum Error {
     InvalidGlobalMetadata,
     #[error("No default master")]
     NoDefaultMaster,
-    #[error("Missing mapping on {axis_name} for {field} at {value:?}. Mappings {mappings:?}")]
-    MissingMappingForDesignCoord {
+    #[error("Missing mapping on {axis_name} for default at {value:?}. Mappings {mappings:?}")]
+    MissingMappingForUserCoord {
         axis_name: String,
-        field: String,
         mappings: Vec<(UserCoord, DesignCoord)>,
-        value: DesignCoord,
+        value: UserCoord,
     },
     #[error("Invalid tag '{raw_tag}': {cause}")]
     InvalidTag { raw_tag: String, cause: InvalidTag },

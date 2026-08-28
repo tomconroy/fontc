@@ -21,7 +21,7 @@ pub use lookups::{FeatureKey, LookupId};
 pub use opts::Opts;
 pub use output::Compilation;
 pub use tables::Os2Builder;
-pub use variations::{AxisLocation, NopVariationInfo, VariationInfo};
+pub use variations::{AxisLocation, GlyphPredicateAttr, NopVariationInfo, VariationInfo};
 
 #[cfg(any(test, feature = "test", feature = "cli"))]
 pub use variations::MockVariationInfo;

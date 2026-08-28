@@ -1,0 +1,70 @@
+{
+familyName = PinnedWeight;
+fontMaster = (
+{
+ascender = 800;
+customValue = 10;
+descender = -200;
+id = "regular";
+weightValue = 151;
+},
+{
+ascender = 800;
+customValue = 10;
+descender = -200;
+id = "hollow";
+weightValue = 65;
+}
+);
+glyphs = (
+{
+glyphname = hyphen;
+layers = (
+{
+layerId = "regular";
+paths = (
+{
+closed = 1;
+nodes = (
+"131 250 LINE",
+"470 250 LINE",
+"470 330 LINE",
+"131 330 LINE"
+);
+}
+);
+width = 600;
+},
+{
+layerId = "hollow";
+paths = (
+{
+closed = 1;
+nodes = (
+"92 224 LINE",
+"508 224 LINE",
+"508 356 LINE",
+"92 356 LINE"
+);
+}
+);
+width = 600;
+},
+);
+unicode = 002D;
+}
+);
+instances = (
+{
+interpolationWeight = 151;
+name = Regular;
+},
+{
+interpolationWeight = 65;
+name = Hollow;
+}
+);
+unitsPerEm = 1000;
+versionMajor = 1;
+versionMinor = 0;
+}

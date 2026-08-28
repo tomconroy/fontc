@@ -29,6 +29,30 @@ use crate::orchestration::Persistable;
 /// Glyph names mapped to postscript names
 pub type PostscriptNames = HashMap<GlyphName, GlyphName>;
 
+/// Glyphsapp only: the glyph attributes a FEA glyph predicate token can compare.
+///
+/// A Glyphs.app source can select glyphs into a FEA class with a predicate
+/// token, e.g. `@lc = [ $[category == "Letter" && case == lower] ];`. Every
+/// value here is the string the *source* stored (`None` when it stored
+/// nothing), because that is what glyphsLib compares: its `TokenExpander` reads
+/// plain `GSGlyph` attributes and never fontc's GlyphData-derived fallbacks.
+/// See <https://github.com/googlefonts/glyphsLib/blob/main/Lib/glyphsLib/builder/tokens.py>.
+// NOTE: no `skip_serializing_if` here. IR is also written with bincode, which
+// is not self-describing: a field skipped on the way out is still read on the
+// way back in, and the whole stream desynchronizes.
+#[derive(Serialize, Deserialize, Default, Debug, Clone, PartialEq, Eq)]
+pub struct GlyphPredicateAttrs {
+    /// `category = Letter;`
+    pub category: Option<SmolStr>,
+    /// `subCategory = Ligature;`
+    pub sub_category: Option<SmolStr>,
+    /// `case = lower;`
+    pub case: Option<SmolStr>,
+    /// The glyph's first codepoint, `%04X`-formatted like glyphsLib's
+    /// `GSGlyph.unicode`.
+    pub unicode: Option<SmolStr>,
+}
+
 /// Global font info that cannot vary across the design space.
 ///
 /// For example, upem, axis definitions, etc, as distinct from
@@ -60,6 +84,14 @@ pub struct StaticMetadata {
     pub variation_model: VariationModel,
     /// Glyphsapp only; named numbers defined per-master
     pub number_values: HashMap<NormalizedLocation, BTreeMap<SmolStr, OrderedFloat<f64>>>,
+    /// Glyphsapp only; what a FEA glyph predicate token may ask about a glyph.
+    ///
+    /// `None` for every source that is not a Glyphs.app file, so that a
+    /// predicate asking about anything but the glyph name is an error there
+    /// rather than a silent empty match. `Some` holds one entry per glyph that
+    /// sets at least one attribute; a glyph that sets none is simply absent.
+    #[serde(default)]
+    pub glyph_predicate_attrs: Option<BTreeMap<GlyphName, GlyphPredicateAttrs>>,
     /// PostScript-specific data per master, feeding the CFF table.
     ///
     /// Keyed like [`Self::number_values`]: one entry per master that defines
@@ -743,6 +775,28 @@ impl std::ops::Deref for ConditionSet {
     }
 }
 
+/// The named instances that reach fvar.
+///
+/// varLib splits a designspace into variable fonts before it builds one, and an
+/// instance whose user location falls outside an axis' range belongs to none of them,
+/// so it is simply absent from the font. This happens for real: a Glyphs source whose
+/// instances disagree about where they sit on an axis leaves some of them off the map
+/// the surviving ones defined.
+///
+/// <https://github.com/fonttools/fonttools/blob/4.63.0/Lib/fontTools/designspaceLib/split.py#L324-L326>
+fn fvar_instances<'a>(
+    axes: &'a Axes,
+    named_instances: &'a [NamedInstance],
+) -> impl Iterator<Item = &'a NamedInstance> {
+    named_instances.iter().filter(|ni| {
+        axes.iter().all(|axis| {
+            ni.location
+                .get(axis.tag)
+                .is_none_or(|pos| axis.min <= pos && pos <= axis.max)
+        })
+    })
+}
+
 impl StaticMetadata {
     const DEFAULT_VENDOR_ID_TAG: Tag = Tag::new(b"NONE");
     // TODO: we could consider a builder or something for this?
@@ -760,8 +814,23 @@ impl StaticMetadata {
         >,
         build_vertical: bool,
     ) -> Result<StaticMetadata, VariationModelError> {
-        // Point axes are less exciting than ranged ones
-        let variable_axes: Axes = axes.iter().filter(|a| !a.is_point()).cloned().collect();
+        // A point axis (min == default == max) can't vary, but it is still an axis:
+        // fontmake writes it to fvar, gives it an identity avar segment, a STAT
+        // DesignAxis, a name record, and counts it in every VarStore's region axes.
+        // Sources keep such an axis deliberately - a .glyphs "Axes" custom parameter
+        // that names it, a mapping that bends it, or a designspace that declares it -
+        // and glyphsLib preserves it for exactly those reasons:
+        // <https://github.com/googlefonts/glyphsLib/blob/v6.13.1/Lib/glyphsLib/builder/axes.py#L288-L299>
+        //
+        // What a point axis cannot do is make a font variable. A source whose axes are
+        // *all* point axes has nothing to interpolate, so it stays static and gets no
+        // fvar at all; that is what an empty `axes` means to the rest of the compiler.
+        // <https://github.com/googlefonts/fontc/issues/1990>
+        let variable_axes: Axes = if axes.iter().any(|a| !a.is_point()) {
+            Axes::new(axes.clone())
+        } else {
+            Axes::default()
+        };
 
         // Named instances of static fonts are unhelpful <https://github.com/googlefonts/fontc/issues/1008>
         if !variable_axes.is_empty() {
@@ -798,7 +867,7 @@ impl StaticMetadata {
             register_if_new(axes.ui_label_name());
         }
 
-        for ni in named_instances.iter() {
+        for ni in fvar_instances(&variable_axes, &named_instances) {
             let instance_name = ni.name.as_str();
             if ni.location == default_instance_location
                 && names
@@ -846,6 +915,9 @@ impl StaticMetadata {
             postscript_names,
             italic_angle: italic_angle.into(),
             number_values: glyphsapp_number_values.unwrap_or_default(),
+            // the Glyphs source sets this after construction; every other
+            // source leaves it None
+            glyph_predicate_attrs: None,
             postscript: Default::default(),
             build_vertical,
             misc: MiscMetadata {
@@ -905,6 +977,15 @@ impl StaticMetadata {
 
     pub fn axis(&self, tag: &Tag) -> Option<&Axis> {
         self.axes.iter().find(|a| &a.tag == tag)
+    }
+
+    /// The named instances fvar lists, a subset of [`Self::named_instances`].
+    ///
+    /// See [`fvar_instances`]: an instance outside the axes' ranges is not part of the
+    /// variable font. It stays in `named_instances` for callers that want every
+    /// instance the source declared, such as building one as a static.
+    pub fn fvar_instances(&self) -> impl Iterator<Item = &NamedInstance> {
+        fvar_instances(&self.axes, &self.named_instances)
     }
 
     /// Calculate a mapping of existing name text to the sorted set of name ID(s) that provide it.
@@ -1063,6 +1144,17 @@ mod tests {
                 }]),
             },
             number_values: Default::default(),
+            // a Glyphs source always sets this, and the round-trip tests
+            // should carry an entry through
+            glyph_predicate_attrs: Some(BTreeMap::from([(
+                GlyphName::new("a"),
+                GlyphPredicateAttrs {
+                    category: Some("Letter".into()),
+                    case: Some("lower".into()),
+                    unicode: Some("0061".into()),
+                    ..Default::default()
+                },
+            )])),
             // one entry per master, so the round-trip tests exercise a
             // multi-entry map
             postscript: HashMap::from([

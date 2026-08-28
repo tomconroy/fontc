@@ -1,0 +1,25 @@
+<?xml version='1.0' encoding='UTF-8'?>
+<!-- Masters whose features.fea disagree. The default master (Regular) is
+     deliberately NOT the first source, so that compiling the first source's
+     features instead of the default's is detectable. -->
+<designspace format="4.1">
+  <axes>
+    <axis tag="wght" name="Weight" minimum="400" maximum="700" default="400"/>
+  </axes>
+  <sources>
+    <source filename="fea_differ_ufo/FeaDiffer-Bold.ufo" name="Fea Differ Bold" familyname="Fea Differ" stylename="Bold">
+      <location>
+        <dimension name="Weight" xvalue="700"/>
+      </location>
+    </source>
+    <source filename="fea_differ_ufo/FeaDiffer-Regular.ufo" name="Fea Differ Regular" familyname="Fea Differ" stylename="Regular">
+      <lib copy="1"/>
+      <groups copy="1"/>
+      <features copy="1"/>
+      <info copy="1"/>
+      <location>
+        <dimension name="Weight" xvalue="400"/>
+      </location>
+    </source>
+  </sources>
+</designspace>
