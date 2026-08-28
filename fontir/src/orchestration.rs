@@ -10,7 +10,7 @@ use std::{
     sync::Arc,
 };
 
-use crate::{error::Error, ir, paths::Paths};
+use crate::{error::Error, instance::InstanceSpec, ir, paths::Paths};
 use bitflags::bitflags;
 use fontdrasil::{
     coords::NormalizedLocation,
@@ -426,6 +426,15 @@ type FeContextMap<T> = ContextMap<WorkId, T, IrPersistentStorage>;
 pub struct Context {
     pub flags: Flags,
 
+    /// The single instance to compile, if the caller asked for one.
+    ///
+    /// Rides here, beside [`Self::flags`], because the pin has two
+    /// consumers that share no other channel: the orchestrator, which rewrites
+    /// this context's IR at a barrier, and (eventually) the global-metrics work,
+    /// which can interpolate its unrounded master values only while it still
+    /// has them.
+    pub instance: Option<InstanceSpec>,
+
     pub(crate) persistent_storage: Arc<IrPersistentStorage>,
 
     // work results we've completed or restored from disk
@@ -455,6 +464,7 @@ impl Context {
         let acl = Arc::from(acl);
         Context {
             flags: self.flags,
+            instance: self.instance.clone(),
             persistent_storage: self.persistent_storage.clone(),
             static_metadata: self.static_metadata.clone_with_acl(acl.clone()),
             preliminary_glyph_order: self.preliminary_glyph_order.clone_with_acl(acl.clone()),
@@ -474,11 +484,16 @@ impl Context {
         }
     }
 
-    pub fn new_root(flags: Flags, ir_dir: Option<PathBuf>) -> Context {
+    pub fn new_root(
+        flags: Flags,
+        instance: Option<InstanceSpec>,
+        ir_dir: Option<PathBuf>,
+    ) -> Context {
         let acl = Arc::from(AccessControlList::read_only());
         let persistent_storage = Arc::from(IrPersistentStorage { ir_dir });
         Context {
             flags,
+            instance,
             persistent_storage: persistent_storage.clone(),
             static_metadata: ContextItem::new(
                 WorkId::StaticMetadata,

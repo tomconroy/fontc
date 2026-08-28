@@ -1,0 +1,49 @@
+<?xml version='1.0' encoding='UTF-8'?>
+<designspace format="5.0">
+  <!-- Two rules that fire together, so their substitutions chain: applied in
+       order as swaps on live state, A -> B then B -> C is the 3-cycle in which
+       A ends up with B's drawing, B with C's and C with A's. `Bcomp` is a
+       composite of B, so it follows the component remapping; `A`, `C` and the
+       kern groups follow the kerning half of the swap. -->
+  <axes>
+    <axis tag="wght" name="Weight" minimum="400" maximum="700" default="400"/>
+  </axes>
+  <rules>
+    <rule name="A_to_B">
+      <conditionset>
+        <condition name="Weight" minimum="550" maximum="700"/>
+      </conditionset>
+      <sub name="A" with="B"/>
+    </rule>
+    <rule name="B_to_C">
+      <conditionset>
+        <condition name="Weight" minimum="550" maximum="700"/>
+      </conditionset>
+      <sub name="B" with="C"/>
+    </rule>
+  </rules>
+  <sources>
+    <source filename="RuleChain-Regular.ufo" name="Rule Chain Regular" familyname="Rule Chain" stylename="Regular">
+      <location>
+        <dimension name="Weight" xvalue="400"/>
+      </location>
+    </source>
+    <source filename="RuleChain-Bold.ufo" name="Rule Chain Bold" familyname="Rule Chain" stylename="Bold">
+      <location>
+        <dimension name="Weight" xvalue="700"/>
+      </location>
+    </source>
+  </sources>
+  <instances>
+    <instance name="Rule Chain Mid" familyname="Rule Chain" stylename="Mid" filename="instance_ufo/RuleChain-Mid.ufo">
+      <location>
+        <dimension name="Weight" xvalue="550"/>
+      </location>
+    </instance>
+    <instance name="Rule Chain Light" familyname="Rule Chain" stylename="Light" filename="instance_ufo/RuleChain-Light.ufo">
+      <location>
+        <dimension name="Weight" xvalue="450"/>
+      </location>
+    </instance>
+  </instances>
+</designspace>

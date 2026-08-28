@@ -297,6 +297,9 @@ impl Work<Context, AnyWorkId, Error> for CffWork {
             .at(static_metadata.default_location());
 
         let upem = static_metadata.units_per_em as f64;
+        // CFF is single-master, so it wants the default master's hints; the IR
+        // keeps every master's, for CFF2's benefit
+        let postscript = static_metadata.postscript_default();
         let family_name = name(&static_metadata, NameId::TYPOGRAPHIC_FAMILY_NAME)
             .or_else(|| name(&static_metadata, NameId::FAMILY_NAME));
         let top_dict = TopDictValues {
@@ -311,22 +314,17 @@ impl Work<Context, AnyWorkId, Error> for CffWork {
             // "{preferred family} {preferred subfamily}" — *not* the name
             // table's full font name, which for Geo is "Geo Medium" where the
             // source states a postscriptFullName of "Geo-Regular"
-            full_name: static_metadata
-                .misc
-                .postscript
-                .full_name
-                .clone()
-                .or_else(|| {
-                    let subfamily = name(&static_metadata, NameId::TYPOGRAPHIC_SUBFAMILY_NAME)
-                        .or_else(|| name(&static_metadata, NameId::SUBFAMILY_NAME));
-                    match (family_name.as_ref(), subfamily) {
-                        (Some(family), Some(subfamily)) => Some(format!("{family} {subfamily}")),
-                        _ => None,
-                    }
-                }),
+            full_name: postscript.full_name.clone().or_else(|| {
+                let subfamily = name(&static_metadata, NameId::TYPOGRAPHIC_SUBFAMILY_NAME)
+                    .or_else(|| name(&static_metadata, NameId::SUBFAMILY_NAME));
+                match (family_name.as_ref(), subfamily) {
+                    (Some(family), Some(subfamily)) => Some(format!("{family} {subfamily}")),
+                    _ => None,
+                }
+            }),
             family_name,
             // like ufo2ft: postscriptWeightName, or no Weight entry at all
-            weight: static_metadata.misc.postscript.weight_name.clone(),
+            weight: postscript.weight_name.clone(),
             is_fixed_pitch: static_metadata.misc.is_fixed_pitch.unwrap_or_default(),
             italic_angle: static_metadata.italic_angle.into_inner(),
             underline_position: metrics.underline_position.into_inner().ot_round(),
@@ -334,7 +332,7 @@ impl Work<Context, AnyWorkId, Error> for CffWork {
             font_matrix: Some([1.0 / upem, 0.0, 0.0, 1.0 / upem, 0.0, 0.0]),
         };
 
-        let private = private_dict_values(&static_metadata.misc.postscript);
+        let private = private_dict_values(&postscript);
 
         let postscript_name =
             name(&static_metadata, NameId::POSTSCRIPT_NAME).unwrap_or_else(|| {

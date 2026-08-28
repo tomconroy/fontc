@@ -493,7 +493,7 @@ mod tests {
     fn v1_palette_index_0xffff() {
         use fontir::orchestration::Context as IrContext;
 
-        let ir_ctx = IrContext::new_root(Default::default(), None);
+        let ir_ctx = IrContext::new_root(Default::default(), None, None);
         let context = Context::new_root(Default::default(), None, None, None, false, &ir_ctx);
 
         let palette = ColorPalettes::default();

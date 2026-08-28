@@ -20,6 +20,10 @@ Usage:
     # compare CFF (.otf) output instead of glyf (.ttf); static sources only
     python resources/scripts/ttx_diff.py --flavor otf ../resources/testdata/Static-Regular.ufo
 
+    # compare a single static instance of a variable source against
+    # `fontmake -i`; --instance also takes a literal instance name
+    python resources/scripts/ttx_diff.py --instance @default ../OswaldFont/sources/Oswald.glyphs
+
 JSON:
     If the `--json` flag is passed, this tool will output JSON.
 
@@ -40,6 +44,7 @@ JSON:
     is the command that was used to run that compiler.
 """
 
+import dataclasses
 import json
 import os
 import re
@@ -47,18 +52,20 @@ import shutil
 import subprocess
 import sys
 import time
+import traceback
 from collections import defaultdict
 from contextlib import contextmanager
 from functools import cache
 from pathlib import Path
 from tempfile import NamedTemporaryFile
-from typing import Any, Dict, Generator, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Generator, List, NoReturn, Optional, Sequence, Tuple
 from urllib.parse import urlparse
 
 import yaml
 from absl import flags
 from cdifflib import CSequenceMatcher as SequenceMatcher
 from fontTools.designspaceLib import DesignSpaceDocument
+from fontTools.designspaceLib.statNames import getStatNames
 from fontTools.misc.fixedTools import otRound
 from fontTools.ttLib import TTFont
 from fontTools.varLib.iup import iup_delta
@@ -83,6 +90,21 @@ FLAVOR_OTF = "otf"
 # too much bloat when run in CI
 MAX_ERR_LEN = 1000
 
+# --instance policies are namespaced with a leading '@' so that a source with an
+# instance literally named 'default' is still reachable by name
+INSTANCE_DEFAULT = "@default"
+
+# Reasons we decline to compare a target. These are a contract with
+# fontc_crater (see `skip`): keep them short, stable, and free of paths, so a
+# report can group targets by reason.
+SKIP_OTF_VARIABLE = "variable source (fontc cannot write CFF2)"
+SKIP_INSTANCE_STATIC = "static source (instance mode requires a variable source)"
+SKIP_NO_INSTANCES = "source has no named instances"
+SKIP_NO_DEFAULT_INSTANCE = "no named instance at the default location"
+SKIP_AMBIGUOUS_INSTANCE = "ambiguous instance name"
+SKIP_NON_INJECTIVE_MAP = "non-injective axis map (fontc pins in user space)"
+SKIP_UNNAMED_INSTANCE = "instance has no name (fontmake selects instances by name)"
+
 # fontc and fontmake's builds may be off by a second or two in the
 # head.created/modified; setting this makes them the same
 if "SOURCE_DATE_EPOCH" not in os.environ:
@@ -92,6 +114,38 @@ if "SOURCE_DATE_EPOCH" not in os.environ:
 # print to stderr
 def eprint(*objects):
     print(*objects, file=sys.stderr)
+
+
+def skip(reason: str, detail: Optional[str] = None) -> NoReturn:
+    """Exit saying this target is not applicable to this run.
+
+    Not a compiler failure: `--flavor otf` on a variable source, `--instance` on
+    a static source and "this source has no instance at the default location"
+    all mean "there is nothing here to compare", and should read that way in a
+    report. The 'SKIP: ' prefix is the contract with fontc_crater, which turns
+    the reason into 'skipped: <reason>' (see ttx_diff_runner.rs); anything
+    target-specific belongs in `detail`, which is printed but not matched on.
+    """
+    if detail is not None:
+        eprint(detail)
+    sys.exit(f"SKIP: {reason}")
+
+
+def fontmake_failed(command: str, error: BaseException) -> NoReturn:
+    """Exit reporting `error` as a failure of fontmake's, not of ours.
+
+    Work we do on fontmake's behalf -- converting a .glyphs source to a
+    DesignSpace, which is step one of every fontmake build (`FontProject.
+    build_master_ufos`) -- fails exactly where fontmake would fail. Reporting
+    that as a crash of ttx_diff hides a real, and correctly reported, upstream
+    limitation behind "unknown error"; reporting it as a compiler failure puts
+    it in the same bucket as the identical failure of `fontmake` itself.
+    """
+    detail = "".join(traceback.format_exception(error))
+    report_errors_and_exit_if_there_were_any(
+        {"fontmake": {"command": command, "stderr": detail[-MAX_ERR_LEN:]}}
+    )
+    raise AssertionError("unreachable")  # pragma: no cover
 
 
 _timing_log: List[Tuple[str, float, int]] = []
@@ -240,7 +294,12 @@ def output_font_path(build_dir: Path, compiler: str) -> Path:
     return build_dir / (compiler + font_suffix())
 
 
-def build_fontc(source: Path, fontc_bin: Path, build_dir: Path):
+def build_fontc(
+    source: Path,
+    fontc_bin: Path,
+    build_dir: Path,
+    instance: Optional["ResolvedInstance"] = None,
+):
     out_file = output_font_path(build_dir, "fontc")
     if out_file.exists():
         eprint(f"reusing {rel_user(out_file)}")
@@ -260,24 +319,38 @@ def build_fontc(source: Path, fontc_bin: Path, build_dir: Path):
         cmd.append("--keep-direction")
     if not FLAGS.production_names:
         cmd.append("--no-production-names")
+    if instance is not None:
+        # a location, not a name: fontc's named instances are keyed by style
+        # name ("Bold") where fontmake's -i wants the DesignSpace instance name
+        # ("Family Bold"), so only the location means the same thing to both
+        cmd += ["--instance", instance.fontc_arg()]
     build(cmd, build_dir)
 
 
-def build_fontmake(source: Path, build_dir: Path):
+def build_fontmake(
+    source: Path, build_dir: Path, instance: Optional["ResolvedInstance"] = None
+):
     out_file = output_font_path(build_dir, "fontmake")
     if out_file.exists():
         eprint(f"reusing {rel_user(out_file)}")
         return
-    variable = source_is_variable(source)
+    # what matters is whether the *output* is variable, not the source: in
+    # instance mode a variable source produces a static font, which must be
+    # built as a static (`-o ttf`/`-o otf`) and, crucially, must keep its
+    # overlaps -- fontmake removes them for static builds and fontc cannot, so
+    # keying this off the source would make every outline differ
+    variable_output = instance is None and source_is_variable(source)
     if FLAGS.flavor == FLAVOR_OTF:
         # guarded in main(), but this is the only place that knows the
         # buildtype so be explicit rather than silently building something else
-        assert not variable, "otf flavor requires a static source"
+        assert not variable_output, "otf flavor requires a static output"
         buildtype = "otf"
-    elif variable:
+    elif variable_output:
         buildtype = "variable"
     else:
         buildtype = "ttf"
+    # exactly one -o per invocation: fontmake mutates the interpolated UFOs in
+    # place, so asking one run for both ttf and otf corrupts the second output
     cmd = [
         "fontmake",
         "-o",
@@ -300,11 +373,28 @@ def build_fontmake(source: Path, build_dir: Path):
         cmd.append("--keep-direction")
     if not FLAGS.production_names:
         cmd.append("--no-production-names")
-    if FLAGS.keep_overlaps and not variable:
+    if FLAGS.keep_overlaps and not variable_output:
         cmd.append("--keep-overlaps")
+    if instance is not None:
+        cmd += ["-i", instance.fontmake_arg()]
+        # a 'TTFAutohint options' custom parameter makes fontmake run
+        # ttfautohint on static builds; fontc never will (a post-process,
+        # out of scope like overlap removal), so compare unhinted statics.
+        # Scoped to instance mode to leave static-source runs untouched.
+        cmd.append("--no-autohint")
     cmd.append(str(source))
 
     build(cmd, build_dir)
+
+    # fontmake exits 0 and writes nothing when `-i` matches no instance, so a
+    # missing output here is a real (and otherwise silent) failure
+    if not out_file.exists():
+        detail = (
+            f" (does '-i {instance.fontmake_arg()}' match an instance?)"
+            if instance is not None
+            else ""
+        )
+        raise BuildFail(cmd, f"fontmake exited 0 but produced no output{detail}")
 
 
 @contextmanager
@@ -493,6 +583,261 @@ def source_is_variable(path: Path) -> bool:
         return False
     # fallback to variable, the existing default, but we should never get here?
     return True
+
+
+def _fmt_coord(value: float) -> str:
+    """Format an axis coordinate the way a human would type it: 400, not 400.0."""
+    value = float(value)
+    return str(int(value)) if value.is_integer() else repr(value)
+
+
+@dataclasses.dataclass(frozen=True)
+class ResolvedInstance:
+    """One named instance, in the two vocabularies the compilers speak.
+
+    fontmake selects by DesignSpace instance *name*; fontc selects by user-space
+    *location*. They are not interchangeable: for a .glyphs source fontmake's
+    name is "Family Style" while fontc's named-instance name is the style name
+    alone, so we resolve once here and hand each compiler its own dialect.
+    """
+
+    # the DesignSpace instance 'name' attribute (or, when it has none, the name
+    # fontmake makes up for it) -> fontmake -i. None if it cannot be named.
+    name: Optional[str]
+    # (axis tag, user-space value) per *variable* axis, in axis order, which is
+    # the location fontc's --instance accepts
+    user_location: Tuple[Tuple[str, float], ...]
+    # (axis name, design-space value) per axis; @default matches on this
+    design_location: Tuple[Tuple[str, float], ...]
+    # position in the designspace document, which is the tiebreak
+    index: int
+    # does this instance sit at the default source's location?
+    is_default: bool
+
+    def fontmake_arg(self) -> str:
+        """The `-i` pattern that selects exactly this instance.
+
+        fontmake matches with `re.fullmatch` (FontProject.interpolate_instance_ufos),
+        not string equality, so a name containing regex metacharacters -- or a
+        space, which re.escape also escapes -- has to be escaped.
+        """
+        assert self.name is not None, "resolve_instance skips a nameless instance"
+        return re.escape(self.name)
+
+    def fontc_arg(self) -> str:
+        """The `--instance` location, e.g. 'wght=400,wdth=87.5'.
+
+        Point axes are absent: see `_variable_axes`.
+        """
+        return ",".join(f"{tag}={_fmt_coord(v)}" for tag, v in self.user_location)
+
+    def describe(self) -> str:
+        design = " ".join(f"{n}={_fmt_coord(v)}" for n, v in self.design_location)
+        return (
+            f"{self.index}: {self.name!r} design [{design}] user [{self.fontc_arg()}]"
+        )
+
+
+@cache
+def _designspace_for(path: Path) -> DesignSpaceDocument:
+    """The DesignSpace that fontmake will interpolate instances from.
+
+    For .glyphs sources this runs the same conversion fontmake runs, so the
+    instance names are exactly the ones `-i` will match against: glyphsLib
+    synthesizes them as "familyName styleName" and drops inactive,
+    non-family-included and VARIABLE-type instances along the way.
+    """
+    if path.suffix == ".designspace":
+        return DesignSpaceDocument.fromfile(path)
+    if path.suffix in (".glyphs", ".glyphspackage"):
+        # imported lazily: only instance mode needs them
+        import ufoLib2
+        from glyphsLib import to_designspace
+
+        # the same arguments fontmake passes in FontProject.build_master_ufos,
+        # so that a source glyphsLib cannot convert fails here exactly when it
+        # would fail there -- and is reported as fontmake's failure, below
+        try:
+            return to_designspace(
+                GSFont(path),
+                ufo_module=ufoLib2,
+                minimal=True,
+                store_editor_state=False,
+                write_skipexportglyphs=True,
+                generate_GDEF=True,
+            )
+        except Exception as e:
+            fontmake_failed(f"glyphsLib.to_designspace({rel_user(path)})", e)
+    skip(f"cannot list the instances of a '{path.suffix}' source")
+
+
+def _fontmake_instance_name(doc: DesignSpaceDocument, instance) -> Optional[str]:
+    """What fontmake's `-i` will match this instance's name against.
+
+    A DesignSpace `<instance>` need not have a `name` attribute (RobotoFlex,
+    RobotoMono and RobotoSerif have none), but fontmake still names it:
+    `interpolate_instance_ufos` iterates `splitInterpolable(designspace)`,
+    which fills a missing name in with `f"{familyName} {styleName}"`, each part
+    falling back to the STAT-derived name for the location
+    (fontTools.designspaceLib.split, `_extractSubSpace`, makeNames=True).
+    We synthesize it identically rather than reading `instance.name`, which is
+    None on those sources and used to crash `re.escape`.
+
+    None when there is nothing to make a name out of -- fontmake would call
+    such an instance "None None" -- which is a skip, not a name we will chase.
+    """
+    if instance.name is not None:
+        return instance.name
+    stat_names = getStatNames(doc, instance.getFullUserLocation(doc))
+    family = instance.familyName or stat_names.familyNames.get("en")
+    style = instance.styleName or stat_names.styleNames.get("en")
+    if family is None and style is None:
+        return None
+    return f"{family} {style}"
+
+
+def _variable_axes(doc: DesignSpaceDocument) -> List[str]:
+    """The axis names fontc keeps, i.e. every axis that is not a point.
+
+    `StaticMetadata::new` drops axes whose user-space min == default == max
+    (`Axis::is_point`), so a pin that names one is rejected outright:
+    "--instance does not know axis 'wdth'". Glyphs 2 sources with no `Axes`
+    custom parameter and a constant `interpolationWidth` (Battambang,
+    KohSantepheap, ...) get exactly such a synthetic wdth axis from glyphsLib.
+    """
+
+    def is_point(axis) -> bool:
+        # a discrete axis (DesignSpace 5) has values, not a min/max
+        values = getattr(axis, "values", None)
+        if values is not None:
+            return len(set(values)) < 2
+        return axis.minimum == axis.maximum
+
+    return [axis.name for axis in doc.axes if not is_point(axis)]
+
+
+def _axis_map_is_non_injective(axis) -> bool:
+    """True if two user values share a design value on this axis.
+
+    fontmake pins an instance at its design location; fontc is given user
+    coordinates and converts back. A flat segment in the map makes that round
+    trip lossy (the two toolchains disagree about which user value a design
+    value came from), so such a source has no meaningful comparison.
+    """
+    outputs = [design for _user, design in getattr(axis, "map", None) or []]
+    return len(outputs) != len(set(outputs))
+
+
+def instances_of(source: Path) -> List[ResolvedInstance]:
+    """Every named instance of a source, in document order."""
+    doc = _designspace_for(source)
+    tag_for_axis = {axis.name: axis.tag for axis in doc.axes}
+    # a pin may only name axes fontc has; if every axis is a point (so there is
+    # nothing left to pin) keep them all, because an empty --instance is not a
+    # location at all and fontc's complaint about it would be the less useful one
+    pinnable = set(_variable_axes(doc)) or set(tag_for_axis)
+    # the default location is design space on both sides of this comparison:
+    # a source with an axis <map> has an axis default (user) that is not its
+    # default source's coordinate (design), and comparing the two would be
+    # wrong for most .glyphs sources
+    default_source = doc.findDefault()
+    default_location = (
+        default_source.getFullDesignLocation(doc)
+        if default_source is not None
+        else dict(doc.newDefaultLocation())
+    )
+    resolved = []
+    for index, instance in enumerate(doc.instances):
+        # sparse instance locations are completed from the default
+        design = instance.getFullDesignLocation(doc)
+        user = instance.getFullUserLocation(doc)
+        resolved.append(
+            ResolvedInstance(
+                name=_fontmake_instance_name(doc, instance),
+                user_location=tuple(
+                    (tag_for_axis[name], float(value))
+                    for name, value in user.items()
+                    if name in pinnable
+                ),
+                design_location=tuple(
+                    (name, float(value)) for name, value in design.items()
+                ),
+                index=index,
+                is_default=design == default_location,
+            )
+        )
+    return resolved
+
+
+def resolve_instance(source: Path, spec: str) -> ResolvedInstance:
+    """Pick the one instance to build, from a policy or a name.
+
+    Skips (rather than fails) when the source cannot answer the question, so
+    that a corpus sweep reports "not applicable" instead of "broken".
+    """
+    instances = instances_of(source)
+    if not instances:
+        skip(SKIP_NO_INSTANCES, f"'{rel_user(source)}' declares no instances")
+    non_injective = [
+        axis.name
+        for axis in _designspace_for(source).axes
+        if _axis_map_is_non_injective(axis)
+    ]
+    if non_injective:
+        skip(
+            SKIP_NON_INJECTIVE_MAP,
+            f"'{rel_user(source)}' has a flat segment on axes {non_injective}",
+        )
+
+    if spec == INSTANCE_DEFAULT:
+        matches = [instance for instance in instances if instance.is_default]
+        if not matches:
+            skip(
+                SKIP_NO_DEFAULT_INSTANCE,
+                f"'{rel_user(source)}' instances:\n  "
+                + "\n  ".join(i.describe() for i in instances),
+            )
+    elif spec.startswith("@"):
+        sys.exit(
+            f"unknown --instance policy '{spec}'; expected '{INSTANCE_DEFAULT}' or "
+            "an instance name"
+        )
+    else:
+        matches = [instance for instance in instances if instance.name == spec]
+        if not matches:
+            sys.exit(
+                f"no instance named '{spec}' in '{rel_user(source)}'; instances:\n  "
+                + "\n  ".join(i.describe() for i in instances)
+            )
+    # instances_of returns document order, so the first match is the lowest index
+    chosen = matches[0]
+    if chosen.name is None:
+        skip(
+            SKIP_UNNAMED_INSTANCE,
+            f"'{rel_user(source)}' instance {chosen.index} has neither a name "
+            "nor a family/style name to make one from",
+        )
+    # fontmake selects with re.fullmatch and errors out ("output_path requires a
+    # single input") if the pattern matches more than one instance; an escaped
+    # name matches only itself, so this fires exactly when names are duplicated
+    pattern = chosen.fontmake_arg()
+    twins = [
+        i for i in instances if i.name is not None and re.fullmatch(pattern, i.name)
+    ]
+    if len(twins) > 1:
+        skip(
+            SKIP_AMBIGUOUS_INSTANCE,
+            f"'{rel_user(source)}' has {len(twins)} instances named "
+            f"{chosen.name!r}; fontmake cannot be pointed at one of them",
+        )
+    return chosen
+
+
+def print_instances(source: Path):
+    """--print_instances: show what --instance can be given, and what @default picks."""
+    for instance in instances_of(source):
+        marker = "  <- @default" if instance.is_default else ""
+        print(f"{instance.describe()}{marker}")
 
 
 def copy(old, new):
@@ -1282,7 +1627,11 @@ def reduce_diff_noise(fontc: etree.ElementTree, fontmake: etree.ElementTree):
         normalize_gvar_contours(fontc, fontc_point_orders)
         normalize_gvar_contours(fontmake, fontmake_point_orders)
 
-    allow_fontc_only_variations_postscript_prefix(fontc, fontmake)
+    if FLAGS.instance is None:
+        allow_fontc_only_variations_postscript_prefix(fontc, fontmake)
+    # in instance mode we deliberately leave name 25 alone: it is the Variations
+    # PostScript Name Prefix, which is meaningless in a static font, so fontc
+    # emitting one is a diff worth seeing rather than noise to hide
 
     with timed("allow off-by-ones"):
         allow_some_off_by_ones(fontc, fontmake, "glyf/TTGlyph", "name", "/contour/pt")
@@ -1641,13 +1990,45 @@ def main(argv):
 
     source = resolve_source(argv[1]).resolve() if has_source else None
 
+    if FLAGS.print_instances:
+        if source is None:
+            sys.exit("--print_instances needs a source file")
+        print_instances(source)
+        sys.exit(0)
+
+    instance = None
+    if FLAGS.instance is not None:
+        if source is None:
+            sys.exit("--instance needs a source file, not precompiled fonts")
+        if FLAGS.compare != "default":
+            sys.exit(
+                f"--instance is only supported with --compare default, not "
+                f"'{FLAGS.compare}'"
+            )
+        # the mirror image of the otf guard below: that one needs a static
+        # source, this one needs a variable source to interpolate from
+        if not source_is_variable(source):
+            skip(
+                SKIP_INSTANCE_STATIC,
+                f"--instance requires a variable source, but '{rel_user(source)}' "
+                "is static",
+            )
+        instance = resolve_instance(source, FLAGS.instance)
+        eprint(
+            f"instance {instance.name!r}: fontmake -i {instance.fontmake_arg()} / "
+            f"fontc --instance {instance.fontc_arg()}"
+        )
+
     if FLAGS.flavor == FLAVOR_OTF:
         # CFF (flavor otf) is static-only on both sides for now: fontc has no
         # CFF2 writer, so there is nothing to compare a variable build against.
-        if source is not None and source_is_variable(source):
-            sys.exit(
+        # Instance mode is exempt: the output is static even though the source
+        # is variable, so CFF is exactly as comparable as it is for a static.
+        if source is not None and instance is None and source_is_variable(source):
+            skip(
+                SKIP_OTF_VARIABLE,
                 f"--flavor otf requires a static source, but '{rel_user(source)}' is "
-                "variable (fontc cannot write CFF2 yet)"
+                "variable (fontc cannot write CFF2 yet)",
             )
         if FLAGS.compare != "default":
             sys.exit(
@@ -1732,7 +2113,7 @@ def main(argv):
         with timed("build fontc"):
             try:
                 if compare == "default":
-                    build_fontc(source, fontc_bin_path, build_dir)
+                    build_fontc(source, fontc_bin_path, build_dir, instance)
                 else:
                     run_gftools(
                         source, FLAGS.config, build_dir, fontc_bin=fontc_bin_path
@@ -1745,7 +2126,7 @@ def main(argv):
         with timed("build fontmake"):
             try:
                 if compare == "default":
-                    build_fontmake(source, build_dir)
+                    build_fontmake(source, build_dir, instance)
                 else:
                     run_gftools(source, FLAGS.config, build_dir)
             except BuildFail as e:

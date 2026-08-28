@@ -13,7 +13,6 @@ use fontdrasil::{
     coords::NormalizedLocation,
     orchestration::{Access, AccessBuilder, Work},
     types::GlyphName,
-    variations::{RoundingBehaviour, VariationModel},
 };
 use kurbo::{Affine, BezPath};
 use log::{debug, log_enabled, trace};
@@ -22,7 +21,8 @@ use write_fonts::{OtRound, types::GlyphId16};
 
 use crate::{
     error::{BadGlyph, Error},
-    ir::{Component, Glyph, GlyphBuilder, GlyphInstance, GlyphOrder, StaticMetadata},
+    instance::interpolate_glyph_instance,
+    ir::{Component, Glyph, GlyphBuilder, GlyphInstance, GlyphOrder},
     orchestration::{Context, Flags, IrWork, WorkId},
     propagate_anchors::propagate_all_anchors,
 };
@@ -532,48 +532,8 @@ fn instantiate_instance(
     loc: &NormalizedLocation,
     context: &Context,
 ) -> Result<GlyphInstance, BadGlyph> {
-    log::debug!("instantiating '{}' at {loc:?}", glyph.name);
     let meta = context.static_metadata.get();
-    let model = variation_model_for_glyph(glyph, &meta);
-    let point_seqs = glyph
-        .sources()
-        .iter()
-        .map(|(loc, instance)| (loc.clone(), instance.values_for_interpolation()))
-        .collect();
-    // when instantiating intermediates we don't want to do rounding (this is
-    // a significant problem if we round some component transformations, where
-    // the fractional bits can be very important).
-    // This matches fonttools, see https://github.com/googlefonts/ufo2ft/blob/01d3faee/Lib/ufo2ft/_compilers/baseCompiler.py#L266
-    let deltas = model
-        .deltas_with_rounding(&point_seqs, RoundingBehaviour::None)
-        .map_err(|e| BadGlyph::new(&glyph.name, e))?;
-    let points = model.interpolate_from_deltas(loc, &deltas);
-    Ok(glyph
-        .default_instance()
-        .new_with_interpolated_values(&points))
-}
-
-fn variation_model_for_glyph<'a>(
-    glyph: &Glyph,
-    meta: &'a StaticMetadata,
-) -> Cow<'a, VariationModel> {
-    if meta
-        .variation_model
-        .locations()
-        .all(|loc| glyph.sources().contains_key(loc))
-        && meta.variation_model.num_locations() == glyph.sources().len()
-    {
-        // great, we have the same model
-        return Cow::Borrowed(&meta.variation_model);
-    }
-
-    // otherwise we need a special model for this glyph.
-    // This code is duplicated in various places (hvar, e.g.)
-    // and maybe we can share it? or cache these models more globally?
-    Cow::Owned(VariationModel::new(
-        glyph.sources().keys().cloned().collect(),
-        meta.axes.iter().map(|ax| ax.tag).collect(),
-    ))
+    interpolate_glyph_instance(&meta, glyph, loc)
 }
 
 fn move_contours_to_new_component(
@@ -1148,7 +1108,8 @@ mod tests {
         )
         .unwrap();
         // No ir_dir, we don't want to write anything down
-        let ctx = Context::new_root(Flags::default(), None).copy_for_work(Access::All, Access::All);
+        let ctx =
+            Context::new_root(Flags::default(), None, None).copy_for_work(Access::All, Access::All);
         ctx.static_metadata.set(meta);
         ctx
     }
@@ -1511,7 +1472,7 @@ mod tests {
         let mut outer = TestGlyph::new("outer");
         outer.add_component("mid", mid_to_outer);
 
-        let context = Context::new_root(Flags::DECOMPOSE_COMPONENTS, None)
+        let context = Context::new_root(Flags::DECOMPOSE_COMPONENTS, None, None)
             .copy_for_work(Access::All, Access::All);
         context
             .static_metadata

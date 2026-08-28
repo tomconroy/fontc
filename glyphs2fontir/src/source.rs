@@ -20,16 +20,16 @@ use fontir::{
         self, AnchorBuilder, ColorGlyphs, ColorPalettes, Condition, ConditionSet,
         DEFAULT_VENDOR_ID, FEATURE_WRITERS_LIB_KEY, FeatureWriterOptionValue, FeatureWriterSpec,
         GlobalMetric, GlobalMetrics, GlobalMetricsBuilder, GlyphAnchors, GlyphInstance, GlyphOrder,
-        KernGroup, KernSide, KerningInstance, KerningLocations, MetaTableValues, NameBuilder,
-        NameKey, NamedInstance, Paint, PaintGlyph, PostscriptNames, PostscriptSettings,
-        PreliminaryGdefCategories, Rule, StaticMetadata, Substitution, VariableFeature,
-        reject_duplicate_writers, validate_feature_writer,
+        InstanceOverrides, KernGroup, KernSide, KerningInstance, KerningLocations, MetaTableValues,
+        NameBuilder, NameKey, NamedInstance, Paint, PaintGlyph, Panose, PostscriptNames,
+        PostscriptSettings, PreliminaryGdefCategories, Rule, StaticMetadata, StyleMapStyle,
+        Substitution, VariableFeature, reject_duplicate_writers, validate_feature_writer,
     },
     orchestration::{Context, Flags, IrWork, WorkId},
     source::Source,
 };
 use glyphs_reader::{
-    Font, FontMaster, InstanceType, Layer, Plist,
+    Font, FontMaster, Instance, InstanceType, Layer, Plist,
     glyphdata::{Category, Subcategory},
 };
 use indexmap::IndexMap;
@@ -330,6 +330,150 @@ fn names(font: &Font, flags: SelectionFlags) -> HashMap<NameKey, String> {
     names
 }
 
+/// A `panose` custom parameter's ten digits, zero-padded and truncated.
+fn to_ir_panose(raw: &[i64]) -> Panose {
+    let mut bytes = [0u8; 10];
+    bytes
+        .iter_mut()
+        .zip(raw)
+        .for_each(|(dst, src)| *dst = *src as u8);
+    bytes.into()
+}
+
+/// What this instance's *own* custom parameters override at the pin.
+///
+/// glyphsLib stashes an instance's parameters in the designspace instance lib
+/// and `apply_instance_data_to_ufo` replays them onto the already-interpolated
+/// UFO (`instances.py:454-470`), so each one beats whatever the masters
+/// produced. Only `--instance` reads the result.
+///
+/// The list is glyphsLib's `to_ufo_custom_params` handlers, minus the ones that
+/// need machinery fontc does not have (`Filter`/`PreFilter`,
+/// `Rename`/`Reencode Glyphs`, `Replace Feature`/`Prefix`,
+/// `Keep`/`Remove Glyphs`, `TTFAutohint options`, `GASP Table`,
+/// `Color Palettes`) and the ones glyphsLib has no handler for at all, which
+/// fontmake therefore ignores too: notably **`xHeight`, `capHeight` and
+/// `italicAngle`**, none of which appears in `KNOWN_PARAM_HANDLERS` — they end
+/// up as inert `com.schriftgestaltung.customParameter.…` lib keys. `weightClass`
+/// and `widthClass` are blacklisted out of the instance lib entirely
+/// (`constants.py:77-88`); the axis mapping decides those.
+///
+/// <https://github.com/googlefonts/glyphsLib/blob/main/Lib/glyphsLib/builder/custom_params.py#L314-L448>
+fn instance_overrides(inst: &Instance) -> InstanceOverrides {
+    let params = &inst.custom_parameters;
+    let mut metrics = BTreeMap::new();
+    macro_rules! set_metric {
+        ($variant:ident, $field:ident) => {
+            if let Some(value) = params.$field {
+                metrics.insert(GlobalMetric::$variant, OrderedFloat(value as f64));
+            }
+        };
+    }
+    set_metric!(Os2TypoAscender, typo_ascender);
+    set_metric!(Os2TypoDescender, typo_descender);
+    set_metric!(Os2TypoLineGap, typo_line_gap);
+    set_metric!(Os2WinAscent, win_ascent);
+    set_metric!(HheaAscender, hhea_ascender);
+    set_metric!(HheaDescender, hhea_descender);
+    set_metric!(HheaLineGap, hhea_line_gap);
+    set_metric!(VheaAscender, vhea_ascender);
+    set_metric!(VheaDescender, vhea_descender);
+    set_metric!(VheaLineGap, vhea_line_gap);
+    set_metric!(StrikeoutPosition, strikeout_position);
+    set_metric!(StrikeoutSize, strikeout_size);
+    set_metric!(SubscriptXOffset, subscript_x_offset);
+    set_metric!(SubscriptXSize, subscript_x_size);
+    set_metric!(SubscriptYOffset, subscript_y_offset);
+    set_metric!(SubscriptYSize, subscript_y_size);
+    set_metric!(SuperscriptXOffset, superscript_x_offset);
+    set_metric!(SuperscriptXSize, superscript_x_size);
+    set_metric!(SuperscriptYOffset, superscript_y_offset);
+    set_metric!(SuperscriptYSize, superscript_y_size);
+    set_metric!(CaretSlopeRun, hhea_caret_slope_run);
+    set_metric!(CaretSlopeRise, hhea_caret_slope_rise);
+    set_metric!(CaretOffset, hhea_caret_offset);
+    set_metric!(VheaCaretSlopeRun, vhea_caret_slope_run);
+    set_metric!(VheaCaretSlopeRise, vhea_caret_slope_rise);
+    set_metric!(VheaCaretOffset, vhea_caret_offset);
+    // these two are floats in the source, not integers
+    for (metric, value) in [
+        (GlobalMetric::UnderlineThickness, params.underline_thickness),
+        (GlobalMetric::UnderlinePosition, params.underline_position),
+    ] {
+        if let Some(value) = value {
+            metrics.insert(metric, value);
+        }
+    }
+    // "enforce that winAscent/Descent are positive, according to UFO spec"
+    // <https://github.com/googlefonts/glyphsLib/blob/main/Lib/glyphsLib/builder/custom_params.py#L533-L544>
+    if let Some(win_descent) = params.win_descent {
+        metrics.insert(
+            GlobalMetric::Os2WinDescent,
+            OrderedFloat(win_descent.abs() as f64),
+        );
+    }
+
+    let mut names = BTreeMap::new();
+    for (name_id, value) in [
+        (
+            NameId::TYPOGRAPHIC_FAMILY_NAME,
+            inst.preferred_family_name(),
+        ),
+        (
+            NameId::TYPOGRAPHIC_SUBFAMILY_NAME,
+            inst.preferred_subfamily_name(),
+        ),
+        (NameId::COMPATIBLE_FULL_NAME, inst.compatible_full_name()),
+        (NameId::WWS_FAMILY_NAME, inst.wws_family_name()),
+        (NameId::WWS_SUBFAMILY_NAME, inst.wws_subfamily_name()),
+    ] {
+        if let Some(value) = value {
+            names.insert(name_id, value.to_string());
+        }
+    }
+
+    let name_records = params
+        .name_table_entries
+        .iter()
+        .map(|entry| {
+            (
+                NameKey {
+                    name_id: NameId::new(entry.name_id),
+                    platform_id: entry.platform_id,
+                    encoding_id: entry.encoding_id,
+                    lang_id: entry.lang_id,
+                },
+                entry.value.clone(),
+            )
+        })
+        .collect();
+
+    InstanceOverrides {
+        panose: params.panose.as_ref().map(|raw| to_ir_panose(raw)),
+        fs_type: params.fs_type,
+        is_fixed_pitch: params.is_fixed_pitch,
+        unicode_range_bits: params
+            .unicode_range_bits
+            .as_ref()
+            .map(|bits| bits.iter().copied().collect()),
+        codepage_range_bits: params
+            .codepage_range_bits
+            .as_ref()
+            .map(|bits| bits.iter().copied().collect()),
+        meta_table: params.meta_table.as_ref().map(|meta| MetaTableValues {
+            dlng: meta.dlng.clone(),
+            slng: meta.slng.clone(),
+        }),
+        use_typo_metrics: params.use_typo_metrics,
+        has_wws_names: params.has_wws_names,
+        use_production_names: params.dont_use_production_names.map(|dont| !dont),
+        metrics,
+        names,
+        name_records,
+        postscript_full_name: inst.postscript_full_name().map(str::to_string),
+    }
+}
+
 /// Read the `com.github.googlei18n.ufo2ft.featureWriters` config from font userData.
 ///
 /// glyphsLib round-trips the key at the font level, so this mirrors ufo2fontir's
@@ -444,6 +588,14 @@ impl Work<Context, WorkId, Error> for StaticMetadataWork {
                 if inst.type_ != InstanceType::Single || !inst.active {
                     return None;
                 }
+                // What `--instance` needs and fvar doesn't: what glyphsLib
+                // would call the instance UFO it generated here. Style linking
+                // is flag-driven, never name-driven.
+                // https://github.com/googlefonts/glyphsLib/blob/main/Lib/glyphsLib/builder/instances.py#L114-L152
+                let family_name = inst
+                    .family_name()
+                    .or_else(|| font.get_default_name("familyNames"))
+                    .unwrap_or_default();
                 Some(NamedInstance {
                     name: inst.name.clone(),
                     postscript_name: inst.postscript_name().map(str::to_string),
@@ -452,6 +604,23 @@ impl Work<Context, WorkId, Error> for StaticMetadataWork {
                         .get(&inst.axes_values)
                         .map(|nc| nc.to_user(&axes).unwrap())
                         .unwrap(),
+                    family_name: Some(family_name.to_string()),
+                    style_map_family_name: Some(inst.style_map_family_name(family_name)),
+                    // an explicit `styleMapStyleName` parameter beats the
+                    // style-linking flags: glyphsLib replays it over the
+                    // descriptor's value after interpolation
+                    style_map_style_name: Some(
+                        inst.custom_parameters
+                            .style_map_style_name
+                            .as_deref()
+                            .map(str::to_string)
+                            .unwrap_or_else(|| {
+                                StyleMapStyle::from_flags(inst.is_bold, inst.is_italic)
+                                    .to_name()
+                                    .to_string()
+                            }),
+                    ),
+                    overrides: instance_overrides(inst),
                 })
             })
             .collect();
@@ -573,6 +742,10 @@ impl Work<Context, WorkId, Error> for StaticMetadataWork {
         static_metadata.misc.selection_flags = selection_flags;
         static_metadata.misc.feature_generation = feature_writers_from_user_data(&font.user_data)?;
         static_metadata.variations = variations;
+        // what `names` above already handed NameBuilder, kept so that a pin can
+        // rebuild name id 3 with the same string; see `MiscMetadata::raw_vendor_id`
+        static_metadata.misc.raw_vendor_id =
+            Some(font.vendor_id().unwrap_or(DEFAULT_VENDOR_ID).to_string());
         // treat  empty string or all spaces as equivalent to no value; it means
         // 'null', per the spec
         if let Some(vendor_id) = font.vendor_id().filter(|id| !id.trim().is_empty()) {
@@ -614,6 +787,33 @@ impl Work<Context, WorkId, Error> for StaticMetadataWork {
             static_metadata.misc.panose = Some(bytes.into());
         }
 
+        // What an *interpolated* instance gets instead: ufo2ft merges the
+        // PANOSE of every UFO glyphsLib generated, which is the master's own
+        // parameter or the font's. The default instance's parameter, which
+        // `misc.panose` prefers above, is not among them - glyphsLib applies
+        // that to the instance UFO afterwards, and only to its own instance.
+        static_metadata.misc.instance_panose = Panose::merged_for_instance(
+            &font
+                .masters
+                .iter()
+                .filter_map(|master| {
+                    master
+                        .custom_parameters
+                        .panose
+                        .as_ref()
+                        .or(font.custom_parameters.panose.as_ref())
+                })
+                .map(|raw| {
+                    let mut bytes = [0u8; 10];
+                    bytes
+                        .iter_mut()
+                        .zip(raw)
+                        .for_each(|(dst, src)| *dst = *src as u8);
+                    Panose::from(bytes)
+                })
+                .collect::<Vec<_>>(),
+        );
+
         static_metadata.misc.version_major = font.version_major;
         static_metadata.misc.version_minor = font.version_minor;
         if let Some(lowest_rec_ppm) = font.custom_parameters.lowest_rec_ppem {
@@ -653,7 +853,21 @@ impl Work<Context, WorkId, Error> for StaticMetadataWork {
             });
         }
 
-        static_metadata.misc.postscript = postscript_settings(font, default_master);
+        // Every master's PostScript hinting data, keyed by location. Only CFF
+        // reads it today, and only the default master's, but CFF2 and IR-level
+        // instancing both want the rest.
+        static_metadata.postscript = font
+            .masters
+            .iter()
+            .map(|master| {
+                let location = font_info
+                    .locations
+                    .get(&master.axes_values)
+                    .cloned()
+                    .unwrap();
+                (location, postscript_settings(font, master))
+            })
+            .collect();
 
         if let Some(gasp) = &font.custom_parameters.gasp_table {
             for (max_ppem, behavior) in gasp.iter() {
@@ -1137,9 +1351,15 @@ impl Work<Context, WorkId, Error> for GlobalMetricWork {
             );
         }
 
+        // pinned here, not at the pin barrier: only the builder still has the
+        // unrounded per-master values `fontmake -i` interpolates
         context
             .global_metrics
-            .set(metrics.build(&static_metadata.axes)?);
+            .set(fontir::instance::build_global_metrics(
+                metrics,
+                &static_metadata,
+                context.instance.as_ref(),
+            )?);
         Ok(())
     }
 }
@@ -2185,7 +2405,7 @@ mod tests {
 
     fn context_for(glyphs_file: &Path) -> (impl Source + use<>, Context) {
         let source = GlyphsIrSource::new(glyphs_file).unwrap();
-        (source, Context::new_root(Flags::default(), None))
+        (source, Context::new_root(Flags::default(), None, None))
     }
 
     #[test]
@@ -2441,7 +2661,8 @@ mod tests {
     #[test]
     fn v2_alignment_zones_to_blue_values() {
         let (_, context) = build_static_metadata(glyphs2_dir().join("alignment_zones_v2.glyphs"));
-        let postscript = &context.static_metadata.get().misc.postscript;
+        let static_metadata = context.static_metadata.get();
+        let postscript = static_metadata.postscript_default();
         // zones sorted by position; the baseline zone (0, -16) is a blue
         // zone despite its negative size, like glyphsLib's to_ufo_blue_values
         assert_eq!(
@@ -2462,7 +2683,8 @@ mod tests {
     #[test]
     fn v3_postscript_hints() {
         let (_, context) = build_static_metadata(glyphs3_dir().join("PsHints.glyphs"));
-        let postscript = &context.static_metadata.get().misc.postscript;
+        let static_metadata = context.static_metadata.get();
+        let postscript = static_metadata.postscript_default();
         // "custom high" and "custom low" are metrics the designer named rather
         // than typed; each still has to contribute its own zone
         assert_eq!(
@@ -2486,6 +2708,33 @@ mod tests {
         // postscriptFullName is a property, not a name table entry: ufo2ft
         // reads it only when it builds the CFF Top DICT
         assert_eq!(postscript.full_name.as_deref(), Some("PsHints-Regular"));
+    }
+
+    #[test]
+    fn postscript_hints_for_every_master() {
+        let (_, context) = build_static_metadata(glyphs3_dir().join("WghtVar.glyphs"));
+        let static_metadata = context.static_metadata.get();
+        let regular = NormalizedLocation::for_pos(&[("wght", 0.0)]);
+        let bold = NormalizedLocation::for_pos(&[("wght", 1.0)]);
+
+        // one entry per master, not just the default
+        assert_eq!(
+            static_metadata.postscript.keys().collect::<HashSet<_>>(),
+            HashSet::from([&regular, &bold])
+        );
+        // Regular states overshoots, so it has zones ...
+        assert_eq!(
+            static_metadata.postscript_at(&regular).blue_values,
+            [-16.0, 0.0, 737.0, 753.0].map(OrderedFloat)
+        );
+        assert_eq!(
+            static_metadata.postscript_at(&regular).other_blues,
+            [-58.0, -42.0].map(OrderedFloat)
+        );
+        // ... Bold states none, so it has none: masters routinely disagree on
+        // zone *count*, which is why they can't share one list
+        assert!(static_metadata.postscript_at(&bold).blue_values.is_empty());
+        assert!(static_metadata.postscript_at(&bold).other_blues.is_empty());
     }
 
     #[test]
@@ -4398,7 +4647,7 @@ mode = skip;
 }"#,
         )
         .unwrap();
-        let context = Context::new_root(Flags::default(), None);
+        let context = Context::new_root(Flags::default(), None, None);
         let task_context = context.copy_for_work(
             Access::None,
             AccessBuilder::new()
@@ -4439,7 +4688,7 @@ mode = skip;
     fn feature_writers_error_from_glyphs_source(source: &str) -> Error {
         let _ = env_logger::builder().is_test(true).try_init();
         let source = GlyphsIrSource::new_from_memory(source).unwrap();
-        let context = Context::new_root(Flags::default(), None);
+        let context = Context::new_root(Flags::default(), None, None);
         let task_context = context.copy_for_work(
             Access::None,
             AccessBuilder::new()
@@ -4482,7 +4731,7 @@ ignoreMarks = 0;
     fn feature_writers_from_glyphs_source(source: &str) -> Option<Vec<FeatureWriterSpec>> {
         let _ = env_logger::builder().is_test(true).try_init();
         let source = GlyphsIrSource::new_from_memory(source).unwrap();
-        let context = Context::new_root(Flags::default(), None);
+        let context = Context::new_root(Flags::default(), None, None);
         let task_context = context.copy_for_work(
             Access::None,
             AccessBuilder::new()

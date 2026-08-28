@@ -5,12 +5,23 @@ use crate::{BuildType, Results, RunResult, Target, args::Flavor, ci::ResultsCach
 // Run ttx-diff via python -m to ensure we use the venv's installed version
 static TTX_DIFF_MODULE: &str = "ttx_diff";
 
+// ttx_diff prefixes the reason it declines a target with this; see `skip` in
+// ttx_diff/src/ttx_diff/core.py
+static SKIP_PREFIX: &str = "SKIP: ";
+
+// fontc's own refusal to instance a static source. ttx_diff normally catches
+// this first, but the two disagree about the edges (point axes, virtual
+// masters), and when they do this is still a skip, not a compiler failure.
+static FONTC_INSTANCE_NEEDS_VARIABLE: &str = "--instance requires a variable source";
+static SKIP_INSTANCE_STATIC: &str = "static source (instance mode requires a variable source)";
+
 pub(super) struct TtxContext {
     pub fontc_path: PathBuf,
     pub normalizer_path: PathBuf,
     pub source_cache: PathBuf,
     pub results_cache: ResultsCache,
     pub flavor: Flavor,
+    pub instance: Option<String>,
 }
 
 pub(super) fn run_ttx_diff(ctx: &TtxContext, target: &Target) -> RunResult<DiffOutput, DiffError> {
@@ -38,6 +49,9 @@ pub(super) fn run_ttx_diff(ctx: &TtxContext, target: &Target) -> RunResult<DiffO
     .args(["--rebuild", "fontc"]);
     if ctx.flavor != Flavor::Ttf {
         cmd.args(["--flavor", "otf"]);
+    }
+    if let Some(instance) = &ctx.instance {
+        cmd.arg("--instance").arg(instance);
     }
     if target.build == BuildType::GfTools {
         cmd.arg("--config")
@@ -69,15 +83,19 @@ pub(super) fn run_ttx_diff(ctx: &TtxContext, target: &Target) -> RunResult<DiffO
                     RunResult::Success(DiffOutput::Diffs(success))
                 }
             }
-            Ok(RawDiffOutput::Error(error)) => RunResult::Fail(DiffError::CompileFailed(error)),
+            Ok(RawDiffOutput::Error(error)) => classify_compile_failure(error),
         },
         Some(124) => RunResult::Fail(DiffError::Other("ttx_diff timed out".to_string())),
-        // ttx_diff refuses sources it can't compare in the requested flavor
-        // (e.g. a variable source with --flavor otf); report that distinctly
-        // from a crash so it reads as a skip, not a failure
-        Some(1) if stderr.contains("requires a static source") => RunResult::Fail(
-            DiffError::Other("skipped: variable source (fontc cannot write CFF2)".to_string()),
-        ),
+        // ttx_diff declines sources it can't compare in the requested mode (a
+        // variable source with --flavor otf, a static source with --instance,
+        // a source with no instance at the default location); report those
+        // distinctly from a crash so they read as skips, not failures
+        Some(1) => match skip_reason(&stderr) {
+            Some(reason) => RunResult::Fail(DiffError::Other(format!("skipped: {reason}"))),
+            None => RunResult::Fail(DiffError::Other(format!(
+                "unknown error (status 1): '{stderr}'"
+            ))),
+        },
         Some(other) => RunResult::Fail(DiffError::Other(format!(
             "unknown error (status {other}): '{stderr}'"
         ))),
@@ -105,6 +123,31 @@ pub(super) fn run_ttx_diff(ctx: &TtxContext, target: &Target) -> RunResult<DiffO
             .save_built_files_to_cache(target, &build_dir);
     }
     result
+}
+
+/// The reason ttx_diff gave for declining this target, if it declined it.
+///
+/// The reason is the last `SKIP: ` line: ttx_diff prints target-specific detail
+/// (paths, instance lists) on separate lines, so that the reason itself stays
+/// stable enough to group a report by.
+fn skip_reason(stderr: &str) -> Option<&str> {
+    stderr
+        .lines()
+        .rev()
+        .find_map(|line| line.trim_end().strip_prefix(SKIP_PREFIX))
+        .filter(|reason| !reason.is_empty())
+}
+
+/// A compile failure, unless it is really a skip wearing a compiler's clothes.
+fn classify_compile_failure(error: CompileFailed) -> RunResult<DiffOutput, DiffError> {
+    let fontc_declined = error
+        .fontc
+        .as_ref()
+        .is_some_and(|fail| fail.stderr.contains(FONTC_INSTANCE_NEEDS_VARIABLE));
+    if fontc_declined {
+        return RunResult::Fail(DiffError::Other(format!("skipped: {SKIP_INSTANCE_STATIC}")));
+    }
+    RunResult::Fail(DiffError::CompileFailed(error))
 }
 
 fn fontmake_finished(result: &RunResult<DiffOutput, DiffError>) -> bool {
@@ -354,5 +397,67 @@ mod tests {
         };
         assert!(command.starts_with("fontmake -o"));
         assert_eq!(stderr, "oh no");
+    }
+
+    #[test]
+    fn skip_reasons_are_the_last_skip_line() {
+        // the reason ttx_diff exits with, after whatever detail it printed
+        let stderr = "Detected fontc repository at ~/fontc\n\
+             '~/x.designspace' instances:\n  0: 'X Bold' design [Weight=700]\n\
+             SKIP: no named instance at the default location\n";
+        assert_eq!(
+            skip_reason(stderr),
+            Some("no named instance at the default location")
+        );
+        assert_eq!(
+            skip_reason("SKIP: static source (instance mode requires a variable source)"),
+            Some("static source (instance mode requires a variable source)")
+        );
+        // the pre-existing flavor skip is unchanged in the report
+        assert_eq!(
+            skip_reason("SKIP: variable source (fontc cannot write CFF2)"),
+            Some("variable source (fontc cannot write CFF2)")
+        );
+    }
+
+    #[test]
+    fn a_crash_is_not_a_skip() {
+        assert_eq!(skip_reason("Traceback (most recent call last):"), None);
+        assert_eq!(skip_reason("SKIP: "), None);
+    }
+
+    #[test]
+    fn fontc_refusing_a_static_source_is_a_skip() {
+        let failed = CompileFailed {
+            fontc: Some(CompilerFailure {
+                command: "fontc --instance wght=400 x.designspace".into(),
+                stderr:
+                    "Error: --instance requires a variable source; this source has no variable axes"
+                        .into(),
+            }),
+            fontmake: None,
+        };
+        let RunResult::Fail(DiffError::Other(reason)) = classify_compile_failure(failed) else {
+            panic!("expected a skip");
+        };
+        assert_eq!(
+            reason,
+            "skipped: static source (instance mode requires a variable source)"
+        );
+    }
+
+    #[test]
+    fn a_real_compile_failure_is_still_a_failure() {
+        let failed = CompileFailed {
+            fontc: Some(CompilerFailure {
+                command: "fontc x.designspace".into(),
+                stderr: "Error: everything is on fire".into(),
+            }),
+            fontmake: None,
+        };
+        assert!(matches!(
+            classify_compile_failure(failed),
+            RunResult::Fail(DiffError::CompileFailed(_))
+        ));
     }
 }

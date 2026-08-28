@@ -21,7 +21,7 @@ use write_fonts::{
 use fontdrasil::{
     coords::NormalizedLocation,
     types::{Axes, GlyphName},
-    variations::{ModelDeltas, VariationModel},
+    variations::{ModelDeltas, RoundingBehaviour, VariationModel},
 };
 
 use crate::{
@@ -43,9 +43,9 @@ pub use feature_writers::{
 };
 pub use path_builder::GlyphPathBuilder;
 pub use static_metadata::{
-    Condition, ConditionSet, GdefCategories, MetaTableValues, MiscMetadata, NameKey, NamedInstance,
-    Panose, PostscriptNames, PostscriptSettings, PreliminaryGdefCategories, Rule, StaticMetadata,
-    Substitution, VariableFeature,
+    Condition, ConditionSet, GdefCategories, InstanceOverrides, MetaTableValues, MiscMetadata,
+    NameKey, NamedInstance, Panose, PostscriptNames, PostscriptSettings, PreliminaryGdefCategories,
+    Rule, StaticMetadata, StyleMapStyle, Substitution, VariableFeature,
 };
 
 pub const DEFAULT_VENDOR_ID: &str = "NONE";
@@ -309,9 +309,19 @@ impl From<KernGroup> for KernSide {
 ///
 /// At a minimum, metric values must be defined at the default location.
 #[derive(Default, Debug)]
-pub struct GlobalMetricsBuilder(
-    HashMap<GlobalMetric, HashMap<NormalizedLocation, OrderedFloat<f64>>>,
-);
+pub struct GlobalMetricsBuilder {
+    values: HashMap<GlobalMetric, HashMap<NormalizedLocation, OrderedFloat<f64>>>,
+    /// Which of [`Self::values`] the *source* actually stated.
+    ///
+    /// The rest were computed by [`Self::populate_defaults`], which densifies
+    /// every master so that a variable build has a value everywhere. That is
+    /// the right shape for deltas, but it is not what `fontmake -i` sees: it
+    /// interpolates raw UFO fontinfo, where an attribute one master omits
+    /// contributes nothing at all rather than a fallback, and the result is an
+    /// *un-normalised* partial sum. [`Self::build_pinned`] needs to know which
+    /// values are which; nothing else does.
+    declared: HashMap<GlobalMetric, HashSet<NormalizedLocation>>,
+}
 
 /// Interpolatable global metrics variation space, including ascender/descender,
 /// cap height, etc.
@@ -330,7 +340,7 @@ impl PartialEq for GlobalMetrics {
     }
 }
 
-#[derive(Serialize, Deserialize, Debug, Copy, Clone, PartialEq, Eq, Hash)]
+#[derive(Serialize, Deserialize, Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum GlobalMetric {
     Ascender,
     Descender,
@@ -411,6 +421,77 @@ impl GlobalMetric {
             _ => None,
         }
     }
+
+    /// This metric's interpolated value at a pin, formatted the way fontMath is.
+    ///
+    /// `MathInfo.extractInfo` runs a per-attribute formatter over every
+    /// interpolated value, unconditionally — `--round-instances` controls a
+    /// *separate*, later `MathInfo.round`. Which formatter an attribute gets is
+    /// a fixed table
+    /// (<https://github.com/robotools/fontMath/blob/0.10.0/Lib/fontMath/mathInfo.py#L360-L422>),
+    /// and it splits the metrics we carry three ways:
+    ///
+    /// - `_numberFormatter` — **stays a float**. The six that are UFO
+    ///   `ascender` / `descender` / `capHeight` / `xHeight` /
+    ///   `postscriptUnderlineThickness` / `postscriptUnderlinePosition`. Every
+    ///   consumer of these `ot_round`s what it reads, so they land in the same
+    ///   place a rounded value would only when nothing else divides them first
+    ///   — `yStrikeoutPosition`'s `otRound(0.6 * xHeight)` is why the
+    ///   difference is observable.
+    /// - `_nonNegativeIntegerFormatter` — `otRound`, then clamped at zero.
+    ///   UFO `openTypeOS2WinAscent` / `WinDescent`, which are unsigned.
+    /// - `_integerFormatter` — `otRound`. Everything else here: the hhea,
+    ///   vhea, OS/2 Typo, sub/superscript, strikeout and caret metrics.
+    ///
+    /// `otRound` is `floor(v + 0.5)`, half toward positive infinity, so
+    /// `-250.5` rounds to `-250` rather than away from zero
+    /// (<https://github.com/googlefonts/ufo2ft/blob/main/Lib/ufo2ft/instantiator.py#L75-L77>).
+    ///
+    /// Spelled out rather than defaulted so that a new metric has to say which
+    /// of the three it is.
+    pub(crate) fn at_pin(&self, value: f64) -> f64 {
+        use GlobalMetric::*;
+        match self {
+            // _numberFormatter
+            Ascender | Descender | CapHeight | XHeight | UnderlineThickness | UnderlinePosition => {
+                value
+            }
+            // _nonNegativeIntegerFormatter
+            Os2WinAscent | Os2WinDescent => OtRound::<f64>::ot_round(value).max(0.0),
+            // _integerFormatter
+            HheaAscender | HheaDescender | HheaLineGap | VheaAscender | VheaDescender
+            | VheaLineGap | Os2TypoAscender | Os2TypoDescender | Os2TypoLineGap
+            | CaretSlopeRise | CaretSlopeRun | CaretOffset | VheaCaretSlopeRise
+            | VheaCaretSlopeRun | VheaCaretOffset | StrikeoutPosition | StrikeoutSize
+            | SubscriptXOffset | SubscriptXSize | SubscriptYOffset | SubscriptYSize
+            | SuperscriptXOffset | SuperscriptXSize | SuperscriptYOffset | SuperscriptYSize => {
+                OtRound::<f64>::ot_round(value)
+            }
+        }
+    }
+}
+
+/// What Glyphs.app, not ufo2ft, calls this metric's default in an *instance*.
+///
+/// fontmake hands every instance it interpolates to glyphsLib's
+/// `apply_instance_data_to_ufo`, whatever the source format was, and that ends
+/// in `_set_default_params`: three fontinfo attributes the instance UFO still
+/// doesn't have get Glyphs.app's default rather than ufo2ft's. Two of them are
+/// metrics, and both are flat numbers where ufo2ft's fallback scales with
+/// upem — the same answer at 1000 upem and a different one at any other.
+///
+/// (The third is `openTypeOS2Type`, which is static metadata; see
+/// `fontir::instance`.)
+///
+/// `None` means glyphsLib has nothing to say and ufo2ft's fallback stands.
+///
+/// <https://github.com/googlefonts/glyphsLib/blob/main/Lib/glyphsLib/builder/custom_params.py#L1161-L1181>
+fn glyphs_app_instance_default(metric: GlobalMetric) -> Option<f64> {
+    match metric {
+        GlobalMetric::UnderlineThickness => Some(50.0),
+        GlobalMetric::UnderlinePosition => Some(-100.0),
+        _ => None,
+    }
 }
 
 /// Adjust Y offset based on italic angle, to get X offset.
@@ -448,6 +529,19 @@ impl GlobalMetricsBuilder {
         italic_angle: Option<f64>,
     ) {
         let units_per_em = units_per_em as f64;
+
+        // ascender/descender/x_height arrive as Options because the source
+        // either stated them or didn't; that is exactly the "declared" bit, and
+        // the only place these three can pick it up.
+        for (metric, stated) in [
+            (GlobalMetric::Ascender, ascender.is_some()),
+            (GlobalMetric::Descender, descender.is_some()),
+            (GlobalMetric::XHeight, x_height.is_some()),
+        ] {
+            if stated {
+                self.declare(metric, pos.clone());
+            }
+        }
 
         // https://github.com/googlefonts/ufo2ft/blob/fca66fe3ea1ea88ffb36f8264b21ce042d3afd05/Lib/ufo2ft/fontInfoData.py#L38-L45
         let ascender = ascender.unwrap_or(0.8 * units_per_em);
@@ -569,11 +663,18 @@ impl GlobalMetricsBuilder {
         &mut self,
         metric: GlobalMetric,
     ) -> &mut HashMap<NormalizedLocation, OrderedFloat<f64>> {
-        self.0.entry(metric).or_default()
+        self.values.entry(metric).or_default()
     }
 
     fn get(&self, metric: GlobalMetric, pos: &NormalizedLocation) -> Option<OrderedFloat<f64>> {
-        self.0.get(&metric)?.get(pos).copied()
+        self.values.get(&metric)?.get(pos).copied()
+    }
+
+    /// Note that the source, not a fallback, is where this value came from.
+    ///
+    /// See [`Self::declared`].
+    fn declare(&mut self, metric: GlobalMetric, pos: NormalizedLocation) {
+        self.declared.entry(metric).or_default().insert(pos);
     }
 
     /// Set the value of a metric at a specific location.
@@ -585,6 +686,7 @@ impl GlobalMetricsBuilder {
         pos: NormalizedLocation,
         value: impl Into<OrderedFloat<f64>>,
     ) {
+        self.declare(metric, pos.clone());
         self.values_mut(metric).insert(pos, value.into());
     }
 
@@ -627,7 +729,7 @@ impl GlobalMetricsBuilder {
     /// default location, axis unsuitable for variation).
     pub fn build(self, axes: &Axes) -> Result<GlobalMetrics, Error> {
         let deltas = self
-            .0
+            .values
             .into_iter()
             .map(|(tag, values)| -> Result<_, Error> {
                 let model =
@@ -647,6 +749,134 @@ impl GlobalMetricsBuilder {
                 Ok((tag, deltas))
             })
             .collect::<Result<HashMap<_, _>, _>>()?;
+
+        Ok(GlobalMetrics(deltas, RwLock::new(Default::default())))
+    }
+
+    /// Finalise and build the [GlobalMetrics] of the instance at `pin`.
+    ///
+    /// Not `build` followed by a read at `pin`: [`Self::build`] rounds every
+    /// master value *before* computing deltas — deliberately, so that a
+    /// variable font read at a master matches building that master — and by
+    /// then the unrounded values `fontmake -i` interpolates are gone.
+    /// `interp(round(master))` is not `round(interp(master))`: two masters at
+    /// 0.6 and 1.6 give 2 the first way and 1 the second.
+    ///
+    /// So this interpolates the builder's own unrounded values and rounds
+    /// once, per attribute, exactly as fontMath's `MathInfo.extractInfo` does
+    /// — which is to say **not at all** for the six metrics whose UFO
+    /// attribute has a `_numberFormatter` (see [`GlobalMetric::at_pin`]).
+    /// `--round-instances` plays no part; the formatters run regardless.
+    ///
+    /// Two further fontMath rules follow from interpolating *raw fontinfo*
+    /// rather than fontc's densified masters:
+    ///
+    /// - a metric only some masters state accumulates an **un-normalised
+    ///   partial sum** over just those masters, so one master saying
+    ///   `openTypeHheaAscender = 900` and another saying nothing gives **450**
+    ///   at the midpoint, not 900 (`_processMathOne`, where a missing term is
+    ///   the identity rather than a zero-weighted contribution);
+    /// - a metric *no* master states is absent from the instance UFO
+    ///   altogether and ufo2ft's compile-time fallback fills it in. We have no
+    ///   way to defer that, so we interpolate the per-master fallbacks
+    ///   [`Self::populate_defaults`] computed, which agrees wherever the
+    ///   fallback is linear in the values it reads. The same stands in when the
+    ///   pin reaches none of the masters that *did* state a metric.
+    ///
+    /// `overrides` are the metrics the *instance* states outright, from
+    /// [`InstanceOverrides::metrics`]. glyphsLib's `apply_instance_data_to_ufo`
+    /// writes those onto the interpolated UFO afterwards, so they replace the
+    /// interpolated value rather than joining the model.
+    ///
+    /// The result is a static space: one location, `key`, with no axes, which
+    /// is what a genuinely static source produces.
+    ///
+    /// <https://github.com/robotools/fontMath/blob/0.10.0/Lib/fontMath/mathInfo.py#L231-L237>
+    pub fn build_pinned(
+        self,
+        axes: &Axes,
+        pin: &NormalizedLocation,
+        key: &NormalizedLocation,
+        overrides: &BTreeMap<GlobalMetric, OrderedFloat<f64>>,
+    ) -> Result<GlobalMetrics, Error> {
+        // One model over every master, not one per metric: fontMath's partial
+        // sums are un-normalised precisely because every attribute is weighed
+        // against the same masters.
+        let masters: HashSet<NormalizedLocation> = self
+            .values
+            .values()
+            .flat_map(|by_location| by_location.keys())
+            .cloned()
+            .collect();
+        let model = VariationModel::new(masters, axes.axis_order());
+        let pinned = VariationModel::new(HashSet::from([key.clone()]), Vec::new());
+
+        let deltas = self
+            .values
+            .iter()
+            .map(|(metric, values)| -> Result<_, Error> {
+                let point_seqs = |declared_only: bool| -> HashMap<NormalizedLocation, Vec<f64>> {
+                    values
+                        .iter()
+                        .filter(|(loc, _)| {
+                            !declared_only
+                                || self
+                                    .declared
+                                    .get(metric)
+                                    .is_some_and(|locs| locs.contains(*loc))
+                        })
+                        .map(|(loc, value)| (loc.clone(), vec![value.into_inner()]))
+                        .collect()
+                };
+                let interpolate = |point_seqs: &HashMap<NormalizedLocation, Vec<f64>>| {
+                    model
+                        .interpolate_from_masters::<f64, f64>(pin, point_seqs)
+                        .map_err(|e| Error::MetricDeltaError(*metric, e))
+                        .map(|values| values.first().copied())
+                };
+
+                // No master stated this metric, or none that the pin reaches:
+                // glyphsLib's default if it has one for it, else the densified
+                // values, standing in for the fallback ufo2ft would compute on
+                // the instance.
+                let value = match overrides.get(metric) {
+                    // the instance says so, and it says so last
+                    Some(stated) => stated.into_inner(),
+                    None => match interpolate(&point_seqs(true))? {
+                        Some(value) => value,
+                        None => match glyphs_app_instance_default(*metric) {
+                            Some(value) => value,
+                            None => interpolate(&point_seqs(false))?.unwrap_or_default(),
+                        },
+                    },
+                };
+
+                let sources = HashMap::from([(key.clone(), vec![metric.at_pin(value)])]);
+                let deltas = pinned
+                    // the value is already formatted; rounding it again here
+                    // would undo the metrics that deliberately stay float
+                    .deltas_with_rounding(&sources, RoundingBehaviour::None)
+                    .map_err(|e| Error::MetricDeltaError(*metric, e))?;
+                Ok((*metric, deltas))
+            })
+            .collect::<Result<HashMap<_, _>, _>>()?;
+
+        // an override for a metric no master mentioned at all: rare, since
+        // `populate_defaults` densifies nearly everything, but it is still the
+        // instance's word and there is nothing to interpolate against
+        let mut deltas = deltas;
+        for (metric, value) in overrides.iter() {
+            if deltas.contains_key(metric) {
+                continue;
+            }
+            let sources = HashMap::from([(key.clone(), vec![metric.at_pin(value.into_inner())])]);
+            deltas.insert(
+                *metric,
+                pinned
+                    .deltas_with_rounding(&sources, RoundingBehaviour::None)
+                    .map_err(|e| Error::MetricDeltaError(*metric, e))?,
+            );
+        }
 
         Ok(GlobalMetrics(deltas, RwLock::new(Default::default())))
     }

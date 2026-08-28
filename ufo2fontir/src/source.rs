@@ -22,15 +22,16 @@ use fontir::{
     ir::{
         AnchorBuilder, Color, ColorGlyphs, ColorPalettes, Condition, ConditionSet,
         DEFAULT_VENDOR_ID, FEATURE_WRITERS_LIB_KEY, FeatureWriterOptionValue, FeatureWriterSpec,
-        FeaturesSource, GlobalMetric, GlobalMetricsBuilder, GlyphOrder, KernGroup, KernSide,
-        KerningInstance, KerningLocations, MetaTableValues, NameBuilder, NameKey, NamedInstance,
-        Paint, PaintGlyph, PaintSolid, Panose, PostscriptNames, PostscriptSettings,
-        PreliminaryGdefCategories, Rule, StaticMetadata, Substitution, VariableFeature,
-        reject_duplicate_writers, validate_feature_writer,
+        FeaturesSource, GlobalMetric, GlobalMetricsBuilder, GlyphOrder, InstanceOverrides,
+        KernGroup, KernSide, KerningInstance, KerningLocations, MetaTableValues, NameBuilder,
+        NameKey, NamedInstance, Paint, PaintGlyph, PaintSolid, Panose, PostscriptNames,
+        PostscriptSettings, PreliminaryGdefCategories, Rule, StaticMetadata, Substitution,
+        VariableFeature, reject_duplicate_writers, validate_feature_writer,
     },
     orchestration::{Context, Flags, IrWork, WorkId},
     source::Source,
 };
+use glyphs_reader::NameTableEntry;
 use log::{Level, debug, log_enabled, trace, warn};
 use norad::{
     DataRequest,
@@ -912,6 +913,47 @@ fn font_infos<'a>(
     Ok(results)
 }
 
+fn to_ir_panose(panose: &norad::fontinfo::Os2Panose) -> Panose {
+    Panose {
+        family_type: panose.family_type as u8,
+        serif_style: panose.serif_style as u8,
+        weight: panose.weight as u8,
+        proportion: panose.proportion as u8,
+        contrast: panose.contrast as u8,
+        stroke_variation: panose.stroke_variation as u8,
+        arm_style: panose.arm_style as u8,
+        letterform: panose.letterform as u8,
+        midline: panose.midline as u8,
+        x_height: panose.x_height as u8,
+    }
+}
+
+/// The `postscript*` fontinfo keys of one master, mostly CFF hinting data.
+fn postscript_settings(font_info: &norad::FontInfo) -> PostscriptSettings {
+    fn float_list(values: &Option<Vec<f64>>) -> Vec<OrderedFloat<f64>> {
+        values
+            .as_ref()
+            .map(|values| values.iter().copied().map(OrderedFloat).collect())
+            .unwrap_or_default()
+    }
+    PostscriptSettings {
+        blue_values: float_list(&font_info.postscript_blue_values),
+        other_blues: float_list(&font_info.postscript_other_blues),
+        family_blues: float_list(&font_info.postscript_family_blues),
+        family_other_blues: float_list(&font_info.postscript_family_other_blues),
+        blue_scale: font_info.postscript_blue_scale.map(OrderedFloat),
+        blue_shift: font_info.postscript_blue_shift.map(OrderedFloat),
+        blue_fuzz: font_info.postscript_blue_fuzz.map(OrderedFloat),
+        stem_snap_h: float_list(&font_info.postscript_stem_snap_h),
+        stem_snap_v: float_list(&font_info.postscript_stem_snap_v),
+        force_bold: font_info.postscript_force_bold,
+        weight_name: font_info.postscript_weight_name.clone(),
+        full_name: font_info.postscript_full_name.clone(),
+        default_width_x: font_info.postscript_default_width_x.map(OrderedFloat),
+        nominal_width_x: font_info.postscript_nominal_width_x.map(OrderedFloat),
+    }
+}
+
 fn names(font_info: &norad::FontInfo) -> HashMap<NameKey, String> {
     let mut builder = NameBuilder::default();
 
@@ -1074,19 +1116,50 @@ impl Work<Context, WorkId, Error> for StaticMetadataWork {
                     location: to_design_location(&tags_by_name, &inst.location)
                         .to_user(&axes)
                         .unwrap(),
+                    // What `--instance` needs and fvar doesn't: the
+                    // <instance> attributes ufo2ft's instantiator writes
+                    // straight into the generated UFO's fontinfo.
+                    // https://github.com/googlefonts/ufo2ft/blob/main/Lib/ufo2ft/instantiator.py#L756-L792
+                    family_name: inst
+                        .familyname
+                        .clone()
+                        .or_else(|| font_info_at_default.family_name.clone()),
+                    // glyphsLib replays a `styleMapFamilyName`/`styleMapStyleName`
+                    // instance parameter *after* the instantiator has written the
+                    // descriptor's, so the parameter wins
+                    style_map_family_name: string_param(&inst.lib, "styleMapFamilyName")
+                        .or_else(|| inst.stylemapfamilyname.clone()),
+                    style_map_style_name: string_param(&inst.lib, "styleMapStyleName")
+                        .or_else(|| inst.stylemapstylename.clone()),
+                    overrides: instance_overrides(&inst.lib),
                 }
             })
             .collect();
 
-        let global_locations = master_locations(
+        let master_locations = master_locations(
             &axes,
             self.designspace
                 .sources
                 .iter()
                 .filter(|s| !is_glyph_only(s)),
-        )
-        .into_values()
-        .collect();
+        );
+        let global_locations = master_locations.values().cloned().collect();
+
+        // Every master's PostScript hinting data, keyed by location. Only CFF
+        // reads it today, and only the default master's, but CFF2 and IR-level
+        // instancing both want the rest. Glyph-only sources contribute no
+        // fontinfo, matching ufo2ft's `collect_info_masters`.
+        let postscript: HashMap<NormalizedLocation, PostscriptSettings> = self
+            .designspace
+            .sources
+            .iter()
+            .filter(|s| !is_glyph_only(s))
+            .filter_map(|source| {
+                let loc = master_locations.get(source.name.as_ref()?)?;
+                let font_info = font_infos.get(&source.filename)?;
+                Some((loc.clone(), postscript_settings(font_info)))
+            })
+            .collect();
 
         let lib_plist =
             match load_plist(&designspace_dir.join(&default_master.filename), "lib.plist") {
@@ -1172,6 +1245,14 @@ impl Work<Context, WorkId, Error> for StaticMetadataWork {
         )
         .map_err(Error::VariationModelError)?;
         static_metadata.misc.selection_flags = selection_flags;
+        // what `names` above already handed NameBuilder, kept so that a pin can
+        // rebuild name id 3 with the same string; see `MiscMetadata::raw_vendor_id`
+        static_metadata.misc.raw_vendor_id = Some(
+            font_info_at_default
+                .open_type_os2_vendor_id
+                .clone()
+                .unwrap_or_else(|| DEFAULT_VENDOR_ID.to_string()),
+        );
         if let Some(vendor_id) = font_info_at_default
             .open_type_os2_vendor_id
             .as_ref()
@@ -1193,14 +1274,14 @@ impl Work<Context, WorkId, Error> for StaticMetadataWork {
             .open_type_os2_width_class
             .map(|v| v as u16);
 
-        // <https://github.com/googlefonts/glyphsLib/blob/cb8a4a914b0a33431f0a77f474bf57eec2f19bcc/Lib/glyphsLib/builder/custom_params.py#L1117-L1119>
-        static_metadata.misc.fs_type = Some(
-            font_info_at_default
-                .open_type_os2_type
-                .as_ref()
-                .map(|flags| flags.iter().fold(0_u16, |acc, e| acc | (1 << *e)))
-                .unwrap_or(1_u16 << 2),
-        );
+        // Left None when the source says nothing, because *which* default
+        // applies depends on what we're building: ufo2ft's [2] for an ordinary
+        // compile, glyphsLib's [3] for an interpolated instance. `fontbe`'s
+        // OS/2 work and the pin each supply their own.
+        static_metadata.misc.fs_type = font_info_at_default
+            .open_type_os2_type
+            .as_ref()
+            .map(|flags| flags.iter().fold(0_u16, |acc, e| acc | (1 << *e)));
 
         static_metadata.misc.is_fixed_pitch = font_info_at_default.postscript_is_fixed_pitch;
 
@@ -1213,20 +1294,22 @@ impl Work<Context, WorkId, Error> for StaticMetadataWork {
             .as_ref()
             .map(|bits| bits.iter().map(|b| *b as u32).collect());
 
-        if let Some(ot_panose) = &font_info_at_default.open_type_os2_panose {
-            static_metadata.misc.panose = Some(Panose {
-                family_type: ot_panose.family_type as u8,
-                serif_style: ot_panose.serif_style as u8,
-                weight: ot_panose.weight as u8,
-                proportion: ot_panose.proportion as u8,
-                contrast: ot_panose.contrast as u8,
-                stroke_variation: ot_panose.stroke_variation as u8,
-                arm_style: ot_panose.arm_style as u8,
-                letterform: ot_panose.letterform as u8,
-                midline: ot_panose.midline as u8,
-                x_height: ot_panose.x_height as u8,
-            });
-        }
+        static_metadata.misc.panose = font_info_at_default
+            .open_type_os2_panose
+            .as_ref()
+            .map(to_ir_panose);
+        // ufo2ft merges every source's PANOSE into an interpolated instance,
+        // which for masters that disagree means no PANOSE at all. Only
+        // `--instance` reads this; a variable build takes the default
+        // master's, above. Layer-only sources share their parent UFO's
+        // fontinfo, and `font_infos` is keyed by filename, so listing them
+        // twice — which ufo2ft does — cannot change the answer.
+        static_metadata.misc.instance_panose = Panose::merged_for_instance(
+            &font_infos
+                .values()
+                .filter_map(|info| info.open_type_os2_panose.as_ref().map(to_ir_panose))
+                .collect::<Vec<_>>(),
+        );
 
         static_metadata.misc.version_major = font_info_at_default
             .version_major
@@ -1278,33 +1361,7 @@ impl Work<Context, WorkId, Error> for StaticMetadataWork {
                 .collect();
         }
         static_metadata.variations = variations;
-
-        let float_list = |values: &Option<Vec<f64>>| -> Vec<OrderedFloat<f64>> {
-            values
-                .as_ref()
-                .map(|values| values.iter().copied().map(OrderedFloat).collect())
-                .unwrap_or_default()
-        };
-        static_metadata.misc.postscript = PostscriptSettings {
-            blue_values: float_list(&font_info_at_default.postscript_blue_values),
-            other_blues: float_list(&font_info_at_default.postscript_other_blues),
-            family_blues: float_list(&font_info_at_default.postscript_family_blues),
-            family_other_blues: float_list(&font_info_at_default.postscript_family_other_blues),
-            blue_scale: font_info_at_default.postscript_blue_scale.map(OrderedFloat),
-            blue_shift: font_info_at_default.postscript_blue_shift.map(OrderedFloat),
-            blue_fuzz: font_info_at_default.postscript_blue_fuzz.map(OrderedFloat),
-            stem_snap_h: float_list(&font_info_at_default.postscript_stem_snap_h),
-            stem_snap_v: float_list(&font_info_at_default.postscript_stem_snap_v),
-            force_bold: font_info_at_default.postscript_force_bold,
-            weight_name: font_info_at_default.postscript_weight_name.clone(),
-            full_name: font_info_at_default.postscript_full_name.clone(),
-            default_width_x: font_info_at_default
-                .postscript_default_width_x
-                .map(OrderedFloat),
-            nominal_width_x: font_info_at_default
-                .postscript_nominal_width_x
-                .map(OrderedFloat),
-        };
+        static_metadata.postscript = postscript;
 
         context.preliminary_glyph_order.set(glyph_order);
         context.static_metadata.set(static_metadata);
@@ -1365,6 +1422,181 @@ fn source_has_kerning(
     let font = norad::Font::load_requested_data(&ufo_dir, norad::DataRequest::none().kerning(true))
         .map_err(|e| BadSource::custom(ufo_dir, e))?;
     Ok(!font.kerning.is_empty())
+}
+
+/// The Glyphs custom parameters glyphsLib stashed in a designspace `<instance><lib>`.
+///
+/// `to_designspace` writes an instance's parameters out as `[name, value]`
+/// pairs under `com.schriftgestaltung.customParameters`, and
+/// `apply_instance_data_to_ufo` replays them onto the interpolated UFO — for a
+/// `.designspace` source exactly as for a `.glyphs` one, because fontmake runs
+/// glyphsLib over the instances it interpolates whatever the source was. So a
+/// designspace generated from Glyphs carries per-instance PANOSE and metrics
+/// that fontc has to honour at the pin (DancingScript, Domine,
+/// NotoSansCherokee, NotoSansMedefaidrin and NotoSerifYezidi all do).
+///
+/// Same list as glyphs2fontir's, minus `codePageRanges` (which would need
+/// Glyphs' codepage-to-bit table) and `meta Table` (whose parameter form is
+/// Glyphs', not `public.openTypeMeta`'s); no corpus designspace states either.
+///
+/// <https://github.com/googlefonts/glyphsLib/blob/main/Lib/glyphsLib/builder/instances.py#L166-L174>
+fn instance_overrides(lib: &Dictionary) -> InstanceOverrides {
+    let mut overrides = InstanceOverrides::default();
+    let Some(params) = lib
+        .get("com.schriftgestaltung.customParameters")
+        .and_then(Value::as_array)
+    else {
+        return overrides;
+    };
+
+    const METRICS: &[(&str, GlobalMetric)] = &[
+        ("typoAscender", GlobalMetric::Os2TypoAscender),
+        ("typoDescender", GlobalMetric::Os2TypoDescender),
+        ("typoLineGap", GlobalMetric::Os2TypoLineGap),
+        ("winAscent", GlobalMetric::Os2WinAscent),
+        ("hheaAscender", GlobalMetric::HheaAscender),
+        ("hheaDescender", GlobalMetric::HheaDescender),
+        ("hheaLineGap", GlobalMetric::HheaLineGap),
+        ("vheaVertAscender", GlobalMetric::VheaAscender),
+        ("vheaVertDescender", GlobalMetric::VheaDescender),
+        ("vheaVertLineGap", GlobalMetric::VheaLineGap),
+        ("strikeoutPosition", GlobalMetric::StrikeoutPosition),
+        ("strikeoutSize", GlobalMetric::StrikeoutSize),
+        ("subscriptXOffset", GlobalMetric::SubscriptXOffset),
+        ("subscriptXSize", GlobalMetric::SubscriptXSize),
+        ("subscriptYOffset", GlobalMetric::SubscriptYOffset),
+        ("subscriptYSize", GlobalMetric::SubscriptYSize),
+        ("superscriptXOffset", GlobalMetric::SuperscriptXOffset),
+        ("superscriptXSize", GlobalMetric::SuperscriptXSize),
+        ("superscriptYOffset", GlobalMetric::SuperscriptYOffset),
+        ("superscriptYSize", GlobalMetric::SuperscriptYSize),
+        ("underlinePosition", GlobalMetric::UnderlinePosition),
+        ("underlineThickness", GlobalMetric::UnderlineThickness),
+    ];
+    const NAMES: &[(&str, NameId)] = &[
+        ("preferredFamilyName", NameId::TYPOGRAPHIC_FAMILY_NAME),
+        ("preferredSubfamilyName", NameId::TYPOGRAPHIC_SUBFAMILY_NAME),
+        ("compatibleFullName", NameId::COMPATIBLE_FULL_NAME),
+        ("WWSFamilyName", NameId::WWS_FAMILY_NAME),
+        ("WWSSubfamilyName", NameId::WWS_SUBFAMILY_NAME),
+    ];
+
+    for param in params {
+        let Some([name, value]) = param.as_array().and_then(|pair| pair.first_chunk::<2>()) else {
+            continue;
+        };
+        let Some(name) = name.as_string() else {
+            continue;
+        };
+        if let Some((_, metric)) = METRICS.iter().find(|(known, _)| *known == name) {
+            if let Some(number) = as_number(value) {
+                overrides.metrics.insert(*metric, OrderedFloat(number));
+            }
+            continue;
+        }
+        if let Some((_, name_id)) = NAMES.iter().find(|(known, _)| *known == name) {
+            if let Some(string) = value.as_string() {
+                overrides.names.insert(*name_id, string.to_string());
+            }
+            continue;
+        }
+        match name {
+            // glyphsLib takes the absolute value of both win metrics
+            "winDescent" => {
+                if let Some(number) = as_number(value) {
+                    overrides
+                        .metrics
+                        .insert(GlobalMetric::Os2WinDescent, OrderedFloat(number.abs()));
+                }
+            }
+            "panose" | "openTypeOS2Panose" => {
+                let mut digits = [0u8; 10];
+                for (dst, src) in digits
+                    .iter_mut()
+                    .zip(value.as_array().into_iter().flatten())
+                {
+                    *dst = src.as_signed_integer().unwrap_or_default() as u8;
+                }
+                overrides.panose = Some(Panose::from_digits(digits));
+            }
+            "fsType" | "openTypeOS2Type" => {
+                overrides.fs_type = Some(
+                    value
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .filter_map(Value::as_signed_integer)
+                        .fold(0u16, |acc, bit| acc | (1 << bit)),
+                );
+            }
+            "unicodeRanges" | "openTypeOS2UnicodeRanges" => {
+                overrides.unicode_range_bits = Some(
+                    value
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .filter_map(Value::as_signed_integer)
+                        .map(|bit| bit as u32)
+                        .collect(),
+                );
+            }
+            "isFixedPitch" | "postscriptIsFixedPitch" => {
+                overrides.is_fixed_pitch = as_glyphs_bool(value);
+            }
+            // the CFF `FullName` operator, not a name record
+            "postscriptFullName" => {
+                overrides.postscript_full_name = value.as_string().map(str::to_string);
+            }
+            "Use Typo Metrics" => overrides.use_typo_metrics = as_glyphs_bool(value),
+            "Has WWS Names" => overrides.has_wws_names = as_glyphs_bool(value),
+            "Don't use Production Names" => {
+                overrides.use_production_names = as_glyphs_bool(value).map(|dont| !dont);
+            }
+            "Name Table Entry" => match value.as_string().map(NameTableEntry::from_str) {
+                Some(Ok(entry)) => {
+                    overrides.name_records.insert(
+                        NameKey {
+                            name_id: NameId::new(entry.name_id),
+                            platform_id: entry.platform_id,
+                            encoding_id: entry.encoding_id,
+                            lang_id: entry.lang_id,
+                        },
+                        entry.value,
+                    );
+                }
+                Some(Err(e)) => warn!("bad instance 'Name Table Entry': {e}"),
+                None => (),
+            },
+            _ => (),
+        }
+    }
+    overrides
+}
+
+/// One string-valued Glyphs custom parameter out of a designspace instance lib.
+fn string_param(lib: &Dictionary, name: &str) -> Option<String> {
+    lib.get("com.schriftgestaltung.customParameters")
+        .and_then(Value::as_array)?
+        .iter()
+        .filter_map(|param| param.as_array()?.first_chunk::<2>())
+        .find(|[key, _]| key.as_string() == Some(name))
+        .and_then(|[_, value]| value.as_string())
+        .map(str::to_string)
+}
+
+fn as_number(value: &Value) -> Option<f64> {
+    value
+        .as_real()
+        .or_else(|| value.as_signed_integer().map(|v| v as f64))
+        // Glyphs 2 wrote numbers as strings often enough to be worth trying
+        .or_else(|| value.as_string().and_then(|s| s.parse().ok()))
+}
+
+/// Glyphs writes its checkbox parameters as 0/1 integers, not booleans.
+fn as_glyphs_bool(value: &Value) -> Option<bool> {
+    value
+        .as_boolean()
+        .or_else(|| value.as_signed_integer().map(|v| v != 0))
 }
 
 fn parse_meta_table_values(plist: &plist::Value) -> Option<MetaTableValues> {
@@ -1723,9 +1955,15 @@ impl Work<Context, WorkId, Error> for GlobalMetricsWork {
         }
 
         trace!("{metrics:#?}");
+        // pinned here, not at the pin barrier: only the builder still has the
+        // unrounded per-master values `fontmake -i` interpolates
         context
             .global_metrics
-            .set(metrics.build(&static_metadata.axes)?);
+            .set(fontir::instance::build_global_metrics(
+                metrics,
+                &static_metadata,
+                context.instance.as_ref(),
+            )?);
         Ok(())
     }
 }
@@ -2436,7 +2674,7 @@ mod tests {
         let _ = env_logger::builder().is_test(true).try_init();
         let mut source = load_designspace(name);
         modify(&mut source);
-        let context = Context::new_root(flags, None);
+        let context = Context::new_root(flags, None, None);
         let task_context = context.copy_for_work(
             Access::None,
             AccessBuilder::new()
@@ -3180,6 +3418,36 @@ mod tests {
     }
 
     #[test]
+    fn postscript_hints_for_every_master() {
+        let (_, context) = build_static_metadata(
+            "designspace_from_glyphs/WghtVar.designspace",
+            Flags::default(),
+        );
+        let static_metadata = context.static_metadata.get();
+        let regular = NormalizedLocation::for_pos(&[("wght", 0.0)]);
+        let bold = NormalizedLocation::for_pos(&[("wght", 1.0)]);
+
+        // one entry per master, not just the default
+        assert_eq!(
+            static_metadata.postscript.keys().collect::<HashSet<_>>(),
+            HashSet::from([&regular, &bold])
+        );
+        // Regular states blues, so it has them ...
+        assert_eq!(
+            static_metadata.postscript_at(&regular).blue_values,
+            [-16.0, 0.0, 737.0, 753.0].map(OrderedFloat)
+        );
+        assert_eq!(
+            static_metadata.postscript_at(&regular).other_blues,
+            [-58.0, -42.0].map(OrderedFloat)
+        );
+        // ... Bold states none, so it has none: masters routinely disagree on
+        // zone *count*, which is why they can't share one list
+        assert!(static_metadata.postscript_at(&bold).blue_values.is_empty());
+        assert!(static_metadata.postscript_at(&bold).other_blues.is_empty());
+    }
+
+    #[test]
     fn static_metadata_disable_postscript_names() {
         let no_production_names = Flags::default() - Flags::PRODUCTION_NAMES;
         let (_, context) = build_static_metadata(
@@ -3210,20 +3478,25 @@ mod tests {
         );
     }
 
-    fn assert_fs_type(src: &str, expected: u16) {
+    fn assert_fs_type(src: &str, expected: Option<u16>) {
         let (_, context) = build_static_metadata(src, Flags::default());
         let static_metadata = context.static_metadata.get();
-        assert_eq!(Some(expected), static_metadata.misc.fs_type);
+        assert_eq!(expected, static_metadata.misc.fs_type);
     }
 
+    /// A UFO that says nothing leaves it to whoever is building.
+    ///
+    /// ufo2ft's default is [2] and glyphsLib's, which an interpolated instance
+    /// gets, is [3]; which applies isn't ours to decide here. `fontbe`'s OS/2
+    /// work supplies the first and `fontir::instance` the second.
     #[test]
     fn default_fs_type() {
-        assert_fs_type("wght_var.designspace", 1 << 2);
+        assert_fs_type("wght_var.designspace", None);
     }
 
     #[test]
     fn obeys_explicit_fs_type() {
-        assert_fs_type("MVAR.designspace", 1 << 3);
+        assert_fs_type("MVAR.designspace", Some(1 << 3));
     }
 
     #[test]
@@ -3283,7 +3556,7 @@ mod tests {
             font.save(&tmp_ufo).unwrap();
 
             let source = DesignSpaceIrSource::new(&tmp_ufo).unwrap();
-            let context = Context::new_root(Flags::default(), None);
+            let context = Context::new_root(Flags::default(), None, None);
             let task_context = context.copy_for_work(
                 Access::None,
                 AccessBuilder::new()
@@ -3947,7 +4220,7 @@ mod tests {
         let mut source = load_designspace("wght_var.designspace");
         let ds = Arc::get_mut(&mut source.designspace).unwrap();
         ds.lib.insert(FEATURE_WRITERS_LIB_KEY.into(), value);
-        let context = Context::new_root(Flags::default(), None);
+        let context = Context::new_root(Flags::default(), None, None);
         let task_context = context.copy_for_work(
             Access::None,
             AccessBuilder::new()

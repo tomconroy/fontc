@@ -148,6 +148,22 @@ pub struct CustomParameters {
     pub vhea_caret_offset: Option<i64>,
     pub meta_table: Option<MetaTableValues>,
     pub dont_use_production_names: Option<bool>,
+
+    // Naming. At *instance* level glyphsLib replays these onto the interpolated
+    // UFO's fontinfo, which is the only place fontc reads them; at font level a
+    // source ordinarily states them as properties instead.
+    // <https://github.com/googlefonts/glyphsLib/blob/main/Lib/glyphsLib/builder/custom_params.py#L364-L448>
+    pub family_name: Option<SmolStr>,
+    pub postscript_font_name: Option<SmolStr>,
+    pub postscript_full_name: Option<SmolStr>,
+    pub style_map_family_name: Option<SmolStr>,
+    pub style_map_style_name: Option<SmolStr>,
+    pub preferred_family_name: Option<SmolStr>,
+    pub preferred_subfamily_name: Option<SmolStr>,
+    pub compatible_full_name: Option<SmolStr>,
+    pub wws_family_name: Option<SmolStr>,
+    pub wws_subfamily_name: Option<SmolStr>,
+
     // Master-level parameters for linking metrics to another master
     pub link_metrics_with_first_master: Option<bool>,
     pub link_metrics_with_master: Option<SmolStr>,
@@ -1308,6 +1324,36 @@ impl RawCustomParameters {
                 "Don't use Production Names" => {
                     add_and_report_issues!(dont_use_production_names, Plist::as_bool)
                 }
+                // naming; each has a short and a long (UFO attribute) spelling,
+                // and glyphsLib's ParamHandler accepts either
+                "familyName" => add_and_report_issues!(family_name, Plist::as_str, into),
+                "postscriptFontName" => {
+                    add_and_report_issues!(postscript_font_name, Plist::as_str, into)
+                }
+                "postscriptFullName" => {
+                    add_and_report_issues!(postscript_full_name, Plist::as_str, into)
+                }
+                "styleMapFamilyName" => {
+                    add_and_report_issues!(style_map_family_name, Plist::as_str, into)
+                }
+                "styleMapStyleName" => {
+                    add_and_report_issues!(style_map_style_name, Plist::as_str, into)
+                }
+                "preferredFamilyName" | "openTypeNamePreferredFamilyName" => {
+                    add_and_report_issues!(preferred_family_name, Plist::as_str, into)
+                }
+                "preferredSubfamilyName" | "openTypeNamePreferredSubfamilyName" => {
+                    add_and_report_issues!(preferred_subfamily_name, Plist::as_str, into)
+                }
+                "compatibleFullName" | "openTypeNameCompatibleFullName" => {
+                    add_and_report_issues!(compatible_full_name, Plist::as_str, into)
+                }
+                "WWSFamilyName" | "openTypeNameWWSFamilyName" => {
+                    add_and_report_issues!(wws_family_name, Plist::as_str, into)
+                }
+                "WWSSubfamilyName" | "openTypeNameWWSSubfamilyName" => {
+                    add_and_report_issues!(wws_subfamily_name, Plist::as_str, into)
+                }
                 "Link Metrics With First Master" => {
                     add_and_report_issues!(link_metrics_with_first_master, Plist::as_bool)
                 }
@@ -2002,6 +2048,19 @@ pub struct Instance {
     pub axes_values: Vec<OrderedFloat<f64>>,
     pub custom_parameters: CustomParameters,
     properties: Vec<RawName>, // used for name resolution
+    /// The "Style Linking" checkboxes of the Instances tab.
+    ///
+    /// glyphsLib derives `styleMapStyleName` from these two flags and nothing
+    /// else — the style *name* is never parsed for "Bold", so an instance
+    /// called `Bold` with the box unchecked is style-linked as regular.
+    /// <https://github.com/googlefonts/glyphsLib/blob/main/Lib/glyphsLib/builder/names.py#L77-L82>
+    pub is_bold: bool,
+    pub is_italic: bool,
+    /// "Style Linking > this instance is the X of", i.e. the family to link into.
+    ///
+    /// Empty or `Regular` means "work it out from the style name"; see
+    /// [`Instance::style_map_names`].
+    pub link_style: Option<String>,
 }
 
 /// <https://github.com/googlefonts/glyphsLib/blob/6f243c1f732ea1092717918d0328f3b5303ffe56/Lib/glyphsLib/classes.py#L150>
@@ -2040,6 +2099,11 @@ struct RawInstance {
 
     weight_class: Option<String>,
     width_class: Option<String>,
+    // Style Linking; both default to off
+    // <https://github.com/googlefonts/glyphsLib/blob/main/Lib/glyphsLib/classes.py#L3269-L3270>
+    is_bold: Option<i64>,
+    is_italic: Option<i64>,
+    link_style: Option<String>,
     properties: Vec<RawName>,
     custom_parameters: RawCustomParameters,
 }
@@ -3639,32 +3703,135 @@ impl Instance {
             axes_values: value.axes_values.clone(),
             properties: value.properties.clone(),
             custom_parameters: value.custom_parameters.to_custom_params()?,
+            is_bold: value.is_bold.unwrap_or_default() != 0,
+            is_italic: value.is_italic.unwrap_or_default() != 0,
+            link_style: value.link_style.clone(),
         })
     }
 
-    fn family_name(&self) -> Option<&str> {
+    /// This instance's value for one of its Glyphs 3 `properties`.
+    fn property(&self, key: &str) -> Option<&str> {
         self.properties
             .iter()
-            .find(|raw| raw.key == "familyNames")
+            .find(|raw| raw.key == key)
             .and_then(RawName::get_value)
-        // glyphsLib here also checks for 'familyName' in customParams, but we
-        // don't have that key? Possible that we're ignoring it in the raw params
-        // conversion..
-        // https://github.com/googlefonts/glyphsLib/blob/c4db6b981d577/Lib/glyphsLib/classes.py#L3271
+    }
+
+    /// The instance's own family name, if it states one.
+    ///
+    /// `GSInstance.familyName`: the `familyNames` property, else the
+    /// `familyName` custom parameter, else (the caller's job) the font's.
+    ///
+    /// <https://github.com/googlefonts/glyphsLib/blob/main/Lib/glyphsLib/classes.py#L3304-L3310>
+    pub fn family_name(&self) -> Option<&str> {
+        self.property("familyNames")
+            .or(self.custom_parameters.family_name.as_deref())
+    }
+
+    /// Name id 16, if the instance states one.
+    ///
+    /// <https://github.com/googlefonts/glyphsLib/blob/main/Lib/glyphsLib/classes.py#L3331-L3337>
+    pub fn preferred_family_name(&self) -> Option<&str> {
+        self.property("preferredFamilyNames")
+            .or(self.custom_parameters.preferred_family_name.as_deref())
+    }
+
+    /// Name id 17, if the instance states one.
+    pub fn preferred_subfamily_name(&self) -> Option<&str> {
+        self.property("preferredSubfamilyNames")
+            .or(self.custom_parameters.preferred_subfamily_name.as_deref())
+    }
+
+    /// Name id 21, if the instance states one.
+    pub fn wws_family_name(&self) -> Option<&str> {
+        self.property("WWSFamilyName")
+            .or(self.custom_parameters.wws_family_name.as_deref())
+    }
+
+    /// Name id 22, if the instance states one.
+    pub fn wws_subfamily_name(&self) -> Option<&str> {
+        self.property("WWSSubfamilyName")
+            .or(self.custom_parameters.wws_subfamily_name.as_deref())
+    }
+
+    /// Name id 18, if the instance states one.
+    ///
+    /// Parameter only: glyphsLib registers no `glyphs3_property` for it, so the
+    /// `compatibleFullNames` property is stashed in the instance lib and then
+    /// dropped.
+    pub fn compatible_full_name(&self) -> Option<&str> {
+        self.custom_parameters.compatible_full_name.as_deref()
+    }
+
+    /// This instance's `styleMapFamilyName`, i.e. name ID 1.
+    ///
+    /// glyphsLib's `build_stylemap_names`: the family name plus the "linked
+    /// style", which is `linkStyle` when it says anything other than
+    /// `Regular`, and otherwise the style name with the *last* occurrence of
+    /// each style-linking word removed — `Regular` only when neither box is
+    /// ticked, `Bold` only when the bold box is, `Italic` or `Oblique` only
+    /// when the italic box is, each consumed once. An empty remainder leaves
+    /// the family name alone.
+    ///
+    /// `family_name` is the instance's own if it has one, else the font's.
+    ///
+    /// A `styleMapFamilyName` custom parameter wins outright: `apply_instance_data_to_ufo`
+    /// runs *after* the instantiator has written the designspace descriptor's
+    /// value, so the parameter overwrites it.
+    ///
+    /// <https://github.com/googlefonts/glyphsLib/blob/main/Lib/glyphsLib/builder/names.py#L59-L106>
+    pub fn style_map_family_name(&self, family_name: &str) -> String {
+        if let Some(stated) = self.custom_parameters.style_map_family_name.as_deref() {
+            return stated.to_string();
+        }
+        let linked_style = match self.link_style.as_deref() {
+            Some(style) if !style.is_empty() && style != "Regular" => style.to_string(),
+            _ => self.linked_style_from_name(),
+        };
+        if linked_style.is_empty() {
+            family_name.to_string()
+        } else {
+            format!("{family_name} {linked_style}")
+        }
+    }
+
+    /// glyphsLib's `_get_linked_style`, walking the style name in reverse.
+    fn linked_style_from_name(&self) -> String {
+        let (mut wants_bold, mut wants_italic) = (self.is_bold, self.is_italic);
+        let mut wants_regular = !(wants_bold || wants_italic);
+        let mut kept: Vec<&str> = Vec::new();
+        for part in self.name.split_ascii_whitespace().rev() {
+            match part {
+                "Regular" if wants_regular => wants_regular = false,
+                "Bold" if wants_bold => wants_bold = false,
+                "Italic" | "Oblique" if wants_italic => wants_italic = false,
+                _ => kept.push(part),
+            }
+        }
+        kept.reverse();
+        kept.join(" ")
+    }
+
+    /// The CFF `FullName` for a static build of this instance, if it states one.
+    ///
+    /// glyphsLib registers `postscriptFullName` as both a custom parameter and a
+    /// Glyphs 3 property, and `apply_instance_data_to_ufo` writes it onto the
+    /// interpolated UFO's `postscriptFullName` — which ufo2ft reads only when it
+    /// builds the CFF Top DICT, never for the name table.
+    ///
+    /// <https://github.com/googlefonts/glyphsLib/blob/main/Lib/glyphsLib/builder/custom_params.py#L385>
+    pub fn postscript_full_name(&self) -> Option<&str> {
+        self.property("postscriptFullName")
+            .or(self.custom_parameters.postscript_full_name.as_deref())
     }
 
     /// Get the optional postscript name to use for the `fvar` named instance.
     pub fn postscript_name(&self) -> Option<&str> {
         // https://handbook.glyphsapp.com/custom-parameter-descriptions/
-        // https://github.com/googlefonts/glyphsLib/blob/7a8f643a711ffb9d351d037425a7eb60759e6219/Lib/glyphsLib/builder/instances.py#L118-L121
-        ["variablePostscriptFontName", "postscriptFontName"]
-            .iter()
-            .find_map(|key| {
-                self.properties
-                    .iter()
-                    .find(|raw| raw.key == *key)
-                    .and_then(RawName::get_value)
-            })
+        // https://github.com/googlefonts/glyphsLib/blob/main/Lib/glyphsLib/builder/instances.py#L124-L128
+        self.property("variablePostscriptFontName")
+            .or_else(|| self.property("postscriptFontName"))
+            .or(self.custom_parameters.postscript_font_name.as_deref())
     }
 }
 
@@ -6163,6 +6330,67 @@ etc;
                 (OrderedFloat(1000.), OrderedFloat(208.))
             ]
         )
+    }
+
+    /// `GSInstance.familyName` and friends: property, then custom parameter.
+    ///
+    /// glyphsLib reads the Glyphs 3 property first and falls back to the
+    /// parameter of the same (singular) name; `postScriptFontName` has the same
+    /// shape with `variablePostscriptFontName` in front. A `styleMapFamilyName`
+    /// parameter beats the name glyphsLib builds from style linking, because
+    /// `apply_instance_data_to_ufo` replays it after the instantiator.
+    ///
+    /// <https://github.com/googlefonts/glyphsLib/blob/main/Lib/glyphsLib/classes.py#L3304-L3337>
+    /// <https://github.com/googlefonts/glyphsLib/blob/main/Lib/glyphsLib/builder/instances.py#L124-L128>
+    #[test]
+    fn instance_names_fall_back_to_custom_parameters() {
+        let mut instance = Instance {
+            name: "Regular".into(),
+            active: true,
+            type_: InstanceType::Single,
+            axis_mappings: Default::default(),
+            axes_values: Vec::new(),
+            custom_parameters: CustomParameters {
+                family_name: Some("Fam Condensed".into()),
+                postscript_font_name: Some("FamCond-Regular".into()),
+                style_map_family_name: Some("Fam Cond Black".into()),
+                preferred_family_name: Some("Fam".into()),
+                postscript_full_name: Some("FamCondRegular".into()),
+                ..Default::default()
+            },
+            properties: Vec::new(),
+            is_bold: false,
+            is_italic: false,
+            link_style: None,
+        };
+        assert_eq!(instance.family_name(), Some("Fam Condensed"));
+        assert_eq!(instance.postscript_name(), Some("FamCond-Regular"));
+        assert_eq!(instance.postscript_full_name(), Some("FamCondRegular"));
+        assert_eq!(instance.preferred_family_name(), Some("Fam"));
+        assert_eq!(
+            instance.style_map_family_name("Fam Condensed"),
+            "Fam Cond Black"
+        );
+
+        // a Glyphs 3 property wins over the parameter
+        instance.properties = vec![
+            RawName {
+                key: "familyNames".into(),
+                value: Some("Fam SemiExpanded".into()),
+                values: Vec::new(),
+            },
+            // Saira Stencil states this one as a property
+            RawName {
+                key: "postscriptFullName".into(),
+                value: Some("FamSemiExpandedRegular".into()),
+                values: Vec::new(),
+            },
+        ];
+        assert_eq!(instance.family_name(), Some("Fam SemiExpanded"));
+        assert_eq!(
+            instance.postscript_full_name(),
+            Some("FamSemiExpandedRegular")
+        );
     }
 
     #[test]

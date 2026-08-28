@@ -1,6 +1,7 @@
 //! A font compiler with aspirations of being fast and safe.
 
 mod error;
+mod instance;
 #[cfg(not(feature = "rayon"))]
 mod norayon;
 mod timing;
@@ -10,6 +11,7 @@ mod workload;
 
 pub use error::Error;
 
+pub use fontir::instance::InstanceSpec; // Re-export for library users
 pub use fontir::orchestration::Flags; // Re-export for library users
 use fontra2fontir::source::FontraIrSource;
 use glyphs2fontir::source::GlyphsIrSource;
@@ -146,6 +148,12 @@ pub struct Options {
     pub timing_file: Option<PathBuf>,
     pub ir_dir: Option<PathBuf>,
     pub debug_dir: Option<PathBuf>,
+    /// Compile one static instance of a variable source instead of the
+    /// variable font.
+    ///
+    /// Resolved against the source's axes and named instances once the
+    /// frontend has run; see [`crate::instance`].
+    pub instance: Option<InstanceSpec>,
 }
 
 /// Run the compiler with the provided input and options.
@@ -224,8 +232,14 @@ fn generate_font_internal(
 
     let flags = merge_compilation_flags(options, &*source);
 
-    let workload = Workload::new(source, timer, options.skip_features, flags)?;
-    let fe_root = FeContext::new_root(flags, options.ir_dir.clone());
+    let workload = Workload::new(
+        source,
+        timer,
+        options.skip_features,
+        flags,
+        options.instance.clone(),
+    )?;
+    let fe_root = FeContext::new_root(flags, options.instance.clone(), options.ir_dir.clone());
     let be_root = BeContext::new_root(
         flags,
         Some(version().into()),
@@ -325,7 +339,7 @@ pub fn testdata_dir() -> std::path::PathBuf {
 mod tests {
 
     use std::{
-        collections::{HashMap, HashSet, VecDeque},
+        collections::{BTreeMap, HashMap, HashSet, VecDeque},
         fs::{self, File},
         io::Read,
         path::Path,
@@ -427,7 +441,8 @@ mod tests {
 
             init_paths(&options).unwrap();
 
-            let fe_context = FeContext::new_root(flags, options.ir_dir.clone());
+            let fe_context =
+                FeContext::new_root(flags, options.instance.clone(), options.ir_dir.clone());
             let be_context = BeContext::new_root(
                 flags,
                 Some(crate::version().into()),
@@ -436,7 +451,14 @@ mod tests {
                 options.compile_debg,
                 &fe_context.read_only(),
             );
-            let workload = Workload::new(source, timer, options.skip_features, flags).unwrap();
+            let workload = Workload::new(
+                source,
+                timer,
+                options.skip_features,
+                flags,
+                options.instance.clone(),
+            )
+            .unwrap();
 
             TestCompile {
                 temp: temp_dir,
@@ -6417,5 +6439,943 @@ mod tests {
                 .unwrap();
         }
         assert!(pen.0 > 0, "at least one CFF glyph should have an outline");
+    }
+
+    // ---- --instance: pinning a variable source at one location ----
+
+    fn compile_instance(source: &str, instance: &str) -> TestCompile {
+        TestCompile::compile(source, |mut options| {
+            options.instance = Some(instance.parse().unwrap());
+            options
+        })
+    }
+
+    fn compile_cff_instance(source: &str, instance: &str) -> TestCompile {
+        TestCompile::compile(source, |mut options| {
+            // what --flavor otf --instance sets
+            options.flags |= Flags::CFF_OUTLINES | Flags::DECOMPOSE_COMPONENTS;
+            options.instance = Some(instance.parse().unwrap());
+            options.output_file = options.output_file.map(|path| path.with_extension("otf"));
+            options
+        })
+    }
+
+    fn table_tags(font: &FontRef) -> Vec<Tag> {
+        font.table_directory
+            .table_records()
+            .iter()
+            .map(|tr| tr.tag())
+            .collect()
+    }
+
+    /// Every glyph ends up with exactly one source, keyed by the source's own
+    /// default location, holding the interpolated outline.
+    ///
+    /// wght 400..700, so `--instance wght=550` is normalized 0.5, and `plus`
+    /// interpolates 557/572 -> 564.5 and (314,595)/(339,596) -> (326.5, 595.5).
+    /// Unrounded: rounding here would feed cu2qu different numbers.
+    #[test]
+    fn instance_pins_every_glyph_to_one_location() {
+        let result = compile_instance("wght_var.designspace", "wght=550");
+
+        let static_metadata = result.fe_context.static_metadata.get();
+        let default_location = static_metadata.default_location();
+        assert_eq!(
+            default_location,
+            &NormalizedLocation::for_pos(&[("wght", 0.0)])
+        );
+
+        for name in ["plus", "bar"] {
+            let glyph = result.fe_context.get_glyph(name);
+            assert_eq!(
+                glyph.sources().keys().collect::<Vec<_>>(),
+                vec![default_location],
+                "{name}"
+            );
+        }
+
+        let plus = result.fe_context.get_glyph("plus");
+        let instance = plus.default_instance();
+        assert_eq!(instance.width, 564.5);
+        let point_at = |i: usize| instance.contours[0].elements()[i];
+        assert_eq!(
+            format!("{:?}", point_at(6)),
+            format!("{:?}", kurbo::PathEl::LineTo(Point::new(326.5, 595.5)))
+        );
+    }
+
+    /// `bar` has a sparse master at wght 600 that `plus` doesn't, so it
+    /// interpolates from its own three locations, not the font's two.
+    #[test]
+    fn instance_interpolates_a_sparse_glyph_from_its_own_masters() {
+        // normalized 2/3, between the 600 layer and Bold
+        let result = compile_instance("wght_var.designspace", "wght=600");
+        let bar = result.fe_context.get_glyph("bar");
+        assert_eq!(bar.sources().len(), 1);
+        // exactly the {600} layer, which is only reachable with a 3-master model
+        assert_eq!(bar.default_instance().width, 540.0);
+    }
+
+    /// A non-exporting glyph the pin cannot interpolate is emptied, not fatal.
+    ///
+    /// `hyphen` there is `export = 0` with four points at Regular and none at
+    /// Bold, which is a thing sources really do: the glyph never reaches the
+    /// font, so nothing ever asked it to interpolate. The variable build
+    /// doesn't notice — `GlyphOrderWork` drops it long before deltas — and the
+    /// static build must not be the one place it becomes an error.
+    #[test]
+    fn instance_empties_an_incompatible_non_exporting_glyph() {
+        let result = compile_instance("glyphs3/WghtVar_NoExportIncompatible.glyphs", "wght=550");
+
+        // emptied, ufo2ft-style: not the default master, which is 4 points at 600
+        let hyphen = result.fe_context.get_glyph("hyphen");
+        assert_eq!(hyphen.sources().len(), 1);
+        assert!(hyphen.default_instance().contours.is_empty(), "{hyphen:?}");
+        assert_eq!(hyphen.default_instance().width, 0.0);
+
+        // and still dropped from the font, exactly as when it interpolates
+        assert!(!result.contains_glyph("hyphen"));
+        assert!(result.contains_glyph("manual-component"));
+    }
+
+    /// No axes means no fvar/gvar/avar/STAT/HVAR/MVAR, by every backend's own
+    /// `axes.is_empty()` gate.
+    #[test]
+    fn instance_has_no_variable_tables() {
+        let variable = TestCompile::compile_source("wght_var.designspace");
+        let variable_tags = table_tags(&variable.font());
+        for tag in [
+            Tag::new(b"HVAR"),
+            Tag::new(b"MVAR"),
+            Tag::new(b"STAT"),
+            Tag::new(b"fvar"),
+            Tag::new(b"gvar"),
+        ] {
+            assert!(variable_tags.contains(&tag), "{tag} in the variable font");
+        }
+
+        let result = compile_instance("wght_var.designspace", "wght=550");
+        assert_eq!(
+            table_tags(&result.font()),
+            vec![
+                Tag::new(b"GPOS"),
+                Tag::new(b"GSUB"),
+                Tag::new(b"OS/2"),
+                Tag::new(b"cmap"),
+                Tag::new(b"glyf"),
+                Tag::new(b"head"),
+                Tag::new(b"hhea"),
+                Tag::new(b"hmtx"),
+                Tag::new(b"loca"),
+                Tag::new(b"maxp"),
+                Tag::new(b"name"),
+                Tag::new(b"post"),
+            ]
+        );
+    }
+
+    /// The name records fvar and STAT would have referenced go with them.
+    #[test]
+    fn instance_prunes_the_names_only_fvar_and_stat_used() {
+        let variable = TestCompile::compile_source("wght_var.designspace");
+        let names = variable.font().name().unwrap();
+        let minted: Vec<_> = names
+            .name_record()
+            .iter()
+            .filter(|record| record.name_id().to_u16() > 255)
+            .map(|record| {
+                record
+                    .string(names.string_data())
+                    .unwrap()
+                    .chars()
+                    .collect::<String>()
+            })
+            .collect();
+        assert_eq!(
+            minted,
+            ["Weight", "Bold"],
+            "axis label, instance style name"
+        );
+
+        let result = compile_instance("wght_var.designspace", "wght=550");
+        let names = result.font().name().unwrap();
+        assert!(
+            names
+                .name_record()
+                .iter()
+                .all(|record| record.name_id().to_u16() <= 255),
+            "{:?}",
+            names
+                .name_record()
+                .iter()
+                .map(|r| r.name_id())
+                .collect::<Vec<_>>()
+        );
+        // and the ones the source gave us are untouched
+        assert_eq!(
+            names
+                .name_record()
+                .iter()
+                .find(|record| record.name_id() == NameId::FAMILY_NAME)
+                .map(|record| record
+                    .string(names.string_data())
+                    .unwrap()
+                    .chars()
+                    .collect::<String>()),
+            Some("Wght Var".to_string())
+        );
+    }
+
+    /// Pinning at the default master must be the same font as compiling that
+    /// master on its own — the whole design is "make the IR look static".
+    ///
+    /// Three tables are exempt. `head` carries the modification time and the
+    /// checksum adjustment, neither of which is about instancing. `OS/2` and
+    /// `post` carry the fields where an interpolated instance is
+    /// *deliberately* not its master: fontmake hands every instance to
+    /// glyphsLib's `apply_instance_data_to_ufo`, which merges PANOSE across
+    /// the masters (this fixture's disagree, so the instance gets none) and
+    /// defaults `fsType` and the underline position to Glyphs.app's values
+    /// rather than ufo2ft's. Those three fields are asserted instead; every
+    /// other field of both tables is covered by the ttx_diff oracle.
+    #[test]
+    fn instance_at_the_default_is_the_default_master_compiled_alone() {
+        let pinned = compile_instance("wght_var.designspace", "wght=400");
+        let alone = TestCompile::compile_source("WghtVar-Regular.ufo");
+
+        let (pinned, alone) = (pinned.font(), alone.font());
+        assert_eq!(table_tags(&pinned), table_tags(&alone));
+        for tag in table_tags(&pinned) {
+            if [Tag::new(b"head"), Tag::new(b"OS/2"), Tag::new(b"post")].contains(&tag) {
+                continue;
+            }
+            assert_eq!(
+                pinned.table_data(tag).map(|d| d.as_bytes().to_vec()),
+                alone.table_data(tag).map(|d| d.as_bytes().to_vec()),
+                "{tag}"
+            );
+        }
+
+        let (pinned_os2, alone_os2) = (pinned.os2().unwrap(), alone.os2().unwrap());
+        assert_eq!(
+            (alone_os2.fs_type(), pinned_os2.fs_type()),
+            (1 << 2, 1 << 3)
+        );
+        assert_eq!(
+            (alone_os2.panose_10(), pinned_os2.panose_10()),
+            (
+                [2u8, 11, 5, 2, 4, 5, 4, 2, 2, 4].as_slice(),
+                [0u8; 10].as_slice()
+            ),
+            "the masters' PANOSE disagree, so the instance has none"
+        );
+        assert_eq!(
+            (
+                alone.post().unwrap().underline_position().to_i16(),
+                pinned.post().unwrap().underline_position().to_i16()
+            ),
+            (-75, -100)
+        );
+    }
+
+    /// Every name record of a pinned font, by id.
+    fn name_records(font: &FontRef) -> Vec<(u16, String)> {
+        let names = font.name().unwrap();
+        let mut records: Vec<_> = names
+            .name_record()
+            .iter()
+            .map(|record| {
+                (
+                    record.name_id().to_u16(),
+                    record
+                        .string(names.string_data())
+                        .unwrap()
+                        .chars()
+                        .collect::<String>(),
+                )
+            })
+            .collect();
+        records.sort();
+        records
+    }
+
+    /// A pinned instance is named for the instance, not for the family.
+    ///
+    /// The strings are `fontmake -m wght_var.designspace -i 'Wght Var Bold'
+    /// --keep-overlaps -o ttf`'s, read out of the ttf it produced (fontmake
+    /// 3.12.1). Name id 5 is the one place fontc deliberately differs: it
+    /// stamps its own version on, and ttx_diff normalises that away.
+    ///
+    /// This instance states `stylemapstylename="bold"`, so ids 1 and 2 come
+    /// from the `<instance>` rather than from the RIBBI fallback, and 16/17 are
+    /// dropped for matching 1/2. `usWeightClass` is the pin's user coordinate
+    /// truncated, `fsSelection` bit 5 and `macStyle` bit 0 are the style
+    /// linking, and `fsType` 8 is glyphsLib's instance default.
+    #[test]
+    fn instance_names_a_style_linked_instance_like_fontmake() {
+        let result = compile_instance("wght_var.designspace", "wght=700");
+        let font = result.font();
+
+        assert_eq!(
+            name_records(&font)
+                .into_iter()
+                .filter(|(id, _)| *id != 5)
+                .collect::<Vec<_>>(),
+            vec![
+                (1, "Wght Var".to_string()),
+                (2, "Bold".to_string()),
+                (3, "0.000;NONE;WghtVar-Bold".to_string()),
+                (4, "Wght Var Bold".to_string()),
+                (6, "WghtVar-Bold".to_string()),
+            ]
+        );
+        let os2 = font.os2().unwrap();
+        assert_eq!(os2.us_weight_class(), 700);
+        assert_eq!(os2.us_width_class(), 5);
+        assert_eq!(os2.fs_selection().bits(), 0b100000);
+        assert_eq!(os2.fs_type(), 8);
+        assert_eq!(font.head().unwrap().mac_style().bits(), 0b1);
+    }
+
+    /// A non-RIBBI style name with no style linking takes ufo2ft's fallback.
+    ///
+    /// Ids 1 and 2 are `styleMapFamilyNameFallback` and
+    /// `styleMapStyleNameFallback`: "Foo" is not one of the four, so id 2 is
+    /// "Regular" and id 1 gains the style as a suffix — which makes 1 and 2
+    /// differ from 16 and 17, so all four are emitted.
+    ///
+    /// Strings from `fontmake -i 'Wght Var Foo' --keep-overlaps -o ttf` on a
+    /// scratch copy of `wght_var.designspace` carrying this fixture's
+    /// `<instance stylename="Foo">` with the `name` and `familyname`
+    /// attributes fontmake's `-i` needs to select it (fontmake 3.12.1).
+    #[test]
+    fn instance_names_a_non_ribbi_instance_like_fontmake() {
+        let result = compile_instance("wght_var_instance_stylename.designspace", "Foo");
+
+        assert_eq!(
+            name_records(&result.font())
+                .into_iter()
+                .filter(|(id, _)| *id != 5)
+                .collect::<Vec<_>>(),
+            vec![
+                (1, "Wght Var Foo".to_string()),
+                (2, "Regular".to_string()),
+                (3, "0.000;NONE;WghtVar-Foo".to_string()),
+                (4, "Wght Var Foo".to_string()),
+                (6, "WghtVar-Foo".to_string()),
+                (16, "Wght Var".to_string()),
+                (17, "Foo".to_string()),
+            ]
+        );
+    }
+
+    /// The pinned instance's *own* custom parameters win over the masters'.
+    ///
+    /// glyphsLib's `apply_instance_data_to_ufo` replays them onto the
+    /// interpolated UFO after interpolation, so each one overwrites whatever
+    /// came out of the model. The fixture's Regular instance states one of
+    /// each kind: `panose` (OS/2), `meta Table`, `typoAscender` (a global
+    /// metric), `Don't use Production Names`, `Name Table Entry`,
+    /// `preferredFamilyName` and `styleMapStyleName`, plus a `familyNames`
+    /// property.
+    #[test]
+    fn instance_applies_its_own_custom_parameters() {
+        let result = compile_instance("glyphs3/InstanceCustomParameters.glyphs", "wght=400");
+        let font = result.font();
+
+        let os2 = font.os2().unwrap();
+        assert_eq!(
+            os2.panose_10(),
+            [2u8, 11, 5, 2, 4, 5, 4, 2, 2, 4].as_slice(),
+            "the instance's own PANOSE, not the merge across masters"
+        );
+        assert_eq!(os2.s_typo_ascender(), 1234);
+        assert!(
+            table_tags(&font).contains(&Tag::new(b"meta")),
+            "the instance's `meta Table` parameter builds a meta table"
+        );
+
+        // English/Windows only: the fixture also carries a Spanish family name
+        let names = font.name().unwrap();
+        let get = |id: u16| {
+            names
+                .name_record()
+                .iter()
+                .find(|record| record.name_id().to_u16() == id && record.language_id() == 0x409)
+                .map(|record| {
+                    record
+                        .string(names.string_data())
+                        .unwrap()
+                        .chars()
+                        .collect::<String>()
+                })
+        };
+        // `Name Table Entry`, which nothing else would produce
+        assert_eq!(get(25), Some("WghtVarRoman".to_string()));
+        // 16 <- preferredFamilyName, 17 <- the style name, 2 <- the non-RIBBI
+        // styleMapStyleName verbatim, 1 <- glyphsLib's style-linked family name
+        // built from the instance's own `familyNames`
+        assert_eq!(get(16), Some("WghtVar Preferred".to_string()));
+        assert_eq!(get(17), Some("Regular".to_string()));
+        assert_eq!(get(2), Some("Black".to_string()));
+        assert_eq!(get(1), Some("WghtVar Narrow".to_string()));
+        // a non-RIBBI style map style earns no RIBBI bit at all
+        assert_eq!(os2.fs_selection().bits() & 0b100_0011, 0);
+        assert_eq!(font.head().unwrap().mac_style().bits(), 0);
+    }
+
+    /// A .glyphs v3 source, where the axis is real and declared.
+    #[test]
+    fn instance_of_glyphs3() {
+        let result = compile_instance("glyphs3/WghtVar.glyphs", "wght=550");
+
+        assert!(
+            result.fe_context.static_metadata.get().axes.is_empty(),
+            "pinned metadata is static"
+        );
+        // space is 200 at Regular and 600 at Bold
+        assert_eq!(
+            result
+                .fe_context
+                .get_glyph("space")
+                .default_instance()
+                .width,
+            400.0
+        );
+        assert!(result.font().table_data(Tag::new(b"fvar")).is_none());
+    }
+
+    /// A .glyphs v2 source with no axis declarations gets three *synthetic*
+    /// axes, two of them points. That is the shape that makes glyph-source
+    /// keying interesting: the metadata's default location names all three
+    /// even though only `wght` varies, and the backend looks glyph sources up
+    /// by exactly that key.
+    #[test]
+    fn instance_of_glyphs2_with_synthetic_point_axes() {
+        let result = compile_instance("glyphs2/WghtVar_ImplicitAxes.glyphs", "wght=500");
+
+        let static_metadata = result.fe_context.static_metadata.get();
+        assert_eq!(
+            static_metadata
+                .all_source_axes
+                .iter()
+                .map(|axis| axis.tag)
+                .collect::<Vec<_>>(),
+            vec![Tag::new(b"wght"), Tag::new(b"wdth"), Tag::new(b"XXXX")],
+            "three axes, two of them points"
+        );
+        assert!(static_metadata.axes.is_empty());
+        assert_eq!(
+            static_metadata.default_location(),
+            &NormalizedLocation::for_pos(&[("wght", 0.0), ("wdth", 0.0), ("XXXX", 0.0)])
+        );
+
+        let space = result.fe_context.get_glyph("space");
+        assert_eq!(
+            space.sources().keys().collect::<Vec<_>>(),
+            vec![static_metadata.default_location()],
+            "the pinned key has to be the key the backend looks up"
+        );
+        // 200 at wght 400, 600 at wght 700, pinned at 500 => a third of the way
+        assert!(
+            (space.default_instance().width - (200.0 + 400.0 / 3.0)).abs() < 1e-9,
+            "{}",
+            space.default_instance().width
+        );
+        assert!(result.font().table_data(Tag::new(b"gvar")).is_none());
+    }
+
+    /// Kerning collapses to one instance at the pin, with the default master's
+    /// groups, and a pair one master states only by class still resolves
+    /// through the cascade rather than contributing zero.
+    #[test]
+    fn instance_pins_kerning_to_one_location() {
+        let result = compile_instance("glyphs3/WghtVar.glyphs", "wght=550");
+
+        let default_location = result
+            .fe_context
+            .static_metadata
+            .get()
+            .default_location()
+            .clone();
+        let locations = result.fe_context.kerning_locations.get();
+        assert_eq!(
+            locations.locations.iter().collect::<Vec<_>>(),
+            vec![&default_location],
+            "one location, and it is the pin"
+        );
+
+        let kerning = result
+            .fe_context
+            .kerning_at
+            .get(&FeWorkIdentifier::KernInstance(default_location.clone()));
+        assert_eq!(kerning.location, default_location);
+
+        let glyph = |name: &str| KernSide::Glyph(GlyphName::from(name));
+        let side1 = |name: &str| KernSide::Group(KernGroup::Side1(name.into()));
+        let side2 = |name: &str| KernSide::Group(KernGroup::Side2(name.into()));
+        let at = |pair: KernPair| kerning.kerns.get(&pair).map(|v| v.into_inner());
+
+        // both masters state these literally: the plain midpoint
+        assert_eq!(
+            at((glyph("bracketleft"), glyph("bracketright"))),
+            Some(-225.0)
+        );
+        assert_eq!(at((glyph("exclam"), glyph("exclam"))), Some(-230.0));
+        assert_eq!(at((glyph("hyphen"), glyph("hyphen"))), Some(-100.0));
+        // Regular only: Bold has neither the pair nor a class pair covering it
+        assert_eq!(at((glyph("exclam"), glyph("hyphen"))), Some(10.0));
+        assert_eq!(at((side1("bracketleft_R"), glyph("exclam"))), Some(-82.5));
+        assert_eq!(at((glyph("exclam"), side2("bracketright_L"))), Some(-80.0));
+        // Glyphs kern groups are per-glyph, so every master shares a partition
+        assert!(
+            kerning
+                .groups
+                .contains_key(&KernGroup::Side1("bracketleft_R".into())),
+            "{:?}",
+            kerning.groups.keys().collect::<Vec<_>>()
+        );
+    }
+
+    /// The value a master contributes to a pair is *resolved*, not the raw
+    /// plist entry: a pair one master states literally and the other covers
+    /// only by class interpolates between the two, and treating the missing
+    /// entry as zero would halve it.
+    ///
+    /// wght 0..1000 default 0, so `--instance wght=500` is normalized 0.5.
+    #[test]
+    fn instance_kerning_resolves_class_kerning_per_master() {
+        let result = compile_instance("PartialKernException.designspace", "wght=500");
+
+        let default_location = result
+            .fe_context
+            .static_metadata
+            .get()
+            .default_location()
+            .clone();
+        let kerning = result
+            .fe_context
+            .kerning_at
+            .get(&FeWorkIdentifier::KernInstance(default_location));
+
+        let glyph = |name: &str| KernSide::Glyph(GlyphName::from(name));
+        let side1 = |name: &str| KernSide::Group(KernGroup::Side1(name.into()));
+        let side2 = |name: &str| KernSide::Group(KernGroup::Side2(name.into()));
+        let at = |pair: KernPair| kerning.kerns.get(&pair).map(|v| v.into_inner());
+
+        // both state it literally
+        assert_eq!(
+            at((side1("GRK_iotaRight"), side2("GRK_iotaLeft"))),
+            Some(55.0)
+        );
+        assert_eq!(
+            at((side1("GRK_iotaRight"), glyph("iotapsilioxia"))),
+            Some(25.0)
+        );
+        // Regular's exception (30) against Bold's class-to-class (50): a naive
+        // "missing pair is zero" would say 15
+        assert_eq!(
+            at((glyph("iotadasiaoxia"), side2("GRK_iotaLeft"))),
+            Some(40.0)
+        );
+        // Regular's class-to-glyph (40) against Bold's class-to-class (50)
+        assert_eq!(at((side1("ethi_qhee"), glyph("ca-ethiopic"))), Some(45.0));
+        // and the same the other way round: Bold's exception, Regular's class
+        assert_eq!(at((glyph("qhwee-ethiopic"), side2("ethi_ca"))), Some(30.0));
+        assert_eq!(at((glyph("uoA"), side2("uoRight"))), Some(60.0));
+        assert_eq!(at((side1("uoLeft"), glyph("uoX"))), Some(40.0));
+        assert_eq!(at((side1("uoLeft"), glyph("uoY"))), Some(40.0));
+
+        // the instance's groups are the default master's, verbatim
+        assert_eq!(
+            kerning
+                .groups
+                .get(&KernGroup::Side1("uoLeft".into()))
+                .map(|members| members.iter().map(|m| m.as_str()).collect::<Vec<_>>()),
+            Some(vec!["uoA", "uoB"])
+        );
+        assert_eq!(kerning.groups.len(), 6);
+    }
+
+    // ---- --instance: feature variation rules become glyph swaps ----
+
+    /// What a pinned glyph draws, how wide it is and what it is made of.
+    fn pinned(result: &TestCompile, name: &str) -> (f64, String, Vec<String>) {
+        let glyph = result.fe_context.get_glyph(name);
+        let instance = glyph.default_instance();
+        (
+            instance.width,
+            instance
+                .contours
+                .iter()
+                .map(|contour| contour.to_svg())
+                .collect::<Vec<_>>()
+                .join(" "),
+            instance
+                .components
+                .iter()
+                .map(|component| component.base.to_string())
+                .collect(),
+        )
+    }
+
+    /// The codepoint -> glyph name map of the compiled font.
+    fn cmap_names(result: &TestCompile) -> BTreeMap<u32, String> {
+        let font = result.font();
+        let charmap = Charmap::new(&font);
+        charmap
+            .mappings()
+            .map(|(codepoint, gid)| {
+                (
+                    codepoint,
+                    result
+                        .get_glyph_name(GlyphId16::new(gid.to_u32() as u16))
+                        .unwrap()
+                        .to_string(),
+                )
+            })
+            .collect()
+    }
+
+    /// `dspace_rules/Basic.designspace` substitutes `plus` with `bar` from
+    /// Weight 550; 400 is outside that, so both glyphs are simply themselves.
+    #[test]
+    fn instance_outside_every_rule_range_swaps_nothing() {
+        let result = compile_instance("dspace_rules/Basic.designspace", "wght=400");
+
+        // the Regular master's own values, because the pin is on it
+        assert_eq!(pinned(&result, "plus").0, 557.0);
+        assert_eq!(pinned(&result, "bar").0, 517.0);
+        assert_eq!(pinned(&result, "plus").1.matches('L').count(), 12);
+        assert_eq!(pinned(&result, "bar").1.matches('L').count(), 4);
+    }
+
+    /// Inside the range it is a *swap*, not a replacement: each glyph ends up
+    /// drawing the other one, both survive with their own codepoint and GID.
+    ///
+    /// Weight 550 is the range's own minimum — designspaceLib's condition
+    /// bounds are inclusive on both ends — and normalized 0.5 on a 400..700
+    /// axis, so `bar` interpolates to 534 and `plus` to 564.5.
+    ///
+    /// Verified against `fontmake -m Basic.designspace -i --keep-overlaps`:
+    /// `glyf`, `cmap` and `hmtx` come out byte-identical.
+    #[test]
+    fn instance_inside_a_rule_range_swaps_both_glyphs() {
+        let result = compile_instance("dspace_rules/Basic.designspace", "wght=550");
+
+        let (width, path, _) = pinned(&result, "plus");
+        assert_eq!(width, 534.0, "plus is as wide as bar");
+        assert_eq!(
+            path, "M222,-234 L312,-234 L312,758.5 L222,758.5 L222,-234 Z",
+            "and draws bar"
+        );
+
+        let (width, path, _) = pinned(&result, "bar");
+        assert_eq!(width, 564.5, "bar is as wide as plus");
+        assert_eq!(path.matches('L').count(), 12, "and draws plus: {path}");
+
+        // "The rules mechanism is supposed to swap glyphs, not characters"
+        assert_eq!(
+            cmap_names(&result),
+            BTreeMap::from([(0x2b, "plus".to_string()), (0x7c, "bar".to_string())])
+        );
+        assert!(result.contains_glyph("plus") && result.contains_glyph("bar"));
+        assert_eq!(
+            result
+                .fe_context
+                .glyph_order
+                .get()
+                .names()
+                .collect::<Vec<_>>(),
+            compile_instance("dspace_rules/Basic.designspace", "wght=400")
+                .fe_context
+                .glyph_order
+                .get()
+                .names()
+                .collect::<Vec<_>>(),
+            "a swap never touches glyph order"
+        );
+    }
+
+    /// Two rules firing at once chain as *sequential swaps on live state*:
+    /// `A -> B` then `B -> C` is the 3-cycle in which A takes B's drawing, B
+    /// takes C's and C takes A's. Resolving the chain to `A -> C` first would
+    /// give A the 550-wide drawing instead of the 450-wide one.
+    ///
+    /// Numbers measured from `fontmake -m Chain.designspace -i`, which puts
+    /// `A 450/250, B 550/350, C 350/150` in the instance UFO; the pre-rule
+    /// interpolation is `A 350/150, B 450/250, C 550/350`.
+    #[test]
+    fn instance_chains_two_rules_into_a_three_cycle() {
+        let before = compile_instance("dspace_rules/Chain.designspace", "wght=450");
+        let after = compile_instance("dspace_rules/Chain.designspace", "wght=550");
+
+        let top = |result: &TestCompile, name: &str| {
+            let (width, path, _) = pinned(result, name);
+            (width, path)
+        };
+        assert_eq!(
+            top(&after, "A"),
+            (450.0, "M0,0 L100,0 L100,250 L0,250 L0,0 Z".into()),
+            "A draws B"
+        );
+        assert_eq!(
+            top(&after, "B"),
+            (550.0, "M0,0 L100,0 L100,350 L0,350 L0,0 Z".into()),
+            "B draws C"
+        );
+        assert_eq!(
+            top(&after, "C"),
+            (350.0, "M0,0 L100,0 L100,150 L0,150 L0,0 Z".into()),
+            "and C draws A: a cycle, not a chain resolved to A -> C"
+        );
+        // and a third of the way up the axis, where no rule fires, each glyph
+        // is its own interpolation
+        // 450 is a sixth of the way up a 400..700 axis
+        assert!((top(&before, "A").0 - (300.0 + 100.0 / 6.0)).abs() < 1e-9);
+        assert!((top(&before, "C").0 - (500.0 + 100.0 / 6.0)).abs() < 1e-9);
+    }
+
+    /// A glyph that *references* a swapped glyph follows it: `Bcomp` is a
+    /// composite of `B`, and after `A <-> B` (then `B <-> C`, which no longer
+    /// concerns it) it is a composite of `A`.
+    ///
+    /// ufo2ft remaps every component reference in the whole font as part of
+    /// each swap, which is why this composes rather than cancelling out.
+    #[test]
+    fn instance_rules_remap_components_that_point_at_a_swapped_glyph() {
+        let before = compile_instance("dspace_rules/Chain.designspace", "wght=450");
+        let after = compile_instance("dspace_rules/Chain.designspace", "wght=550");
+
+        assert_eq!(pinned(&before, "Bcomp").2, vec!["B".to_string()]);
+        assert_eq!(pinned(&after, "Bcomp").2, vec!["A".to_string()]);
+        // its own width is its own business
+        assert_eq!(pinned(&after, "Bcomp").0, 450.0);
+    }
+
+    /// Kerning is swapped too, and — because it does not exist until after
+    /// the glyphs are pinned — in the pin's second phase: literal pair keys
+    /// naming either glyph, and kern group *membership*, never group names.
+    ///
+    /// `('A','C')` through `A <-> B` then `B <-> C` becomes `('C','B')`, and
+    /// the groups `kern1.A = [A]` / `kern2.C = [C]` become `[C]` / `[B]`.
+    /// Both measured from `fontmake -m Chain.designspace -i`.
+    #[test]
+    fn instance_rules_swap_kerning_pairs_and_group_membership() {
+        let glyph = |name: &str| KernSide::Glyph(GlyphName::from(name));
+        let kerning_of = |result: &TestCompile| {
+            let at = result
+                .fe_context
+                .static_metadata
+                .get()
+                .default_location()
+                .clone();
+            result
+                .fe_context
+                .kerning_at
+                .get(&FeWorkIdentifier::KernInstance(at))
+        };
+
+        let before = kerning_of(&compile_instance(
+            "dspace_rules/Chain.designspace",
+            "wght=450",
+        ));
+        assert_eq!(
+            before.kerns.keys().collect::<Vec<_>>(),
+            vec![&(glyph("A"), glyph("C"))]
+        );
+
+        let after = kerning_of(&compile_instance(
+            "dspace_rules/Chain.designspace",
+            "wght=550",
+        ));
+        assert_eq!(
+            after.kerns.keys().collect::<Vec<_>>(),
+            vec![&(glyph("C"), glyph("B"))]
+        );
+        assert_eq!(
+            after.kerns.values().next().map(|v| v.into_inner()),
+            Some(-60.0)
+        );
+        let members = |group: KernGroup| {
+            after
+                .groups
+                .get(&group)
+                .map(|m| m.iter().map(|g| g.to_string()).collect::<Vec<_>>())
+        };
+        assert_eq!(
+            members(KernGroup::Side1("A".into())),
+            Some(vec!["C".into()])
+        );
+        assert_eq!(
+            members(KernGroup::Side2("C".into())),
+            Some(vec!["B".into()])
+        );
+    }
+
+    /// A `.glyphs` bracket layer is the same mechanism: glyphsLib mints a
+    /// `X.BRACKET.varAltNN` alternate, appends it to glyph order and writes a
+    /// rule substituting the parent with it. Pinning inside the bracket swaps
+    /// them — and the alternate *stays in the font*, GID and all, with no cmap
+    /// entry, exactly as `fontmake -g ... -i` leaves it.
+    ///
+    /// The axis maps design 40..200 onto user 100..900, so the bracket's
+    /// `min = 150` is user 650: `wght=900` is inside it and `wght=100` is not.
+    /// `yen` is a composite of `peso` (`uni20B1`) and has a bracket layer of
+    /// its own, so both swaps happen and the component references compose.
+    ///
+    /// Verified against `fontmake -g LibreFranklin-bracketlayer.glyphs -i`:
+    /// `glyf`, `cmap`, `hmtx`, `post` and `GDEF` byte-identical at both pins.
+    #[test]
+    fn instance_of_a_bracket_layer_source_keeps_the_alternate() {
+        let outside = compile_instance("glyphs3/LibreFranklin-bracketlayer.glyphs", "wght=100");
+        let inside = compile_instance("glyphs3/LibreFranklin-bracketlayer.glyphs", "wght=900");
+
+        for result in [&outside, &inside] {
+            assert_eq!(
+                result
+                    .fe_context
+                    .glyph_order
+                    .get()
+                    .names()
+                    .map(|name| name.to_string())
+                    .collect::<Vec<_>>(),
+                vec![
+                    ".notdef",
+                    "peso",
+                    "yen",
+                    "peso.BRACKET.varAlt01",
+                    "yen.BRACKET.varAlt01"
+                ],
+                "the alternate is never pruned"
+            );
+            assert_eq!(
+                cmap_names(result),
+                BTreeMap::from([(0xa5, "yen".to_string()), (0x20b1, "peso".to_string())]),
+                "and never gains a codepoint"
+            );
+        }
+
+        // masters: peso 750/786 (Thin/Bold), the bracket layer 780/746
+        assert_eq!(pinned(&outside, "peso").0, 750.0);
+        assert_eq!(pinned(&outside, "peso.BRACKET.varAlt01").0, 780.0);
+        assert_eq!(pinned(&inside, "peso").0, 746.0, "the bracket's width");
+        assert_eq!(pinned(&inside, "peso.BRACKET.varAlt01").0, 786.0);
+        // yen composes both swaps and still reads as a plain composite
+        assert_eq!(pinned(&inside, "yen").2, vec!["peso".to_string()]);
+        assert_eq!(
+            pinned(&inside, "yen.BRACKET.varAlt01").2,
+            vec!["peso.BRACKET.varAlt01".to_string()]
+        );
+        assert_eq!(pinned(&inside, "yen").0, 746.0);
+    }
+
+    /// `processing="last"` is a variable-font concern (it picks `rclt` over
+    /// `rvrn` for the feature variations table), so a pinned instance treats
+    /// it exactly like `processing="first"`.
+    #[test]
+    fn instance_rules_ignore_the_processing_attribute() {
+        // one rule, bar -> plus from Weight 550, the only difference being
+        // <rules processing="last">
+        let first = compile_instance("dspace_rules/CustomFeatures.designspace", "wght=600");
+        let last = compile_instance("dspace_rules/Last.designspace", "wght=600");
+
+        assert_eq!(pinned(&first, "bar"), pinned(&last, "bar"));
+        assert_eq!(pinned(&first, "plus"), pinned(&last, "plus"));
+        // and it really did swap
+        assert_eq!(pinned(&last, "bar").1.matches('L').count(), 12);
+    }
+
+    /// The instance has no feature variations of its own: the rules were
+    /// spent on the swap, and there are no axes left to condition them on.
+    #[test]
+    fn instance_has_no_feature_variations() {
+        let variable = TestCompile::compile_source("dspace_rules/Basic.designspace");
+        assert!(
+            variable
+                .font()
+                .gsub()
+                .unwrap()
+                .feature_variations()
+                .is_some(),
+            "the variable font has them"
+        );
+
+        let result = compile_instance("dspace_rules/Basic.designspace", "wght=550");
+        assert!(result.fe_context.static_metadata.get().variations.is_none());
+        assert!(result.font().gsub().unwrap().feature_variations().is_none());
+    }
+
+    // ---- --flavor otf --instance ----
+
+    /// The CFF path refuses a variable source; a pinned one is not variable.
+    #[test]
+    fn cff_instance_of_a_variable_source() {
+        let result = compile_cff_instance("glyphs3/WghtVar.glyphs", "wght=400");
+        let font = result.font();
+
+        assert!(font.table_data(Tag::new(b"CFF ")).is_some());
+        assert!(font.table_data(Tag::new(b"glyf")).is_none());
+        assert!(font.table_data(Tag::new(b"gvar")).is_none());
+
+        // the composite is decomposed *after* interpolation, so it draws
+        let outlines = font.outline_glyphs();
+        let gid = result.get_gid("manual-component");
+        assert!(
+            outlines.get(GlyphId::from(gid)).is_some(),
+            "manual-component should be a real CFF glyph"
+        );
+    }
+
+    /// Pinned at Regular, the Private DICT carries Regular's alignment zones.
+    ///
+    /// Only Regular states zones in this source (Bold's metrics have no
+    /// overshoot), and a pin that lands on a master has one contributing term,
+    /// so its values come through verbatim.
+    #[test]
+    fn cff_instance_private_dict_has_the_pinned_master_blues() {
+        use write_fonts::read::ps::cff::CffFontRef;
+
+        let result = compile_cff_instance("glyphs3/WghtVar.glyphs", "wght=400");
+
+        // what the IR says, which is what feeds the Private DICT
+        let static_metadata = result.fe_context.static_metadata.get();
+        let postscript = static_metadata.postscript_default();
+        assert_eq!(
+            postscript
+                .blue_values
+                .iter()
+                .map(|v| v.into_inner())
+                .collect::<Vec<_>>(),
+            vec![-16.0, 0.0, 737.0, 753.0],
+            "baseline and ascender zones, from Regular"
+        );
+
+        // and what the font says
+        let font = result.font();
+        let cff =
+            write_fonts::read::tables::cff::Cff::read(font.table_data(Tag::new(b"CFF ")).unwrap())
+                .unwrap();
+        let cff_font = CffFontRef::new_cff(cff.offset_data().as_bytes(), 0, None).unwrap();
+        let (_, hints) = cff_font.subfont_hinted(0, &[]).unwrap();
+        assert_eq!(
+            hints
+                .blues
+                .values()
+                .iter()
+                .map(|(a, b)| (a.to_f64(), b.to_f64()))
+                .collect::<Vec<_>>(),
+            vec![(-16.0, 0.0), (737.0, 753.0)]
+        );
+        assert_eq!(
+            hints
+                .other_blues
+                .values()
+                .iter()
+                .map(|(a, b)| (a.to_f64(), b.to_f64()))
+                .collect::<Vec<_>>(),
+            vec![(-58.0, -42.0)],
+            "the descender zone"
+        );
     }
 }

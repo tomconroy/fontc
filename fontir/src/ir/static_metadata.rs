@@ -1,6 +1,7 @@
 //! Global font metadata
 
 use std::{
+    borrow::Cow,
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     fmt::Debug,
     io::Read,
@@ -21,6 +22,7 @@ use fontdrasil::{
     variations::{VariationModel, VariationModelError},
 };
 
+use super::GlobalMetric;
 use super::feature_writers::FeatureWriterSpec;
 use crate::orchestration::Persistable;
 
@@ -58,6 +60,14 @@ pub struct StaticMetadata {
     pub variation_model: VariationModel,
     /// Glyphsapp only; named numbers defined per-master
     pub number_values: HashMap<NormalizedLocation, BTreeMap<SmolStr, OrderedFloat<f64>>>,
+    /// PostScript-specific data per master, feeding the CFF table.
+    ///
+    /// Keyed like [`Self::number_values`]: one entry per master that defines
+    /// any, at that master's location. Read it with [`Self::postscript_at`] or
+    /// [`Self::postscript_default`] rather than indexing directly; sources that
+    /// have no PostScript data at all (fontra) leave the map empty.
+    #[serde(default)]
+    pub postscript: HashMap<NormalizedLocation, PostscriptSettings>,
     default_location: NormalizedLocation,
 
     /// See <https://learn.microsoft.com/en-us/typography/opentype/spec/name>.
@@ -85,11 +95,227 @@ pub struct StaticMetadata {
 }
 
 /// IR for a named position in variation space
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+///
+/// A variable font uses only [`Self::name`], [`Self::postscript_name`] and
+/// [`Self::location`], for `fvar`. The rest is what an instance *built* here is
+/// called, which only `--instance` reads. All of it is `#[serde(default)]`
+/// because IR is schema-less YAML and additive fields are how it grows.
+#[derive(Serialize, Deserialize, Debug, Default, Clone, PartialEq, Eq)]
 pub struct NamedInstance {
+    /// The style name: designspace `<instance stylename>`, or a Glyphs
+    /// instance's `name`.
     pub name: String,
     pub postscript_name: Option<String>,
     pub location: UserLocation,
+    /// The family name of the UFO fontmake would interpolate here.
+    ///
+    /// The instance's own — designspace `<instance familyname>`, or a Glyphs
+    /// instance's `familyNames` property — falling back to the font's, which
+    /// is what the instance UFO inherits. Name ID 16 is exactly this: the
+    /// instance never inherits `openTypeNamePreferredFamilyName`, so ufo2ft's
+    /// fallback chain always lands on `familyName`.
+    #[serde(default)]
+    pub family_name: Option<String>,
+    /// Name ID 1 for this instance, if the source states one.
+    ///
+    /// designspace `<instance stylemapfamilyname>`; for Glyphs, built by
+    /// glyphsLib from the instance's style linking. Absent means "let the
+    /// RIBBI fallback decide", which is what [`NameBuilder::build`] already
+    /// does.
+    ///
+    /// [`NameBuilder::build`]: crate::ir::NameBuilder::build
+    #[serde(default)]
+    pub style_map_family_name: Option<String>,
+    /// Name ID 2 for this instance, if the source states one.
+    ///
+    /// Kept as the source's own string rather than as a [`StyleMapStyle`]:
+    /// ufo2ft's instantiator writes a `stylemapstylename` that *isn't* one of
+    /// the four through to the instance UFO anyway — it only logs "may cause
+    /// problems in some applications" — and the compiler then title-cases it
+    /// straight into name id 2 while setting **no** RIBBI bit in `fsSelection`
+    /// or `head.macStyle`. Doto's `@default` is exactly that: style map style
+    /// `Black`, name id 2 `Black`, `fsSelection` `0x0080`.
+    ///
+    /// Read it with [`Self::style_map_style`] for the flags and
+    /// [`Self::style_map_style_display`] for the name.
+    ///
+    /// <https://github.com/googlefonts/ufo2ft/blob/main/Lib/ufo2ft/instantiator.py#L775-L792>
+    /// <https://github.com/googlefonts/ufo2ft/blob/main/Lib/ufo2ft/outlineCompiler.py#L404>
+    #[serde(default)]
+    pub style_map_style_name: Option<String>,
+    /// What the instance's *own* Glyphs custom parameters say to override.
+    ///
+    /// Empty for a source that has none, and for anything but `--instance`:
+    /// nothing outside the pin reads it.
+    #[serde(default)]
+    pub overrides: InstanceOverrides,
+}
+
+impl NamedInstance {
+    /// The style linking this instance's name id 2 implies, if it implies any.
+    ///
+    /// `None` for a `styleMapStyleName` that isn't one of the four: ufo2ft
+    /// sets no RIBBI bit for it at all.
+    pub fn style_map_style(&self) -> Option<StyleMapStyle> {
+        StyleMapStyle::parse(self.style_map_style_name.as_deref()?)
+    }
+
+    /// `styleMapStyleName` as name id 2 spells it.
+    ///
+    /// ufo2ft lowercases the UFO attribute on the way in and `.title()`s it on
+    /// the way out, so `BLACK`, `black` and `Black` all end up `Black`.
+    pub fn style_map_style_display(&self) -> Option<String> {
+        self.style_map_style_name.as_deref().map(title_case)
+    }
+}
+
+/// Python's `str.title()`: capitalise every run of letters, lowercase the rest.
+fn title_case(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    let mut in_word = false;
+    for c in raw.chars() {
+        if c.is_alphabetic() {
+            if in_word {
+                out.extend(c.to_lowercase());
+            } else {
+                out.extend(c.to_uppercase());
+            }
+            in_word = true;
+        } else {
+            out.push(c);
+            in_word = false;
+        }
+    }
+    out
+}
+
+/// What an instance's own Glyphs custom parameters and properties override.
+///
+/// glyphsLib's `apply_instance_data_to_ufo` runs `to_ufo_custom_params` over
+/// the *instance's* parameters on the already-interpolated UFO, so every one of
+/// them wins over whatever the masters produced — and it runs for
+/// `.designspace` sources as much as for `.glyphs` ones, because fontmake
+/// stashes the parameters in the designspace `<instance><lib>` and replays them
+/// from there. Only [`crate::instance`] reads this.
+///
+/// Parameters whose effect is on *global metrics* live in
+/// [`Self::metrics`]; those are applied where the metrics are pinned, in
+/// [`GlobalMetricsBuilder::build_pinned`](crate::ir::GlobalMetricsBuilder::build_pinned).
+///
+/// <https://github.com/googlefonts/glyphsLib/blob/main/Lib/glyphsLib/builder/instances.py#L454-L470>
+/// <https://github.com/googlefonts/glyphsLib/blob/main/Lib/glyphsLib/builder/custom_params.py#L314-L448>
+#[derive(Serialize, Deserialize, Debug, Default, Clone, PartialEq, Eq)]
+pub struct InstanceOverrides {
+    /// `panose` / `openTypeOS2Panose`, which *replaces* the merged-across-masters
+    /// PANOSE an interpolated instance would otherwise get.
+    pub panose: Option<Panose>,
+    /// `fsType` / `openTypeOS2Type`.
+    pub fs_type: Option<u16>,
+    /// `isFixedPitch` / `postscriptIsFixedPitch`.
+    pub is_fixed_pitch: Option<bool>,
+    /// `unicodeRanges` / `openTypeOS2UnicodeRanges`.
+    pub unicode_range_bits: Option<HashSet<u32>>,
+    /// `codePageRanges`.
+    pub codepage_range_bits: Option<HashSet<u32>>,
+    /// `meta Table`, which becomes `public.openTypeMeta`.
+    pub meta_table: Option<MetaTableValues>,
+    /// `Use Typo Metrics`, i.e. `fsSelection` bit 7.
+    pub use_typo_metrics: Option<bool>,
+    /// `Has WWS Names`, i.e. `fsSelection` bit 8.
+    pub has_wws_names: Option<bool>,
+    /// `Don't use Production Names`, already negated into ufo2ft's
+    /// `useProductionNames`.
+    pub use_production_names: Option<bool>,
+    /// Metrics the instance states outright, overriding the interpolation.
+    pub metrics: BTreeMap<GlobalMetric, OrderedFloat<f64>>,
+    /// Names the instance states as *fontinfo*, so they also drive the
+    /// fallbacks: `preferredFamilyName` (16), `preferredSubfamilyName` (17),
+    /// `compatibleFullName` (18), `WWSFamilyName` (21), `WWSSubfamilyName`
+    /// (22). Windows/English, like everything `NameBuilder` computes.
+    pub names: BTreeMap<NameId, String>,
+    /// `Name Table Entry`, i.e. `openTypeNameRecords`.
+    ///
+    /// Any id on any platform, and applied *after* the table is built — these
+    /// override the computed records and never feed them, which is the order
+    /// `outlineCompiler.setupTable_name` uses.
+    pub name_records: BTreeMap<NameKey, String>,
+    /// `postscriptFullName`, i.e. the CFF `FullName` operator.
+    ///
+    /// Not a name-table record: ufo2ft reads `postscriptFullName` only when it
+    /// builds the CFF Top DICT. An interpolated instance never inherits the
+    /// masters' — it is neither a `MathInfo` attribute nor on ufo2ft's copy
+    /// whitelist — so the instance's own is the only one that can reach a
+    /// `--flavor otf` build.
+    #[serde(default)]
+    pub postscript_full_name: Option<String>,
+}
+
+/// The four style-linking styles, i.e. UFO `styleMapStyleName`.
+///
+/// <https://unifiedfontobject.org/versions/ufo3/fontinfo.plist/#generic-identification-information>
+#[derive(Serialize, Deserialize, Debug, Copy, Clone, PartialEq, Eq, Hash)]
+pub enum StyleMapStyle {
+    Regular,
+    Italic,
+    Bold,
+    BoldItalic,
+}
+
+impl StyleMapStyle {
+    /// The `Regular` / `Bold Italic` form, which is what name ID 2 holds.
+    ///
+    /// ufo2ft `.title()`s `styleMapStyleName` on the way into the name table,
+    /// so the record is title case whatever the UFO's casing was.
+    ///
+    /// <https://github.com/googlefonts/ufo2ft/blob/main/Lib/ufo2ft/outlineCompiler.py#L404>
+    pub fn to_name(self) -> &'static str {
+        match self {
+            StyleMapStyle::Regular => "Regular",
+            StyleMapStyle::Italic => "Italic",
+            StyleMapStyle::Bold => "Bold",
+            StyleMapStyle::BoldItalic => "Bold Italic",
+        }
+    }
+
+    /// The `fsSelection` bits this style contributes, which are also macStyle's.
+    ///
+    /// <https://github.com/googlefonts/ufo2ft/blob/main/Lib/ufo2ft/outlineCompiler.py#L714-L725>
+    pub fn selection_flags(self) -> SelectionFlags {
+        match self {
+            StyleMapStyle::Regular => SelectionFlags::REGULAR,
+            StyleMapStyle::Italic => SelectionFlags::ITALIC,
+            StyleMapStyle::Bold => SelectionFlags::BOLD,
+            StyleMapStyle::BoldItalic => SelectionFlags::BOLD | SelectionFlags::ITALIC,
+        }
+    }
+
+    /// Parse a UFO `styleMapStyleName`, which ufo2ft lowercases first.
+    ///
+    /// `None` for anything that isn't one of the four: ufo2ft logs "not one of
+    /// ..." and leaves the attribute unset.
+    ///
+    /// <https://github.com/googlefonts/ufo2ft/blob/main/Lib/ufo2ft/instantiator.py#L778-L792>
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw.trim().to_lowercase().as_str() {
+            "regular" => Some(StyleMapStyle::Regular),
+            "italic" => Some(StyleMapStyle::Italic),
+            "bold" => Some(StyleMapStyle::Bold),
+            "bold italic" => Some(StyleMapStyle::BoldItalic),
+            _ => None,
+        }
+    }
+
+    /// glyphsLib's flag-driven derivation, which never looks at the style name.
+    ///
+    /// <https://github.com/googlefonts/glyphsLib/blob/main/Lib/glyphsLib/builder/names.py#L77-L82>
+    pub fn from_flags(is_bold: bool, is_italic: bool) -> Self {
+        match (is_bold, is_italic) {
+            (true, true) => StyleMapStyle::BoldItalic,
+            (true, false) => StyleMapStyle::Bold,
+            (false, true) => StyleMapStyle::Italic,
+            (false, false) => StyleMapStyle::Regular,
+        }
+    }
 }
 
 /// See <https://learn.microsoft.com/en-us/typography/opentype/spec/name>
@@ -190,6 +416,18 @@ pub struct MiscMetadata {
     /// See <https://learn.microsoft.com/en-us/typography/opentype/spec/os2#achvendid>
     pub vendor_id: Tag,
 
+    /// `openTypeOS2VendorID` exactly as the source stated it, if it stated one.
+    ///
+    /// [`Self::vendor_id`] is `achVendID`, which is four bytes and which `Tag`
+    /// pads a short id out to. Name id 3's fallback interpolates the *raw*
+    /// attribute instead — ufo2ft only `ljust`s for OS/2 — so a source whose
+    /// vendor id is a single space (Geom) gets `1.102; ;Geom-Regular`, which
+    /// the padded tag cannot spell. The frontends already hand this string to
+    /// [`NameBuilder::build`](crate::ir::NameBuilder::build); a pin that
+    /// rebuilds the name table needs it too.
+    #[serde(default)]
+    pub raw_vendor_id: Option<String>,
+
     /// UFO appears to allow negative major versions.
     ///
     /// See <https://unifiedfontobject.org/versions/ufo3/fontinfo.plist/#generic-identification-information>
@@ -205,6 +443,19 @@ pub struct MiscMetadata {
     pub family_class: Option<i16>,
 
     pub panose: Option<Panose>,
+
+    /// The PANOSE an interpolated *instance* gets, which is not [`Self::panose`].
+    ///
+    /// ufo2ft merges every source's PANOSE into the instance element-wise,
+    /// keeping a digit only when every source that has a PANOSE agrees about
+    /// it and zeroing the rest, and dropping the whole thing when nothing
+    /// survives — so two masters with different PANOSE produce an instance
+    /// with none at all. Only `--instance` reads this; a variable build takes
+    /// the default master's, as fontmake does.
+    ///
+    /// <https://github.com/googlefonts/ufo2ft/blob/main/Lib/ufo2ft/instantiator.py#L480-L502>
+    #[serde(default)]
+    pub instance_panose: Option<Panose>,
 
     // Allows source to explicitly control bits. <https://github.com/googlefonts/fontc/issues/1027>
     pub unicode_range_bits: Option<HashSet<u32>>,
@@ -230,10 +481,6 @@ pub struct MiscMetadata {
     /// `None` means the key was absent (use the built-in defaults); `Some` fully
     /// replaces the defaults (an empty list disables all automatic features).
     pub feature_generation: Option<Vec<FeatureWriterSpec>>,
-
-    /// PostScript-specific data at the default location, feeding the CFF table.
-    #[serde(default)]
-    pub postscript: PostscriptSettings,
 }
 
 /// The `postscript*` keys of UFO fontinfo, mostly CFF hinting data.
@@ -243,9 +490,10 @@ pub struct MiscMetadata {
 /// it generates.
 ///
 /// Arrays are empty when the source provides none. Values are kept unrounded;
-/// CFF compilation rounds them the same way ufo2ft does. All values are taken
-/// from the default master: hints for other masters would only matter to
-/// CFF2, which is not supported.
+/// CFF compilation rounds them the same way ufo2ft does. One of these is
+/// stored per master in [`StaticMetadata::postscript`]; CFF, which is
+/// single-master, reads the default master's via
+/// [`StaticMetadata::postscript_default`].
 ///
 /// See <https://unifiedfontobject.org/versions/ufo3/fontinfo.plist/#postscript-specific-data>
 #[derive(Serialize, Deserialize, Default, Debug, Clone, PartialEq, Eq)]
@@ -307,6 +555,67 @@ pub struct Panose {
     pub letterform: u8,
     pub midline: u8,
     pub x_height: u8,
+}
+
+impl Panose {
+    /// The ten digits, in `OS/2` order.
+    pub fn digits(&self) -> [u8; 10] {
+        [
+            self.family_type,
+            self.serif_style,
+            self.weight,
+            self.proportion,
+            self.contrast,
+            self.stroke_variation,
+            self.arm_style,
+            self.letterform,
+            self.midline,
+            self.x_height,
+        ]
+    }
+
+    pub fn from_digits(digits: [u8; 10]) -> Panose {
+        Panose {
+            family_type: digits[0],
+            serif_style: digits[1],
+            weight: digits[2],
+            proportion: digits[3],
+            contrast: digits[4],
+            stroke_variation: digits[5],
+            arm_style: digits[6],
+            letterform: digits[7],
+            midline: digits[8],
+            x_height: digits[9],
+        }
+    }
+
+    /// The PANOSE an instance interpolated from these masters gets.
+    ///
+    /// ufo2ft keeps a digit only when every master that *has* a PANOSE agrees
+    /// about it, zeroes the rest, and drops the whole thing when nothing
+    /// survives — so a family whose masters disagree everywhere produces
+    /// instances with no PANOSE at all, and `OS/2` writes zeros. Masters with
+    /// no PANOSE don't vote; if none of them has one, there is nothing to
+    /// merge.
+    ///
+    /// <https://github.com/googlefonts/ufo2ft/blob/main/Lib/ufo2ft/instantiator.py#L480-L502>
+    pub fn merged_for_instance<'a>(
+        masters: impl IntoIterator<Item = &'a Panose>,
+    ) -> Option<Panose> {
+        let mut shared: Option<[u8; 10]> = None;
+        for master in masters {
+            let digits = master.digits();
+            shared = Some(match shared {
+                None => digits,
+                Some(shared) => {
+                    std::array::from_fn(|i| if shared[i] == digits[i] { shared[i] } else { 0 })
+                }
+            });
+        }
+        shared
+            .filter(|digits| digits.iter().any(|digit| *digit != 0))
+            .map(Panose::from_digits)
+    }
 }
 
 /// A series of substitution rules to be applied to layout features
@@ -524,12 +833,14 @@ impl StaticMetadata {
             postscript_names,
             italic_angle: italic_angle.into(),
             number_values: glyphsapp_number_values.unwrap_or_default(),
+            postscript: Default::default(),
             build_vertical,
             misc: MiscMetadata {
                 fs_type: None, // default is, sigh, inconsistent across source formats
                 is_fixed_pitch: None,
                 selection_flags: Default::default(),
                 vendor_id: Self::DEFAULT_VENDOR_ID_TAG,
+                raw_vendor_id: None,
                 // https://github.com/googlefonts/ufo2ft/blob/0d2688cd847d003b41104534d16973f72ef26c40/Lib/ufo2ft/fontInfoData.py#L353-L354
                 version_major: 0,
                 version_minor: 0,
@@ -540,6 +851,7 @@ impl StaticMetadata {
                 created: None,
                 family_class: None,
                 panose: None,
+                instance_panose: None,
                 unicode_range_bits: None,
                 codepage_range_bits: None,
                 meta_table: None,
@@ -547,7 +859,6 @@ impl StaticMetadata {
                 us_width_class: None,
                 gasp: Vec::new(),
                 feature_generation: None,
-                postscript: Default::default(),
             },
             variations: None,
         })
@@ -556,6 +867,27 @@ impl StaticMetadata {
     /// The default on all variable axes.
     pub fn default_location(&self) -> &NormalizedLocation {
         &self.default_location
+    }
+
+    /// The PostScript settings of the master at `loc`.
+    ///
+    /// Falls back to the default master's settings when `loc` names no master
+    /// (or names one the source gave no PostScript data), and to
+    /// [`PostscriptSettings::default`] when the source has none at all.
+    pub fn postscript_at(&self, loc: &NormalizedLocation) -> Cow<'_, PostscriptSettings> {
+        self.postscript
+            .get(loc)
+            .or_else(|| self.postscript.get(&self.default_location))
+            .map(Cow::Borrowed)
+            .unwrap_or_default()
+    }
+
+    /// The PostScript settings of the default master.
+    ///
+    /// This is what a single-master table like CFF wants; a CFF2 writer would
+    /// walk [`Self::postscript`] in [`Self::variation_model`] order instead.
+    pub fn postscript_default(&self) -> Cow<'_, PostscriptSettings> {
+        self.postscript_at(self.default_location())
     }
 
     pub fn axis(&self, tag: &Tag) -> Option<&Axis> {
@@ -660,6 +992,7 @@ mod tests {
                 name: "Nobody".to_string(),
                 postscript_name: None,
                 location: vec![(WGHT, UserCoord::new(100.0))].into(),
+                ..Default::default()
             }],
             variation_model: VariationModel::new(
                 HashSet::from([
@@ -695,6 +1028,7 @@ mod tests {
                 is_fixed_pitch: None,
                 selection_flags: SelectionFlags::default(),
                 vendor_id: Tag::from_be_bytes(*b"DUCK"),
+                raw_vendor_id: None,
                 version_major: 42,
                 version_minor: 24,
                 head_flags: head::Flags::empty(),
@@ -702,6 +1036,7 @@ mod tests {
                 created: None,
                 family_class: None,
                 panose: None,
+                instance_panose: None,
                 unicode_range_bits: None,
                 codepage_range_bits: None,
                 meta_table: None,
@@ -713,14 +1048,30 @@ mod tests {
                     mode: FeatureWriterMode::Append,
                     features: None,
                 }]),
-                postscript: PostscriptSettings {
-                    blue_values: vec![(-10.0).into(), 0.0.into(), 700.0.into(), 710.0.into()],
-                    blue_scale: Some(0.05.into()),
-                    weight_name: Some("Chonky".to_string()),
-                    ..Default::default()
-                },
             },
             number_values: Default::default(),
+            // one entry per master, so the round-trip tests exercise a
+            // multi-entry map
+            postscript: HashMap::from([
+                (
+                    vec![(WGHT, NormalizedCoord::new(0.0))].into(),
+                    PostscriptSettings {
+                        blue_values: vec![(-10.0).into(), 0.0.into(), 700.0.into(), 710.0.into()],
+                        blue_scale: Some(0.05.into()),
+                        weight_name: Some("Chonky".to_string()),
+                        ..Default::default()
+                    },
+                ),
+                (
+                    vec![(WGHT, NormalizedCoord::new(1.0))].into(),
+                    PostscriptSettings {
+                        blue_values: vec![(-12.0).into(), 0.0.into(), 720.0.into(), 734.0.into()],
+                        stem_snap_v: vec![120.0.into()],
+                        weight_name: Some("Chonkier".to_string()),
+                        ..Default::default()
+                    },
+                ),
+            ]),
             variations: None,
             build_vertical: false,
         }
@@ -772,6 +1123,52 @@ mod tests {
         assert_eq!(
             reverse_names.get("Fam").unwrap().iter().next().unwrap(),
             &NameId::FAMILY_NAME
+        );
+    }
+
+    #[test]
+    fn postscript_at_master_locations() {
+        let static_metadata = test_static_metadata();
+        let default = vec![(WGHT, NormalizedCoord::new(0.0))].into();
+        let bold = vec![(WGHT, NormalizedCoord::new(1.0))].into();
+
+        assert_eq!(
+            static_metadata
+                .postscript_at(&default)
+                .weight_name
+                .as_deref(),
+            Some("Chonky")
+        );
+        assert_eq!(
+            static_metadata.postscript_at(&bold).weight_name.as_deref(),
+            Some("Chonkier")
+        );
+        // the default master is what a single-master table gets
+        assert_eq!(
+            static_metadata.postscript_default().weight_name.as_deref(),
+            Some("Chonky")
+        );
+    }
+
+    #[test]
+    fn postscript_at_falls_back() {
+        let mut static_metadata = test_static_metadata();
+        let unknown: NormalizedLocation = vec![(WGHT, NormalizedCoord::new(-1.0))].into();
+
+        // a location with no entry of its own gets the default master's
+        assert_eq!(
+            static_metadata
+                .postscript_at(&unknown)
+                .weight_name
+                .as_deref(),
+            Some("Chonky")
+        );
+
+        // a source with no PostScript data at all (e.g. fontra) gets defaults
+        static_metadata.postscript.clear();
+        assert_eq!(
+            static_metadata.postscript_default().into_owned(),
+            PostscriptSettings::default()
         );
     }
 

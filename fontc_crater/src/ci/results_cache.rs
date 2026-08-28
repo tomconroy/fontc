@@ -2,7 +2,10 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::{Target, args::Flavor};
+use crate::{
+    Target,
+    args::{Flavor, mode_name},
+};
 
 static CACHE_DIR_NAME: &str = "crater_cached_results";
 
@@ -22,13 +25,14 @@ impl ResultsCache {
     /// argument is the directory that will contain the cache dir.
     ///
     /// By convention this is the same directory where we checkout git repos.
-    /// The ttf cache lives where it always did; other flavors get a sibling
-    /// subdirectory, since the cached ttx/markkern files are named the same
-    /// but their contents differ per flavor.
-    pub fn in_dir(path: &Path, flavor: Flavor) -> Self {
+    /// The variable ttf cache lives where it always did; every other
+    /// combination of flavor and instance gets a sibling subdirectory, since
+    /// the cached ttx/markkern files are named the same but their contents
+    /// differ per mode.
+    pub fn in_dir(path: &Path, flavor: Flavor, instance: Option<&str>) -> Self {
         let mut base_results_cache_dir = path.join(CACHE_DIR_NAME);
-        if flavor != Flavor::Ttf {
-            base_results_cache_dir.push(flavor.to_string());
+        if let Some(mode) = mode_name(flavor, instance) {
+            base_results_cache_dir.push(mode);
         }
         Self {
             base_results_cache_dir,
@@ -90,5 +94,33 @@ impl ResultsCache {
         } else {
             Ok(false)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn each_mode_caches_separately() {
+        let root = Path::new("/cache");
+        let dir = |flavor, instance| {
+            ResultsCache::in_dir(root, flavor, instance)
+                .base_results_cache_dir
+                .to_str()
+                .unwrap()
+                .to_owned()
+        };
+        // the pre-existing variable ttf cache stays exactly where it was
+        assert_eq!(dir(Flavor::Ttf, None), "/cache/crater_cached_results");
+        assert_eq!(dir(Flavor::Otf, None), "/cache/crater_cached_results/otf");
+        assert_eq!(
+            dir(Flavor::Ttf, Some("@default")),
+            "/cache/crater_cached_results/instance@default"
+        );
+        assert_eq!(
+            dir(Flavor::Otf, Some("@default")),
+            "/cache/crater_cached_results/otf-instance@default"
+        );
     }
 }
