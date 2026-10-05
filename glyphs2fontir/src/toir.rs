@@ -214,6 +214,73 @@ fn to_user_coord(mappings: &[(UserCoord, DesignCoord)], design: DesignCoord) -> 
     UserCoord::new(design_to_user.map(design.into_inner()))
 }
 
+/// An axis whose range is the masters' span, read through the mapping; see
+/// [`AxisRange::Masters`].
+///
+/// The mapping keeps only its points inside that span, plus a point for each of
+/// the extreme and default masters it doesn't name already, so the converter's
+/// extremes are the axis' and every master sits on it.
+fn masters_through_mapping(
+    mappings: &[(UserCoord, DesignCoord)],
+    min: DesignCoord,
+    default: DesignCoord,
+    max: DesignCoord,
+    axis_name: &str,
+) -> Result<(CoordConverter, UserCoord, UserCoord, UserCoord), Error> {
+    let user_min = to_user_coord(mappings, min);
+    let user_default = to_user_coord(mappings, default);
+    let user_max = to_user_coord(mappings, max);
+
+    let mut trimmed: Vec<_> = mappings
+        .iter()
+        .filter(|(user, design)| {
+            (min..=max).contains(design) && (user_min..=user_max).contains(user)
+        })
+        .copied()
+        .collect();
+    for point in [(user_min, min), (user_default, default), (user_max, max)] {
+        if !trimmed.contains(&point) {
+            trimmed.push(point);
+        }
+    }
+    trimmed.sort();
+    trimmed.dedup_by_key(|(user, _)| *user);
+
+    let default_idx = trimmed
+        .iter()
+        .position(|(user, _)| *user == user_default)
+        .ok_or_else(|| Error::MissingMappingForUserCoord {
+            axis_name: axis_name.to_string(),
+            mappings: mappings.to_vec(),
+            value: user_default,
+        })?;
+    Ok((
+        CoordConverter::new(trimmed, default_idx)?,
+        user_min,
+        user_default,
+        user_max,
+    ))
+}
+
+/// Where an axis' user-space range comes from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AxisRange {
+    /// The masters' span, read through the mapping: how Glyphs itself exports.
+    ///
+    /// Every master is on the axis, so none is ever dropped, and the mapping is
+    /// trimmed to the masters' span. Glyphs exports a source whose "Axis Mappings"
+    /// reach from 100 to 900 but whose masters sit at 400 and 700 as a 400-700
+    /// axis, with the mapping's interior points as avar.
+    Masters,
+    /// The mapping's own user-space extremes, as glyphsLib reads them.
+    ///
+    /// A master the mapping can't reach is then off the axis, and
+    /// [`drop_sources_outside_axes`] drops it, as fontmake does. Only a Glyphs 2
+    /// source reads its axes this way, and only while some master is left at the
+    /// default location; see [`FontInfo::try_from`].
+    Mapping,
+}
+
 /// Convert .glyphs axes to IR axes.
 ///
 ///  See <https://github.com/googlefonts/glyphsLib/blob/6f243c1f732ea1092717918d0328f3b5303ffe56/Lib/glyphsLib/builder/axes.py#L155>
@@ -222,6 +289,7 @@ fn to_ir_axis(
     axis_values: &[OrderedFloat<f64>],
     default_idx: usize,
     axis: &glyphs_reader::Axis,
+    range: AxisRange,
 ) -> Result<fontdrasil::types::Axis, Error> {
     let min = axis_values.iter().min().unwrap();
     let max = axis_values.iter().max().unwrap();
@@ -244,9 +312,10 @@ fn to_ir_axis(
         })
         .unwrap_or_default();
 
-    // A mapped axis takes its user-space extremes from the mapping itself, never from
-    // the masters: instances contribute mappings too, so the mapped range can reach
-    // past the masters, and a master can sit at a design value the mapping never names.
+    // Read as glyphsLib does (`AxisRange::Mapping`), a mapped axis takes its user-space
+    // extremes from the mapping itself, never from the masters: instances contribute
+    // mappings too, so the mapped range can reach past the masters, and a master can sit
+    // at a design value the mapping never names.
     // <https://github.com/googlefonts/glyphsLib/blob/6.13.1/Lib/glyphsLib/builder/axes.py#L284-L285>
     // <https://github.com/googlefonts/fontc/issues/1991>
     //
@@ -254,7 +323,7 @@ fn to_ir_axis(
     // clamped into that range.
     // <https://github.com/googlefonts/glyphsLib/blob/6.13.1/Lib/glyphsLib/builder/axes.py#L259-L263>
     // <https://github.com/googlefonts/glyphsLib/blob/6.13.1/Lib/glyphsLib/builder/axes.py#L286>
-    let mapped = (!mappings.is_empty()).then(|| {
+    let mapped = (range == AxisRange::Mapping && !mappings.is_empty()).then(|| {
         #[allow(clippy::unwrap_used)] // a non-identity mapping isn't empty
         let user_min = mappings.iter().map(|(user, _)| *user).min().unwrap();
         #[allow(clippy::unwrap_used)] // a non-identity mapping isn't empty
@@ -274,7 +343,9 @@ fn to_ir_axis(
     });
 
     let (converter, user_min, user_default, user_max) =
-        if let Some((user_min, user_default, user_max)) = mapped {
+        if range == AxisRange::Masters && !mappings.is_empty() {
+            masters_through_mapping(&mappings, min, default, max, &axis.name)?
+        } else if let Some((user_min, user_default, user_max)) = mapped {
             let user_default = user_default.clamp(user_min, user_max);
             let default_idx = mappings
                 .iter()
@@ -404,13 +475,36 @@ fn drop_sources_outside_axes(
         return Ok(());
     }
 
+    // If the default master is going with them the survivor at the default
+    // location takes over, as designspaceLib's `subDoc.findDefault()` does. Work
+    // that out before touching the font: with no such survivor the caller reads
+    // the axes again rather than dropping anything.
+    let default_master_id = font.default_master().id.clone();
+    let survivors = || font.masters.iter().filter(|m| !dropped.contains(&m.id));
+    let default_master_idx = if dropped.contains(&default_master_id) {
+        let at_default = |axes_values: &[OrderedFloat<f64>]| {
+            axes.iter().zip(axis_indices).all(|(axis, &idx)| {
+                axes_values.get(idx).is_some_and(|value| {
+                    *value == axis.default.to_design(&axis.converter).into_inner()
+                })
+            })
+        };
+        survivors()
+            .position(|master| at_default(&master.axes_values))
+            .ok_or(Error::NoDefaultMaster)?
+    } else {
+        #[allow(clippy::unwrap_used)] // it isn't dropped, so it survives
+        survivors()
+            .position(|master| master.id == default_master_id)
+            .unwrap()
+    };
+
     for master in font.masters.iter().filter(|m| dropped.contains(&m.id)) {
         warn!(
             "Master '{}' is outside the axis ranges the mapping defines; dropping it",
             master.name
         );
     }
-    let default_master_id = font.default_master().id.clone();
     font.masters.retain(|master| !dropped.contains(&master.id));
     // A variable instance describes a whole variable font rather than a point
     // in it; glyphsLib doesn't write it as a designspace instance at all.
@@ -424,32 +518,11 @@ fn drop_sources_outside_axes(
     }
     // Kerning is keyed by master id and only ever read for a live master, so
     // the dropped masters' entries can stay where they are.
-
-    // If the default master went with them the survivor at the default
-    // location takes over, as designspaceLib's `subDoc.findDefault()` does.
-    font.default_master_idx = if dropped.contains(&default_master_id) {
-        let at_default = |axes_values: &[OrderedFloat<f64>]| {
-            axes.iter().zip(axis_indices).all(|(axis, &idx)| {
-                axes_values.get(idx).is_some_and(|value| {
-                    *value == axis.default.to_design(&axis.converter).into_inner()
-                })
-            })
-        };
-        font.masters
-            .iter()
-            .position(|master| at_default(&master.axes_values))
-            .ok_or(Error::NoDefaultMaster)?
-    } else {
-        #[allow(clippy::unwrap_used)] // it wasn't dropped, so it's still there
-        font.masters
-            .iter()
-            .position(|master| master.id == default_master_id)
-            .unwrap()
-    };
+    font.default_master_idx = default_master_idx;
     Ok(())
 }
 
-fn ir_axes(font: &Font) -> Result<(fontdrasil::types::Axes, Vec<usize>), Error> {
+fn ir_axes(font: &Font, range: AxisRange) -> Result<(fontdrasil::types::Axes, Vec<usize>), Error> {
     // Every master should have a value for every axis
     for master in font.masters.iter() {
         if font.axes.len() != master.axes_values.len() {
@@ -479,7 +552,13 @@ fn ir_axes(font: &Font) -> Result<(fontdrasil::types::Axes, Vec<usize>), Error> 
                 })
             }))
             .collect();
-        let axis = to_ir_axis(font, &axis_values, font.default_master_idx, glyphs_axis)?;
+        let axis = to_ir_axis(
+            font,
+            &axis_values,
+            font.default_master_idx,
+            glyphs_axis,
+            range,
+        )?;
         let is_identity_map = font
             .axis_mappings
             .get(&glyphs_axis.name)
@@ -517,10 +596,29 @@ impl TryFrom<Font> for FontInfo {
     type Error = Error;
 
     fn try_from(mut font: Font) -> Result<Self, Self::Error> {
-        // The axes are read off every master, as glyphsLib does, and only then
-        // do the sources the axes can't reach get dropped.
-        let (axes, axis_indices) = ir_axes(&font)?;
-        drop_sources_outside_axes(&mut font, &axes, &axis_indices)?;
+        // A Glyphs 3 or 4 source reads its axes as Glyphs does: the masters are
+        // the range, and they all stay. A Glyphs 2 source reads them as glyphsLib
+        // does, for fontmake's sake: the axes are read off every master, and only
+        // then do the sources the axes can't reach get dropped. Not the default
+        // master, though, unless another master can take its place; when none
+        // can, fontmake can't build the source at all, and we take the range off
+        // the masters instead, so that every one of them stays.
+        let (axes, axis_indices) = if font.is_glyphs2() {
+            let (axes, axis_indices) = ir_axes(&font, AxisRange::Mapping)?;
+            match drop_sources_outside_axes(&mut font, &axes, &axis_indices) {
+                Ok(()) => (axes, axis_indices),
+                Err(Error::NoDefaultMaster) => {
+                    warn!(
+                        "The axis mappings leave no master at the default location; \
+                         taking the axis ranges from the masters instead"
+                    );
+                    ir_axes(&font, AxisRange::Masters)?
+                }
+                Err(e) => return Err(e),
+            }
+        } else {
+            ir_axes(&font, AxisRange::Masters)?
+        };
 
         let master_indices: HashMap<_, _> = font
             .masters
@@ -1657,6 +1755,133 @@ mod tests {
         // the default master went with them, so the survivor at the default
         // location takes over
         assert_eq!(font_info.font.default_master().id, "italic-regular");
+    }
+
+    /// A Weight axis' user (min, default, max), its converter's (user, design)
+    /// points, and the ids of the masters that survived.
+    type WghtAxisAndMasters<'a> = ((f64, f64, f64), Vec<(f64, f64)>, Vec<&'a str>);
+
+    /// The Weight axis and masters of a [`FontInfo`], for the tests below.
+    fn wght_axis_and_masters(font_info: &FontInfo) -> WghtAxisAndMasters<'_> {
+        let wght = font_info
+            .axes
+            .get(&write_fonts::types::Tag::from_str("wght").unwrap())
+            .unwrap();
+        (
+            (wght.min.to_f64(), wght.default.to_f64(), wght.max.to_f64()),
+            wght.converter
+                .iter()
+                .map(|(user, design, _)| (user.to_f64(), design.to_f64()))
+                .collect(),
+            font_info
+                .font
+                .masters
+                .iter()
+                .map(|master| master.id.as_str())
+                .collect(),
+        )
+    }
+
+    /// A Glyphs 3 source with no "Axis Location" or "Axis Mappings", whose only
+    /// exporting instance is a Medium at design 483 with weightClass 500.
+    ///
+    /// glyphsLib reads that weightClass as the instance's user location, and so
+    /// pins the Weight axis to user 500, which neither master (400, 700) is on;
+    /// reading the range off that mapping dropped both, and with them the default
+    /// master. Glyphs 3.5 and 4.1.1 both export the source as a 400-700 axis, user
+    /// == design, with no avar and the Medium at 483, and so do we.
+    #[test]
+    fn one_exporting_instance_keeps_the_masters() {
+        let font = Font::load(&testdata_dir().join("glyphs3/OneExportingInstance.glyphs")).unwrap();
+        let font_info = FontInfo::try_from(font).unwrap();
+
+        let (range, converter, masters) = wght_axis_and_masters(&font_info);
+        assert_eq!(range, (400.0, 400.0, 700.0));
+        // user == design, so there's nothing for avar to say
+        assert!(
+            converter.iter().all(|(user, design)| user == design),
+            "{converter:?}"
+        );
+        assert_eq!(masters, vec!["m01", "E09E0C54-128D-4FEA-B209-1B70BEFE300B"]);
+        assert_eq!(font_info.font.default_master().id, "m01");
+        assert_eq!(
+            font_info
+                .font
+                .instances
+                .iter()
+                .map(|instance| (instance.name.as_str(), instance.active))
+                .collect::<Vec<_>>(),
+            vec![("Regular", false), ("Medium", true)]
+        );
+    }
+
+    /// A Glyphs 3 source's "Axis Mappings" can reach past its masters; the axis is
+    /// still the masters' span. Glyphs exports this one, a 100-900 mapping over
+    /// masters at 400 and 700, as a 400-700 axis with avar 0.3333 -> 0.2767: the
+    /// mapping's 500 -> 483, and nothing beyond the masters.
+    #[test]
+    fn glyphs3_axis_mappings_past_the_masters() {
+        let raw =
+            std::fs::read_to_string(testdata_dir().join("glyphs3/OneExportingInstance.glyphs"))
+                .unwrap()
+                .replace(
+                    "familyName = WghtVar;",
+                    "customParameters = (\n{\nname = \"Axis Mappings\";\nvalue = {\nwght = {\n\
+                 100 = 300;\n400 = 400;\n500 = 483;\n700 = 700;\n900 = 800;\n};\n};\n}\n);\n\
+                 familyName = WghtVar;",
+                );
+        let font = Font::load_from_string(&raw).unwrap();
+        let font_info = FontInfo::try_from(font).unwrap();
+
+        let (range, converter, masters) = wght_axis_and_masters(&font_info);
+        assert_eq!(range, (400.0, 400.0, 700.0));
+        assert_eq!(
+            converter,
+            vec![(400.0, 400.0), (500.0, 483.0), (700.0, 700.0)]
+        );
+        assert_eq!(masters, vec!["m01", "E09E0C54-128D-4FEA-B209-1B70BEFE300B"]);
+        assert_eq!(font_info.font.default_master().id, "m01");
+    }
+
+    /// The same design in Glyphs 2 still reads its user space as glyphsLib does,
+    /// off the instance's weightClass. That leaves no master at the default, a
+    /// source fontmake can't build at all, so rather than fail we take the range
+    /// off the masters, read through that mapping, and keep them all.
+    #[test]
+    fn glyphs2_mapping_that_leaves_no_default_master() {
+        let raw = std::fs::read_to_string(testdata_dir().join("glyphs2/WghtVar_Instances.glyphs"))
+            .unwrap();
+        let start = raw.find("instances = (").unwrap();
+        let end = raw[start..].find("\n);\n").unwrap() + start + "\n);\n".len();
+        let raw = format!(
+            "{}instances = (\n{{\nexports = 0;\ninterpolationWeight = 400;\nname = Regular;\n}},\n\
+             {{\ninterpolationWeight = 483;\nname = Medium;\nweightClass = Medium;\n}}\n);\n{}",
+            &raw[..start],
+            &raw[end..]
+        );
+        let font = Font::load_from_string(&raw).unwrap();
+        assert!(font.is_glyphs2());
+        // glyphsLib's reading: one point, user 500 -> design 483
+        assert_eq!(
+            font.axis_mappings
+                .get("Weight")
+                .unwrap()
+                .iter()
+                .map(|(user, design)| (user.into_inner(), design.into_inner()))
+                .collect::<Vec<_>>(),
+            vec![(500.0, 483.0)]
+        );
+        let font_info = FontInfo::try_from(font).unwrap();
+
+        let (range, converter, masters) = wght_axis_and_masters(&font_info);
+        // the masters' span, read through the mapping
+        assert_eq!(range, (417.0, 417.0, 717.0));
+        assert_eq!(
+            converter,
+            vec![(417.0, 400.0), (500.0, 483.0), (717.0, 700.0)]
+        );
+        assert_eq!(masters, vec!["m01", "E09E0C54-128D-4FEA-B209-1B70BEFE300B"]);
+        assert_eq!(font_info.font.default_master().id, "m01");
     }
 
     /// Dropping an axis and dropping a master meet here: a master's `axesValues`

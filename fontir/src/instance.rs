@@ -1181,6 +1181,13 @@ fn pin_instance_overrides(pinned: &mut StaticMetadata, instance: &NamedInstance)
     if let Some(meta_table) = overrides.meta_table.as_ref() {
         pinned.misc.meta_table = Some(meta_table.clone());
     }
+    // after `pin_os2_classes`, which reads them off the pin
+    if let Some(class) = overrides.us_weight_class {
+        pinned.misc.us_weight_class = Some(class);
+    }
+    if let Some(class) = overrides.us_width_class {
+        pinned.misc.us_width_class = Some(class);
+    }
     if let Some(full_name) = overrides.postscript_full_name.as_ref() {
         // one entry, keyed at the pin; see `pin_static_metadata`
         for settings in pinned.postscript.values_mut() {
