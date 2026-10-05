@@ -37,7 +37,9 @@ use write_fonts::{
 use crate::{
     error::Error,
     features::{
-        properties::{COMMON_SCRIPT, INHERITED_SCRIPT, ScriptDirection, UnicodeShortName},
+        properties::{
+            COMMON_SCRIPT, ExtraSubstitutions, INHERITED_SCRIPT, ScriptDirection, UnicodeShortName,
+        },
         resolve_variable_metric,
     },
     orchestration::{
@@ -115,6 +117,7 @@ impl Work<Context, AnyWorkId, Error> for GatherIrKerningWork {
     }
 
     /// Generate kerning data structures.
+    #[tracing::instrument(name = "fontbe::GatherIrKerningWork::exec", skip_all)]
     fn exec(&self, context: &Context) -> Result<(), Error> {
         let glyph_order = context.ir.glyph_order.get();
         let ir_groups = context.ir.kerning_locations.get();
@@ -781,6 +784,7 @@ impl Work<Context, AnyWorkId, Error> for KerningFragmentWork {
             .build()
     }
 
+    #[tracing::instrument(name = "fontbe::KernSegmentWork::exec", skip_all)]
     fn exec(&self, context: &Context) -> Result<(), Error> {
         let static_metadata = context.ir.static_metadata.get();
         let glyph_order = context.ir.glyph_order.get();
@@ -833,10 +837,11 @@ impl Work<Context, AnyWorkId, Error> for KerningGatherWork {
         Access::Unknown // https://github.com/googlefonts/fontc/issues/647: don't enable until KernFragment's spawn
     }
 
+    #[tracing::instrument(name = "fontbe::KernsWork::exec", skip_all)]
     fn exec(&self, context: &Context) -> Result<(), Error> {
         debug!("Gather be kerning");
         let arc_fragments = context.kern_fragments.all();
-        let ast = context.fea_ast.get();
+        let ast = context.default_fea_ast();
         let glyph_order = context.ir.glyph_order.get();
         let gdef_categories = context.ir.gdef_categories.get();
         let static_metadata = context.ir.static_metadata.get();
@@ -914,7 +919,14 @@ fn finalize_kerning(
         })
         .collect();
 
-    let split_ctx = KernSplitContext::new(&char_map, &known_scripts, ast.gsub(), mark_glyphs)?;
+    let extra_substitutions = super::properties::extra_substitutions(static_metadata, glyph_order);
+    let split_ctx = KernSplitContext::new(
+        &char_map,
+        &known_scripts,
+        ast.gsub(),
+        &extra_substitutions,
+        mark_glyphs,
+    )?;
 
     let lookups = split_ctx.make_lookups(pairs);
     let (lookups_by_script, lookups) = split_lookups_by_script(lookups);
@@ -930,8 +942,49 @@ fn finalize_kerning(
         .flatten()
         .chain(dist_features.into_iter().flatten())
         .collect();
+    let (lookups, features) = prune_unreferenced_lookups(lookups, features);
     debug_ordered_lookups(&features, &lookups);
     Ok(FeaRsKerns { lookups, features })
+}
+
+/// Drop any lookup no feature refers to, renumbering those that remain.
+///
+/// A tag in our todo list can end up with no features: `kern` is dropped when
+/// the FEA declares it without an insertion marker, and `dist` only gets
+/// features for the scripts that use it. Lookups built for a tag that produced
+/// nothing are dead weight, and their mark filtering sets would still land in
+/// GDEF.
+// <https://github.com/googlefonts/ufo2ft/blob/9b9ced585437/Lib/ufo2ft/featureWriters/kernFeatureWriter.py#L305>
+fn prune_unreferenced_lookups(
+    lookups: Vec<PendingLookup<PairPosBuilder>>,
+    mut features: BTreeMap<FeatureKey, Vec<usize>>,
+) -> (
+    Vec<PendingLookup<PairPosBuilder>>,
+    BTreeMap<FeatureKey, Vec<usize>>,
+) {
+    let referenced = features
+        .values()
+        .flatten()
+        .copied()
+        .collect::<BTreeSet<_>>();
+    if referenced.len() == lookups.len() {
+        return (lookups, features);
+    }
+
+    let remap = referenced
+        .iter()
+        .enumerate()
+        .map(|(new_idx, old_idx)| (*old_idx, new_idx))
+        .collect::<HashMap<_, _>>();
+    let lookups = lookups
+        .into_iter()
+        .enumerate()
+        .filter_map(|(idx, lookup)| remap.contains_key(&idx).then_some(lookup))
+        .collect();
+    for idx in features.values_mut().flatten() {
+        *idx = remap[idx];
+    }
+    (lookups, features)
 }
 
 /// Given a map of `[scripts] -> [lookups]`, convert it into a map of
@@ -1110,11 +1163,17 @@ impl KernSplitContext {
         char_map: &HashMap<u32, GlyphId16>,
         known_scripts: &HashSet<UnicodeShortName>,
         gsub: Option<Gsub>,
+        extra_substitutions: &ExtraSubstitutions,
         mark_glyphs: HashMap<GlyphId16, MarkSpacing>,
     ) -> Result<Self, ReadError> {
-        let glyph_scripts =
-            super::properties::scripts_by_glyph(char_map, known_scripts, gsub.as_ref())?;
-        let bidi_glyphs = super::properties::glyphs_by_bidi_class(char_map, gsub.as_ref())?;
+        let glyph_scripts = super::properties::scripts_by_glyph(
+            char_map,
+            known_scripts,
+            gsub.as_ref(),
+            extra_substitutions,
+        )?;
+        let bidi_glyphs =
+            super::properties::glyphs_by_bidi_class(char_map, gsub.as_ref(), extra_substitutions)?;
 
         Ok(Self {
             mark_glyphs,
@@ -1558,6 +1617,8 @@ fn merge_scripts(
 
 #[cfg(test)]
 mod tests {
+    use fea_rs::compile::Compilation;
+    use fontir::ir::{Rule, VariableFeature};
     use write_fonts::read::FontRead;
 
     use crate::features::test_helpers::LayoutOutputBuilder;
@@ -1612,6 +1673,7 @@ mod tests {
         opentype_categories: BTreeMap<GlyphName, GlyphClassDef>,
         glyph_order: GlyphOrder,
         user_fea: &'static str,
+        rule_substitutions: Vec<(&'static str, &'static str)>,
     }
 
     trait ToKernSide {
@@ -1672,6 +1734,7 @@ mod tests {
                 non_spacing: Default::default(),
                 user_fea: "",
                 opentype_categories: Default::default(),
+                rule_substitutions: Default::default(),
             }
         }
 
@@ -1716,6 +1779,12 @@ mod tests {
             self
         }
 
+        /// Add designspace rule (or bracket layer) substitutions
+        fn with_rule_substitutions(mut self, subs: &[(&'static str, &'static str)]) -> Self {
+            self.rule_substitutions.extend_from_slice(subs);
+            self
+        }
+
         fn with_rule(mut self, side1: impl ToKernSide, side2: impl ToKernSide, val: i16) -> Self {
             let side1 = side1.to_kern_side(&self);
             let side2 = side2.to_kern_side(&self);
@@ -1727,17 +1796,24 @@ mod tests {
             self
         }
 
-        /// Returns the raw lookups/features as well as otl-normalizer output
-        fn build(self) -> (FeaRsKerns, String) {
+        /// Returns the raw lookups/features as well as the compiled tables
+        fn compile(self) -> (FeaRsKerns, Compilation, GlyphOrder) {
             let pairs = self.pairs.iter().collect::<Vec<_>>();
             let categories = GdefCategories {
                 categories: self.opentype_categories,
             };
-            let layout_output = LayoutOutputBuilder::new()
+            let mut builder = LayoutOutputBuilder::new();
+            builder
                 .with_categories(categories)
                 .with_user_fea(self.user_fea)
-                .with_glyph_order(self.glyph_order.clone())
-                .build();
+                .with_glyph_order(self.glyph_order.clone());
+            if !self.rule_substitutions.is_empty() {
+                builder.with_variations(VariableFeature {
+                    features: vec![Tag::new(b"rvrn")],
+                    rules: vec![Rule::for_test(&[], &self.rule_substitutions)],
+                });
+            }
+            let layout_output = builder.build();
             let kerns = finalize_kerning(
                 &pairs,
                 &layout_output.first_pass_fea,
@@ -1750,11 +1826,17 @@ mod tests {
             .unwrap();
 
             let comp = layout_output.compile(&kerns);
+            (kerns, comp, self.glyph_order)
+        }
+
+        /// Returns the raw lookups/features as well as otl-normalizer output
+        fn build(self) -> (FeaRsKerns, String) {
+            let (kerns, comp, glyph_order) = self.compile();
             let gpos_bytes = write_fonts::dump_table(comp.gpos.as_ref().unwrap()).unwrap();
             let gpos =
                 write_fonts::read::tables::gpos::Gpos::read(gpos_bytes.as_slice().into()).unwrap();
             let mut buf = Vec::new();
-            let names = self.glyph_order.names().cloned().collect();
+            let names = glyph_order.names().cloned().collect();
             otl_normalizer::print_gpos(&mut buf, &gpos, None, &names).unwrap();
             let norm_out = String::from_utf8(buf).unwrap();
             (kerns, norm_out)
@@ -2315,6 +2397,79 @@ mod tests {
         );
     }
 
+    fn mark_filter_set_count(comp: &Compilation) -> usize {
+        comp.gdef
+            .as_ref()
+            .and_then(|gdef| gdef.mark_glyph_sets_def.as_ref())
+            .map(|sets| sets.coverages.len())
+            .unwrap_or_default()
+    }
+
+    const TONOS: char = '\u{0384}';
+
+    #[test]
+    fn no_mark_filter_set_when_kern_is_declared_in_fea() {
+        let input = || {
+            KernInput::new(&['A', 'B', TONOS])
+                // a mark with an advance: makes the lookups use a filtering
+                // set instead of IgnoreMarks
+                .with_opentype_category_marks(&[TONOS])
+                .with_rule('A', 'B', -30)
+        };
+
+        let (kerns, comp, _) = input()
+            .with_user_fea("languagesystem DFLT dflt; feature kern { pos A B -40; } kern;")
+            .compile();
+
+        assert!(kerns.features.is_empty());
+        assert!(kerns.lookups.is_empty());
+        assert_eq!(mark_filter_set_count(&comp), 0);
+
+        // control: with no 'kern' block in the FEA we do generate the lookups,
+        // and they do want a filtering set
+        let (kerns, comp, _) = input().compile();
+        assert_eq!(kerns.lookups.len(), 1);
+        assert_eq!(
+            flags_and_rule_count(&kerns.lookups[0]).0,
+            LookupFlag::USE_MARK_FILTERING_SET
+        );
+        assert_eq!(mark_filter_set_count(&comp), 1);
+    }
+
+    #[test]
+    fn prune_lookups_that_no_feature_uses() {
+        let (kerns, _, _) = KernInput::new(&[AAMATRA_KANNADA, AILENGTH_KANNADA, 'A', 'B'])
+            .with_user_fea(
+                "
+            languagesystem DFLT dflt;
+            languagesystem latn dflt;
+            languagesystem knda dflt;
+            languagesystem knd2 dflt;
+            feature kern { pos A B -40; } kern;
+                ",
+            )
+            .with_rule([AAMATRA_KANNADA], [AILENGTH_KANNADA], 34)
+            .with_rule('A', 'B', -30)
+            .compile();
+
+        // only 'dist' is generated, so the latin lookup belongs to nothing
+        assert_eq!(
+            kerns.features.keys().cloned().collect::<Vec<_>>(),
+            [
+                FeatureKey::new(DIST, DFLT_LANG, Tag::new(b"knd2")),
+                FeatureKey::new(DIST, DFLT_LANG, Tag::new(b"knda")),
+            ]
+        );
+        assert_eq!(kerns.lookups.len(), 1);
+        assert!(
+            kerns
+                .features
+                .values()
+                .flatten()
+                .all(|idx| *idx < kerns.lookups.len())
+        );
+    }
+
     #[test]
     fn prefer_user_fea() {
         let (_kerns, normalized) = KernInput::new(&['a', 'b', 'c', 'd'])
@@ -2401,7 +2556,7 @@ mod tests {
     //https://github.com/googlefonts/ufo2ft/blob/01d3faee/tests/featureWriters/kernFeatureWriter_test.py#L1531
     #[test]
     fn kern_split_and_drop() {
-        let _ = env_logger::builder().is_test(true).try_init();
+        let _ = tracing_subscriber::fmt().with_test_writer().try_init();
         const ALPHA: char = 'α';
         const A_ORYA: char = '\u{B05}';
 
@@ -2502,6 +2657,38 @@ mod tests {
         );
     }
 
+    // https://github.com/googlefonts/ufo2ft/blob/b4890b5bb5bf88ebf5256b442031eae83a6d6dd1/Lib/ufo2ft/featureWriters/kernFeatureWriter.py#L260-L265
+    #[test]
+    fn kern_rule_substitute_gets_script_of_its_source() {
+        let (_kerns, normalized) = KernInput::new(&['V', A_CY, '.'])
+            .with_unmapped_glyphs(["a-cy.alt"])
+            .with_rule_substitutions(&[("a-cy", "a-cy.alt")])
+            .with_rule('.', "a-cy.alt", -20)
+            .with_rule('V', '.', -10)
+            .build();
+
+        assert_eq_ignoring_ws!(
+            normalized,
+            r#"
+            # kern: DFLT/dflt
+            # 2 PairPos rules
+            # lookupflag LookupFlag(8)
+            V -10 period
+            period -20 a-cy.alt
+
+            # kern: cyrl/dflt
+            # 1 PairPos rules
+            # lookupflag LookupFlag(8)
+            period -20 a-cy.alt
+
+            # kern: latn/dflt
+            # 1 PairPos rules
+            # lookupflag LookupFlag(8)
+            V -10 period
+            "#
+        );
+    }
+
     const COMMA_AR: char = '\u{060C}';
     const ONE_AR: char = '\u{661}';
 
@@ -2582,7 +2769,7 @@ mod tests {
     fn unicode_script(cp: u32) -> UnicodeShortName {
         use super::super::properties;
         let s = icu_properties::script::ScriptWithExtensions::new().get_script_val32(cp);
-        let name = properties::get_script_short_name(s).unwrap();
+        let name = fontdrasil::unicode18::script_short_name(s).unwrap();
         if name == properties::HIRA || name == properties::KANA {
             properties::HRKT
         } else {

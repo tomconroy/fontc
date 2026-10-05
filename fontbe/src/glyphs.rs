@@ -351,6 +351,7 @@ impl Work<Context, AnyWorkId, Error> for GlyphWork {
         vec![WorkId::GvarFragment(self.glyph_name.clone()).into()]
     }
 
+    #[tracing::instrument(name = "fontbe::GlyfWork::exec", skip_all)]
     fn exec(&self, context: &Context) -> Result<(), Error> {
         trace!("BE glyph work for '{}'", self.glyph_name);
 
@@ -884,6 +885,7 @@ impl Work<Context, AnyWorkId, Error> for GlyfLocaWork {
     /// and [loca](https://learn.microsoft.com/en-us/typography/opentype/spec/loca).
     ///
     /// We've already generated all the binary glyphs so all we have to do here is glue everything together.
+    #[tracing::instrument(name = "fontbe::GlyfLocaWork::exec", skip_all)]
     fn exec(&self, context: &Context) -> Result<(), Error> {
         compute_composite_bboxes(context)?;
 
@@ -900,9 +902,9 @@ impl Work<Context, AnyWorkId, Error> for GlyfLocaWork {
         let (glyf, loca, loca_format) = builder.build();
         let raw_loca = write_fonts::dump_table(&loca).unwrap();
         let raw_glyf = write_fonts::dump_table(&glyf).unwrap();
-        context.loca_format.set(loca_format.into());
-        context.glyf.set(raw_glyf.into());
-        context.loca.set(raw_loca.into());
+        context.loca_format.set(loca_format);
+        context.glyf.set(raw_glyf);
+        context.loca.set(raw_loca);
 
         Ok(())
     }

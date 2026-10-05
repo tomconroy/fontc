@@ -21,11 +21,12 @@ use fontir::{
     error::{BadSource, BadSourceKind, Error},
     ir::{
         AnchorBuilder, Color, ColorGlyphs, ColorPalettes, Condition, ConditionSet,
-        DEFAULT_VENDOR_ID, FEATURE_WRITERS_LIB_KEY, FeatureWriterOptionValue, FeatureWriterSpec,
-        FeaturesSource, GlobalMetric, GlobalMetricsBuilder, GlyphOrder, InstanceOverrides,
-        KernGroup, KernSide, KerningInstance, KerningLocations, MetaTableValues, NameBuilder,
-        NameKey, NamedInstance, Paint, PaintGlyph, PaintSolid, Panose, PostscriptNames,
-        PostscriptSettings, PreliminaryGdefCategories, Rule, StaticMetadata, Substitution,
+        DEFAULT_VENDOR_ID, FEATURE_WRITERS_LIB_KEY, FeatureSources, FeatureWriterOptionValue,
+        FeatureWriterSpec, FeaturesSource, FilterScope, GlobalMetric, GlobalMetricsBuilder,
+        GlyphOrder, InstanceOverrides, KernGroup, KernSide, KerningInstance, KerningLocations,
+        MasterFeaSource, MetaTableValues, NameBuilder, NameKey, NamedInstance, Paint, PaintGlyph,
+        PaintSolid, Panose, PostscriptNames, PostscriptSettings, PreliminaryGdefCategories, Rule,
+        StaticMetadata, Substitution,
         VariableFeature, reject_duplicate_writers, validate_feature_writer,
     },
     orchestration::{Context, Flags, IrWork, WorkId},
@@ -47,7 +48,10 @@ use write_fonts::{
     types::{NameId, Tag},
 };
 
-use crate::toir::{master_locations, to_design_location, to_ir_axes, to_ir_glyph};
+use crate::toir::{
+    master_locations, to_design_location, to_instance_design_location, to_ir_axes, to_ir_glyph,
+    within_axis_ranges,
+};
 
 const UFO_KERN1_PREFIX: &str = "public.kern1.";
 const UFO_KERN2_PREFIX: &str = "public.kern2.";
@@ -65,12 +69,8 @@ pub struct DesignSpaceIrSource {
     designspace: Arc<DesignSpaceDocument>,
     designspace_dir: Arc<PathBuf>,
     glyphs: Arc<HashMap<GlyphName, HashMap<PathBuf, Vec<DesignLocation>>>>,
-    /// Every source's features.fea, in designspace order; sources that don't
-    /// have one are simply absent.
-    fea_files: Arc<Vec<PathBuf>>,
-    /// The default master's features.fea, if it has one. This is the file that
-    /// gets compiled; see [`FeatureWork`].
-    default_fea_file: Option<PathBuf>,
+    /// The features.fea of each master that has one, default master first
+    fea_files: Arc<Vec<(DesignLocation, PathBuf)>>,
 }
 
 fn glif_files(
@@ -252,7 +252,7 @@ impl Source for DesignSpaceIrSource {
                 default_master_lib = Some(ufo.lib);
             }
 
-            let location = to_design_location(&axis_tags_by_name, &source.location);
+            let location = to_design_location(&axis_tags_by_name, &source.location)?;
             for (glyph_name, glif_file) in glif_files(&ufo_dir, &mut layer_cache, source)? {
                 if !glif_file.exists() {
                     return Err(BadSource::new(glif_file, BadSourceKind::ExpectedFile).into());
@@ -281,14 +281,20 @@ impl Source for DesignSpaceIrSource {
             debug!("{} glyphs identified", glyphs.len());
         }
 
-        // For compilation purposes we start from ufo dir / features.fea
-        let fea_file_of = |s: &designspace::Source| {
-            let fea_file = designspace_dir.join(&s.filename).join("features.fea");
-            fea_file.is_file().then_some(fea_file)
-        };
-        let fea_files: Vec<_> = designspace.sources.iter().filter_map(fea_file_of).collect();
-        // Only the default master's features are compiled; see [`FeatureWork`].
-        let default_fea_file = fea_file_of(&designspace.sources[default_master_idx]);
+        // For compilation purposes we start from ufo dir / features.fea.
+        // The default master comes first; it is the source of anything we
+        // don't (yet) compile per-master.
+        let mut fea_source_indices = (0..designspace.sources.len()).collect::<Vec<_>>();
+        fea_source_indices.swap(0, default_master_idx);
+        let mut fea_files: Vec<(DesignLocation, PathBuf)> = Vec::new();
+        for idx in fea_source_indices {
+            let source = &designspace.sources[idx];
+            let fea_file = designspace_dir.join(&source.filename).join("features.fea");
+            if fea_file.is_file() {
+                let location = to_design_location(&axis_tags_by_name, &source.location)?;
+                fea_files.push((location, fea_file));
+            }
+        }
 
         // if source was a designspace we don't want to copy over keys like
         // public.skipExportGlyphs, but we do if it was a UFO. (we assume that
@@ -307,7 +313,6 @@ impl Source for DesignSpaceIrSource {
             designspace_dir: Arc::new(designspace_dir),
             glyphs: Arc::new(glyphs),
             fea_files: Arc::new(fea_files),
-            default_fea_file,
         })
     }
 
@@ -332,7 +337,6 @@ impl Source for DesignSpaceIrSource {
         Ok(Box::new(FeatureWork {
             designspace_or_ufo: self.designspace_or_ufo.clone(),
             fea_files: self.fea_files.clone(),
-            default_fea_file: self.default_fea_file.clone(),
         }))
     }
 
@@ -424,6 +428,7 @@ impl Source for DesignSpaceIrSource {
                     "decomposeTransformedComponents" => {
                         flags.set(Flags::DECOMPOSE_TRANSFORMED_COMPONENTS, true)
                     }
+                    "decomposeComponents" => (),
                     other => log::info!("unhandled ufo2ft filter '{other}'"),
                 }
             }
@@ -482,45 +487,10 @@ struct GlobalMetricsWork {
     designspace: Arc<DesignSpaceDocument>,
 }
 
-/// Produce the [`FeaturesSource`] for a designspace: the *default* master's
-/// features.fea, matching ufo2ft.
-///
-/// Line numbers below are ufo2ft 3.9.0 / fontTools 4.63.0, as shipped with
-/// fontmake 3.12.1.
-///
-/// ufo2ft compiles exactly one hand-written feature file into a variable font,
-/// the default source's, and it does so via `VariableFeatureCompiler`, which is
-/// handed `designSpaceDoc.findDefault().font`
-/// (ufo2ft/_compilers/baseCompiler.py:465-468 `compile_variable_features`, and
-/// ufo2ft/featureCompiler.py:452-480 `VariableFeatureCompiler.setupFeatures`,
-/// which reads `self.ufo.features.text`, i.e. the default UFO's). The other
-/// masters' feature *text* never reaches the variable font; only their kerning,
-/// mark/mkmk anchors and GDEF categories do, and those arrive through the
-/// feature writers, which are given the whole designspace and so see every
-/// master (ufo2ft/featureCompiler.py:469-474).
-///
-/// ufo2ft first checks whether the masters agree, with `_featuresCompatible`
-/// (ufo2ft/featureCompiler.py:483-504, called from
-/// ufo2ft/_compilers/baseCompiler.py:336-338): the sources are sorted default
-/// first and their feature files tokenized -- whitespace and comments excluded,
-/// includes followed -- and they are "compatible" when every non-default source
-/// matches the default, or when every non-default source has *no* features at
-/// all. [`fea_files_identical`] is our equivalent of that token comparison.
-///
-/// When they are *not* compatible ufo2ft takes a slower path we cannot follow:
-/// it compiles every master's features separately and lets `varLib` merge the
-/// resulting GSUB/GPOS/GDEF (fontTools/varLib/__init__.py:833-864
-/// `_merge_OTL`), which turns per-master *values* -- ligature carets, anchors,
-/// value records -- into variations. That merge only survives structurally
-/// identical layout tables; anything else raises `VarLibMergeError`. We instead
-/// compile the default master's file, which agrees with fontmake at the default
-/// location and differs only in that values the masters disagree about come out
-/// constant rather than variable. We warn, naming the masters we ignored.
 #[derive(Debug)]
 struct FeatureWork {
     designspace_or_ufo: Arc<PathBuf>,
-    fea_files: Arc<Vec<PathBuf>>,
-    default_fea_file: Option<PathBuf>,
+    fea_files: Arc<Vec<(DesignLocation, PathBuf)>>,
 }
 
 #[derive(Debug)]
@@ -564,12 +534,12 @@ fn default_master(
             (tag, UserCoord::new(a.default as f64).to_design(converter))
         })
         .collect();
-    designspace
-        .sources
-        .iter()
-        .enumerate()
-        .find(|(_, source)| to_design_location(&tags_by_name, &source.location) == default_location)
-        .ok_or(Error::NoDefaultMaster)
+    for (idx, source) in designspace.sources.iter().enumerate() {
+        if to_design_location(&tags_by_name, &source.location)? == default_location {
+            return Ok((idx, source));
+        }
+    }
+    Err(Error::NoDefaultMaster)
 }
 
 fn load_plist(ufo_dir: &Path, name: &str) -> Result<plist::Dictionary, BadSource> {
@@ -719,6 +689,28 @@ fn feature_writers_from_lib(lib: &Dictionary) -> Result<Option<Vec<FeatureWriter
     Ok(Some(specs))
 }
 
+/// Read the `decomposeComponents` entry of the ufo2ft filter list, if any.
+fn decompose_components_from_lib(lib: &Dictionary) -> Option<FilterScope> {
+    let filter = lib
+        .get(UFO2FT_FILTERS)?
+        .as_array()?
+        .iter()
+        .filter_map(Value::as_dictionary)
+        .find(|f| f.get("name").and_then(Value::as_string) == Some("decomposeComponents"))?;
+    let scope = FilterScope::from_lists(filter.get("include"), filter.get("exclude"), |v| {
+        v.as_array()?
+            .iter()
+            .map(|v| v.as_string().map(GlyphName::from))
+            .collect()
+    });
+    if scope.is_none() {
+        warn!(
+            "ignoring decomposeComponents filter: include and exclude are mutually exclusive and must be lists of glyph names"
+        );
+    }
+    scope
+}
+
 fn plist_to_feature_writer_option(value: &Value) -> FeatureWriterOptionValue {
     if let Some(b) = value.as_boolean() {
         FeatureWriterOptionValue::Boolean(b)
@@ -784,6 +776,7 @@ fn preliminary_gdef_categories_from_glyphdata(
         categories,
         infer_from_anchors: true,
         mark_category_glyphs,
+        excluded: Default::default(),
     }
 }
 
@@ -900,30 +893,6 @@ fn fea_files_identical(f1: &Path, f2: &Path) -> Result<bool, BadSource> {
 fn ufo_parent_dir(fea_path: &Path) -> PathBuf {
     let fea_dir = fea_path.parent().unwrap_or(Path::new("."));
     fea_dir.parent().unwrap_or(fea_dir).to_path_buf()
-}
-
-/// The name of the master a features.fea belongs to: the UFO directory name,
-/// which identifies the master far more legibly than the path to features.fea.
-fn master_name(fea_file: &Path) -> Cow<'_, str> {
-    fea_file
-        .parent()
-        .and_then(Path::file_name)
-        .map(OsStr::to_string_lossy)
-        .unwrap_or_else(|| fea_file.to_string_lossy())
-}
-
-/// [`master_name`] for each of `fea_files`, comma separated, for log messages.
-///
-/// Deduplicated: a UFO used by several designspace sources (a sparse layer
-/// source names the same UFO as its full-layer sibling) has one features.fea
-/// and should be named once.
-fn master_names<'a>(fea_files: impl Iterator<Item = &'a PathBuf>) -> String {
-    let mut seen = HashSet::new();
-    fea_files
-        .filter(|fea_file| seen.insert(fea_file.as_path()))
-        .map(|fea_file| master_name(fea_file))
-        .collect::<Vec<_>>()
-        .join(", ")
 }
 
 /// Iterate the significant tokens of a features.fea for compatibility comparison:
@@ -1133,6 +1102,7 @@ impl Work<Context, WorkId, Error> for StaticMetadataWork {
         ]
     }
 
+    #[tracing::instrument(name = "ufo2fontir::StaticMetadataWork::exec", skip_all)]
     fn exec(&self, context: &Context) -> Result<(), Error> {
         debug!("Static metadata for {:#?}", self.designspace_or_ufo);
         let designspace_dir = self.designspace_dir.as_ref();
@@ -1161,48 +1131,48 @@ impl Work<Context, WorkId, Error> for StaticMetadataWork {
             .get(&NameKey::new_bmp_only(NameId::FAMILY_NAME))
             .map(|name| name.clone() + " ")
             .unwrap_or_default();
-        let named_instances = self
-            .designspace
-            .instances
-            .iter()
-            .map(|inst| {
-                // TODO: Also support localised names, and names inferred from axis labels
-                // (also used to build STAT table)
-                NamedInstance {
-                    name: inst.stylename.clone().unwrap_or_else(|| {
-                        match inst
-                            .name
-                            .as_ref()
-                            .unwrap()
-                            .strip_prefix(family_prefix.as_str())
-                        {
-                            Some(tail) => tail.to_string(),
-                            None => inst.name.clone().unwrap(),
-                        }
-                    }),
-                    postscript_name: inst.postscriptfontname.clone(),
-                    location: to_design_location(&tags_by_name, &inst.location)
-                        .to_user(&axes)
-                        .unwrap(),
-                    // What `--instance` needs and fvar doesn't: the
-                    // <instance> attributes ufo2ft's instantiator writes
-                    // straight into the generated UFO's fontinfo.
-                    // https://github.com/googlefonts/ufo2ft/blob/main/Lib/ufo2ft/instantiator.py#L756-L792
-                    family_name: inst
-                        .familyname
-                        .clone()
-                        .or_else(|| font_info_at_default.family_name.clone()),
-                    // glyphsLib replays a `styleMapFamilyName`/`styleMapStyleName`
-                    // instance parameter *after* the instantiator has written the
-                    // descriptor's, so the parameter wins
-                    style_map_family_name: string_param(&inst.lib, "styleMapFamilyName")
-                        .or_else(|| inst.stylemapfamilyname.clone()),
-                    style_map_style_name: string_param(&inst.lib, "styleMapStyleName")
-                        .or_else(|| inst.stylemapstylename.clone()),
-                    overrides: instance_overrides(&inst.lib),
-                }
-            })
-            .collect();
+        let mut named_instances = Vec::with_capacity(self.designspace.instances.len());
+        for inst in &self.designspace.instances {
+            let location = to_instance_design_location(&axes, &tags_by_name, &inst.location)?
+                .to_user(&axes)?;
+            // fontmake silently drops instances outside the axis ranges; do the same
+            if !within_axis_ranges(&axes, &location) {
+                continue;
+            }
+            // TODO: Also support localised names, and names inferred from axis labels
+            // (also used to build STAT table)
+            named_instances.push(NamedInstance {
+                name: inst.stylename.clone().unwrap_or_else(|| {
+                    match inst
+                        .name
+                        .as_ref()
+                        .unwrap()
+                        .strip_prefix(family_prefix.as_str())
+                    {
+                        Some(tail) => tail.to_string(),
+                        None => inst.name.clone().unwrap(),
+                    }
+                }),
+                postscript_name: inst.postscriptfontname.clone(),
+                location,
+                // What `--instance` needs and fvar doesn't: the
+                // <instance> attributes ufo2ft's instantiator writes
+                // straight into the generated UFO's fontinfo.
+                // https://github.com/googlefonts/ufo2ft/blob/main/Lib/ufo2ft/instantiator.py#L756-L792
+                family_name: inst
+                    .familyname
+                    .clone()
+                    .or_else(|| font_info_at_default.family_name.clone()),
+                // glyphsLib replays a `styleMapFamilyName`/`styleMapStyleName`
+                // instance parameter *after* the instantiator has written the
+                // descriptor's, so the parameter wins
+                style_map_family_name: string_param(&inst.lib, "styleMapFamilyName")
+                    .or_else(|| inst.stylemapfamilyname.clone()),
+                style_map_style_name: string_param(&inst.lib, "styleMapStyleName")
+                    .or_else(|| inst.stylemapstylename.clone()),
+                overrides: instance_overrides(&inst.lib),
+            });
+        }
 
         let master_locations = master_locations(
             &axes,
@@ -1210,7 +1180,7 @@ impl Work<Context, WorkId, Error> for StaticMetadataWork {
                 .sources
                 .iter()
                 .filter(|s| !is_glyph_only(s)),
-        );
+        )?;
         let global_locations = master_locations.values().cloned().collect();
 
         // Every master's PostScript hinting data, keyed by location. Only CFF
@@ -1258,6 +1228,7 @@ impl Work<Context, WorkId, Error> for StaticMetadataWork {
                     categories,
                     infer_from_anchors: false,
                     mark_category_glyphs: Default::default(),
+                    excluded: Default::default(),
                 }
             };
 
@@ -1412,7 +1383,11 @@ impl Work<Context, WorkId, Error> for StaticMetadataWork {
             .get("public.openTypeMeta")
             .and_then(parse_meta_table_values);
 
+        static_metadata.misc.unicode_variation_sequences = unicode_variation_sequences(&lib_plist)?;
+
         static_metadata.misc.feature_generation = feature_writers_from_lib(&self.designspace.lib)?;
+        static_metadata.misc.decompose_components =
+            decompose_components_from_lib(&self.designspace.lib);
 
         if let Some(gasp_records) = font_info_at_default.open_type_gasp_range_records.as_ref() {
             static_metadata.misc.gasp = gasp_records
@@ -1667,6 +1642,42 @@ fn as_glyphs_bool(value: &Value) -> Option<bool> {
         .or_else(|| value.as_signed_integer().map(|v| v != 0))
 }
 
+/// <https://unifiedfontobject.org/versions/ufo3/lib.plist/#publicunicodevariationsequences>
+fn unicode_variation_sequences(
+    lib_plist: &plist::Dictionary,
+) -> Result<BTreeMap<u32, BTreeMap<u32, GlyphName>>, BadSource> {
+    const KEY: &str = "public.unicodeVariationSequences";
+    let Some(raw) = lib_plist.get(KEY) else {
+        return Ok(Default::default());
+    };
+    let raw = raw
+        .as_dictionary()
+        .ok_or_else(|| BadSource::custom("lib.plist", format!("{KEY} isn't a dictionary")))?;
+
+    let mut sequences: BTreeMap<u32, BTreeMap<u32, GlyphName>> = BTreeMap::new();
+    for (selector, mappings) in raw {
+        let (Ok(selector), Some(mappings)) =
+            (u32::from_str_radix(selector, 16), mappings.as_dictionary())
+        else {
+            warn!("{KEY}: ignoring malformed entry for \"{selector}\"");
+            continue;
+        };
+        for (codepoint, glyph_name) in mappings {
+            let (Ok(codepoint), Some(glyph_name)) =
+                (u32::from_str_radix(codepoint, 16), glyph_name.as_string())
+            else {
+                warn!("{KEY}: ignoring malformed entry for \"{selector:04X}\" \"{codepoint}\"");
+                continue;
+            };
+            sequences
+                .entry(selector)
+                .or_default()
+                .insert(codepoint, GlyphName::from(glyph_name));
+        }
+    }
+    Ok(sequences)
+}
+
 fn parse_meta_table_values(plist: &plist::Value) -> Option<MetaTableValues> {
     let plist = plist.as_dictionary()?;
     let mut ret = MetaTableValues::default();
@@ -1834,6 +1845,7 @@ impl Work<Context, WorkId, Error> for GlobalMetricsWork {
         Access::Variant(WorkId::StaticMetadata)
     }
 
+    #[tracing::instrument(name = "ufo2fontir::GlobalMetricsWork::exec", skip_all)]
     fn exec(&self, context: &Context) -> Result<(), Error> {
         debug!("Global metrics for {:#?}", self.designspace_or_ufo);
         let static_metadata = context.static_metadata.get();
@@ -1841,7 +1853,7 @@ impl Work<Context, WorkId, Error> for GlobalMetricsWork {
         let designspace_dir = self.designspace_dir.as_ref();
         let font_infos = font_infos(designspace_dir, &self.designspace)?;
         let master_locations =
-            master_locations(&static_metadata.all_source_axes, &self.designspace.sources);
+            master_locations(&static_metadata.all_source_axes, &self.designspace.sources)?;
 
         let mut metrics = GlobalMetricsBuilder::new();
 
@@ -2041,61 +2053,64 @@ impl Work<Context, WorkId, Error> for FeatureWork {
         WorkId::Features
     }
 
+    #[tracing::instrument(name = "ufo2fontir::FeatureWork::exec", skip_all)]
     fn exec(&self, context: &Context) -> Result<(), Error> {
         debug!("Features for {:#?}", self.designspace_or_ufo);
 
-        // ufo2ft compiles the default master's features.fea and no other; see
-        // the doc comment on [`FeatureWork`].
-        let Some(fea_file) = self.default_fea_file.clone() else {
-            // The default master has no features.fea, so the font has no
-            // hand-written features -- whatever the other masters may say.
-            let ignored = master_names(self.fea_files.iter());
-            if !ignored.is_empty() {
-                warn!(
-                    "The default master has no features.fea; ignoring the feature file(s) of {ignored}"
-                );
-            }
-            context.features.set(FeaturesSource::empty());
-            return Ok(());
-        };
-
-        // Not fatal, but the masters disagreeing about features means we build
-        // something fontmake wouldn't: it compiles each master's features and
-        // lets varLib merge them, so values the masters disagree about (e.g.
-        // ligature carets) end up variable there and constant here.
-        let mut differing = Vec::new();
-        let mut seen = HashSet::new();
-        for other in self.fea_files.iter() {
-            // several sources can name the same UFO (a sparse layer source and
-            // its full-layer sibling), and it has only one features.fea
-            if *other == fea_file || !seen.insert(other.as_path()) {
-                continue;
-            }
-            if !fea_files_identical(&fea_file, other)? {
-                differing.push(other.clone());
-            }
-        }
-        if !differing.is_empty() {
-            warn!(
-                "Compiling only the default master's features ({}); the feature file(s) of {} differ and are ignored",
-                master_name(&fea_file),
-                master_names(differing.iter())
-            );
-        }
-
-        // Fea file is required to be ufo_dir/features.fea. Includes resolve as siblings
-        // of ufo_dir.
-        let include_dir = fea_file
-            .parent()
-            .and_then(|f| f.parent())
-            .map(|v| v.to_path_buf())
-            .ok_or_else(|| BadSource::new(&fea_file, BadSourceKind::ExpectedParent))?;
-        context
-            .features
-            .set(FeaturesSource::from_file(fea_file, Some(include_dir)));
+        context.features.set(group_fea_files(&self.fea_files)?);
 
         Ok(())
     }
+}
+
+/// Collapse the masters' fea files into one entry per distinct source.
+///
+/// Masters whose features are equivalent (see [`fea_files_identical`]) share an
+/// entry, so the usual case - every master has the same features.fea - yields a
+/// single source. `fea_files` must have the default master first.
+fn group_fea_files(fea_files: &[(DesignLocation, PathBuf)]) -> Result<FeatureSources, Error> {
+    if fea_files.is_empty() {
+        return Ok(FeatureSources::single(FeaturesSource::empty()));
+    }
+
+    let mut sources: Vec<MasterFeaSource> = Vec::new();
+    // representative path of each group, parallel to sources
+    let mut representatives: Vec<&PathBuf> = Vec::new();
+    for (location, fea_file) in fea_files {
+        let mut group = None;
+        for (i, other) in representatives.iter().enumerate() {
+            if fea_files_identical(other, fea_file)? {
+                group = Some(i);
+                break;
+            }
+        }
+        match group {
+            Some(i) => sources[i].locations.push(location.clone()),
+            None => {
+                // Fea file is required to be ufo_dir/features.fea. Includes resolve as siblings
+                // of ufo_dir.
+                let include_dir = fea_file
+                    .parent()
+                    .and_then(|f| f.parent())
+                    .map(|v| v.to_path_buf())
+                    .ok_or_else(|| BadSource::new(fea_file, BadSourceKind::ExpectedParent))?;
+                sources.push(MasterFeaSource {
+                    source: FeaturesSource::from_file(fea_file.clone(), Some(include_dir)),
+                    locations: vec![location.clone()],
+                });
+                representatives.push(fea_file);
+            }
+        }
+    }
+
+    if sources.len() > 1 {
+        debug!(
+            "{} distinct feature files; they will be merged",
+            sources.len()
+        );
+    }
+
+    Ok(FeatureSources::new(sources))
 }
 
 /// Build the kern-group partition for a single source.
@@ -2161,13 +2176,14 @@ impl Work<Context, WorkId, Error> for KerningLocationsWork {
         AccessBuilder::new().variant(WorkId::StaticMetadata).build()
     }
 
+    #[tracing::instrument(name = "ufo2fontir::KerningLocationsWork::exec", skip_all)]
     fn exec(&self, context: &Context) -> Result<(), Error> {
         debug!("Kerning groups for {:#?}", self.designspace_or_ufo);
 
         let designspace_dir = self.designspace_dir.as_ref();
         let static_metadata = context.static_metadata.get();
         let master_locations =
-            master_locations(&static_metadata.all_source_axes, &self.designspace.sources);
+            master_locations(&static_metadata.all_source_axes, &self.designspace.sources)?;
         let (default_master_idx, _) = default_master(&self.designspace)?;
 
         let mut kerning_locations = KerningLocations::default();
@@ -2212,6 +2228,7 @@ impl Work<Context, WorkId, Error> for KerningInstanceWork {
             .build()
     }
 
+    #[tracing::instrument(name = "ufo2fontir::KerningInstanceWork::exec", skip_all)]
     fn exec(&self, context: &Context) -> Result<(), Error> {
         debug!(
             "Kerning for {:#?} at {:?}",
@@ -2222,7 +2239,7 @@ impl Work<Context, WorkId, Error> for KerningInstanceWork {
         let static_metadata = context.static_metadata.get();
         let glyph_order = context.glyph_order.get();
         let master_locations =
-            master_locations(&static_metadata.all_source_axes, &self.designspace.sources);
+            master_locations(&static_metadata.all_source_axes, &self.designspace.sources)?;
 
         // We know all the groups, read all the kerning
         let source = self
@@ -2328,6 +2345,7 @@ impl Work<Context, WorkId, Error> for GlyphIrWork {
         vec![WorkId::Anchor(self.glyph_name.clone())]
     }
 
+    #[tracing::instrument(name = "ufo2fontir::GlyphIrWork::exec", skip_all)]
     fn exec(&self, context: &Context) -> Result<(), Error> {
         trace!(
             "Generate glyph IR for {:?} from {:#?}",
@@ -2566,6 +2584,7 @@ impl Work<Context, WorkId, Error> for ColorPaletteWork {
         Access::Variant(WorkId::ColorPalettes)
     }
 
+    #[tracing::instrument(name = "ufo2fontir::ColorPaletteWork::exec", skip_all)]
     fn exec(&self, context: &Context) -> Result<(), Error> {
         let Some(raw_palettes) = self.lib.get(UFO2FT_COLOR_PALETTES) else {
             return Ok(());
@@ -2595,6 +2614,7 @@ impl Work<Context, WorkId, Error> for PaintGraphWork {
         Access::Variant(WorkId::PaintGraph)
     }
 
+    #[tracing::instrument(name = "ufo2fontir::PaintGraphWork::exec", skip_all)]
     fn exec(&self, context: &Context) -> Result<(), Error> {
         let Some(raw_layers) = self.lib.get(UFO2FT_COLOR_LAYERS) else {
             return Ok(());
@@ -2620,7 +2640,10 @@ mod tests {
     };
 
     use fontdrasil::{
-        coords::{DesignCoord, DesignLocation, NormalizedCoord, NormalizedLocation, UserCoord},
+        coords::{
+            DesignCoord, DesignLocation, NormalizedCoord, NormalizedLocation, UserCoord,
+            UserLocation,
+        },
         orchestration::{Access, AccessBuilder},
         types::GlyphName,
         variations::Tent,
@@ -2695,72 +2718,73 @@ mod tests {
         assert!(fea_files_identical(&a, &b).unwrap());
     }
 
-    /// The features.fea we would compile for a designspace.
-    fn features_of(name: &str) -> Arc<FeaturesSource> {
-        let _ = env_logger::builder().is_test(true).try_init();
-        let source = load_designspace(name);
-        let context = Context::new_root(Flags::default(), None, None);
-        let work = source.create_feature_ir_work().unwrap();
-        work.exec(&context.copy_for_work(work.read_access(), work.write_access()))
-            .unwrap();
-        context.features.get()
+    fn fea_sources(designspace: &str) -> FeatureSources {
+        let source = DesignSpaceIrSource::new(&testdata_dir().join(designspace)).unwrap();
+        group_fea_files(&source.fea_files).unwrap()
     }
 
-    fn fea_file_of(name: &str) -> PathBuf {
-        match features_of(name).as_ref() {
-            FeaturesSource::File { fea_file, .. } => fea_file.clone(),
-            other => panic!("expected a fea file for {name}, got {other:?}"),
+    fn fea_file(source: &MasterFeaSource) -> &Path {
+        match &source.source {
+            FeaturesSource::File { fea_file, .. } => fea_file,
+            other => panic!("expected a file, got {other}"),
         }
     }
 
     #[test]
-    fn compiles_the_default_masters_features() {
-        // ufo2ft hands VariableFeatureCompiler designSpaceDoc.findDefault(), so
-        // the default master's features.fea is the one that gets compiled -- in
-        // fea_differ.designspace the default is deliberately the *second*
-        // source, so taking the first source's file would be caught here.
+    fn no_fea_is_one_empty_source() {
+        let sources = group_fea_files(&[]).unwrap();
+        assert_eq!(sources.n_sources(), 1);
+        assert_eq!(sources.default_source(), &FeaturesSource::Empty);
+    }
+
+    #[test]
+    fn masters_sharing_fea_are_one_source() {
+        // both masters have the same features.fea; we compile it once
+        let sources = fea_sources("fea_include.designspace");
+        assert_eq!(sources.n_sources(), 1);
         assert_eq!(
-            testdata_dir().join("fea_differ_ufo/FeaDiffer-Regular.ufo/features.fea"),
-            fea_file_of("fea_differ.designspace")
+            sources.get(0).unwrap().locations,
+            vec![
+                DesignLocation::for_pos(&[("wght", 400.0)]),
+                DesignLocation::for_pos(&[("wght", 700.0)]),
+            ]
         );
     }
 
     #[test]
-    fn identical_features_still_compile_the_same_file() {
-        // fea_include's masters agree, and the default is also the first
-        // source: unchanged by looking the default master up.
-        assert_eq!(
-            testdata_dir().join("fea_include_ufo/FeaInc-Regular.ufo/features.fea"),
-            fea_file_of("fea_include.designspace")
-        );
+    fn equivalent_includes_at_different_depths_are_one_source() {
+        // the masters sit at different depths so their include paths differ,
+        // but they resolve to the same file: still one source
+        let sources = fea_sources("fea_include_resolve.designspace");
+        assert_eq!(sources.n_sources(), 1);
+        assert_eq!(sources.get(0).unwrap().locations.len(), 2);
     }
 
     #[test]
-    fn features_of_a_ufo_without_a_designspace() {
+    fn differing_master_fea_are_separate_sources_default_first() {
+        let sources = fea_sources("variable_fea/VarFea.designspace");
+        assert_eq!(sources.n_sources(), 2);
+        let names = sources
+            .iter()
+            .map(|s| {
+                fea_file(s)
+                    .parent()
+                    .and_then(|p| p.file_name())
+                    .unwrap()
+                    .to_str()
+                    .unwrap()
+                    .to_string()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(names, vec!["VarFea-Regular.ufo", "VarFea-Bold.ufo"]);
         assert_eq!(
-            testdata_dir().join("WghtVar-Regular.ufo/features.fea"),
-            fea_file_of("WghtVar-Regular.ufo")
+            sources.get(0).unwrap().locations,
+            vec![DesignLocation::for_pos(&[("wght", 400.0)])]
         );
-    }
-
-    #[test]
-    fn no_features_when_the_default_master_has_none() {
-        // The default master having no features.fea means no hand-written
-        // features, whatever the other masters say; ufo2ft reads the default
-        // UFO's features.text and nobody else's.
-        let tmp = tempfile::tempdir().unwrap();
-        let ds = tmp.path().join("no_default_fea.designspace");
-        std::fs::copy(testdata_dir().join("fea_differ.designspace"), &ds).unwrap();
-        let ufos = tmp.path().join("fea_differ_ufo");
-        copy_dir(&testdata_dir().join("fea_differ_ufo"), &ufos);
-        std::fs::remove_file(ufos.join("FeaDiffer-Regular.ufo/features.fea")).unwrap();
-
-        let context = Context::new_root(Flags::default(), None, None);
-        let source = DesignSpaceIrSource::new(&ds).unwrap();
-        let work = source.create_feature_ir_work().unwrap();
-        work.exec(&context.copy_for_work(work.read_access(), work.write_access()))
-            .unwrap();
-        assert_eq!(FeaturesSource::Empty, *context.features.get());
+        assert_eq!(
+            sources.get(1).unwrap().locations,
+            vec![DesignLocation::for_pos(&[("wght", 700.0)])]
+        );
     }
 
     macro_rules! plist_dict {
@@ -2828,10 +2852,10 @@ mod tests {
         flags: Flags,
         modify: F,
     ) -> (DesignSpaceIrSource, Context) {
-        let _ = env_logger::builder().is_test(true).try_init();
+        let _ = tracing_subscriber::fmt().with_test_writer().try_init();
         let mut source = load_designspace(name);
         modify(&mut source);
-        let context = Context::new_root(flags, None, None);
+        let context = Context::new_root(flags);
         let task_context = context.copy_for_work(
             Access::None,
             AccessBuilder::new()
@@ -3006,6 +3030,7 @@ mod tests {
                 &tags_by_name,
                 &default_master(&source.designspace).unwrap().1.location
             )
+            .unwrap()
         );
     }
 
@@ -3574,6 +3599,48 @@ mod tests {
         );
     }
 
+    // https://github.com/googlefonts/fontc/issues/1649
+    #[test]
+    fn static_metadata_instances_located_by_uservalue() {
+        let (_, context) =
+            build_static_metadata("mapping_instance_uservalue.designspace", Flags::default());
+        let static_metadata = context.static_metadata.get();
+
+        // uservalue 500 goes through the wght map (400..700 -> 0..100) and back;
+        // width is omitted from the location so it takes the axis default
+        assert_eq!(
+            static_metadata
+                .named_instances
+                .iter()
+                .map(|ni| (ni.name.as_str(), ni.location.clone()))
+                .collect::<Vec<_>>(),
+            vec![(
+                "Medium",
+                UserLocation::from(vec![
+                    (Tag::new(b"wght"), UserCoord::new(500.0)),
+                    (Tag::new(b"wdth"), UserCoord::new(100.0)),
+                ])
+            )]
+        );
+    }
+
+    #[test]
+    fn static_metadata_skips_instances_outside_axis_range() {
+        let (_, context) =
+            build_static_metadata("instance_out_of_range.designspace", Flags::default());
+        let static_metadata = context.static_metadata.get();
+
+        // "Extrapolated" sits at wght=2000 on a 400..700 axis and is dropped, as in fontmake
+        assert_eq!(
+            static_metadata
+                .named_instances
+                .iter()
+                .map(|ni| ni.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["Regular"]
+        );
+    }
+
     #[test]
     fn postscript_hints_for_every_master() {
         let (_, context) = build_static_metadata(
@@ -3684,6 +3751,33 @@ mod tests {
     }
 
     #[test]
+    fn unicode_variation_sequences_from_lib() {
+        let (_, context) = build_static_metadata("UnicodeVariationSequences.ufo", Flags::default());
+        let static_metadata = context.static_metadata.get();
+        let sequences = static_metadata
+            .misc
+            .unicode_variation_sequences
+            .iter()
+            .flat_map(|(selector, mappings)| {
+                mappings
+                    .iter()
+                    .map(|(codepoint, name)| (*selector, *codepoint, name.as_str()))
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            sequences,
+            vec![
+                (0xFE00, 0x7C, "bar.uv001"),
+                (0xFE0E, 0x1F170, "u1F170.text"),
+                (0xFE0F, 0x2B, "plus"),
+                (0xFE0F, 0x7C, "bar"),
+                (0xFE0F, 0x1F170, "u1F170"),
+                (0xE0100, 0x20, "space"),
+            ]
+        );
+    }
+
+    #[test]
     fn ignore_empty_meta_table_values() {
         let mut plist = plist::Dictionary::new();
         plist.insert(
@@ -3713,7 +3807,7 @@ mod tests {
             font.save(&tmp_ufo).unwrap();
 
             let source = DesignSpaceIrSource::new(&tmp_ufo).unwrap();
-            let context = Context::new_root(Flags::default(), None, None);
+            let context = Context::new_root(Flags::default());
             let task_context = context.copy_for_work(
                 Access::None,
                 AccessBuilder::new()
@@ -4156,6 +4250,68 @@ mod tests {
         );
     }
 
+    fn ufo2ft_filters(filter: plist::Dictionary) -> plist::Dictionary {
+        plist_dict! {
+            UFO2FT_FILTERS => Value::Array(vec![
+                plist_dict! { "name" => "flattenComponents" }.into(),
+                filter.into(),
+            ]),
+        }
+    }
+
+    fn glyph_list(names: &[&str]) -> Value {
+        Value::Array(names.iter().map(|n| Value::from(*n)).collect())
+    }
+
+    #[test]
+    fn decompose_components_filter_scope() {
+        let unscoped = ufo2ft_filters(plist_dict! { "name" => "decomposeComponents" });
+        assert_eq!(
+            decompose_components_from_lib(&unscoped),
+            Some(FilterScope::All)
+        );
+
+        let include = ufo2ft_filters(plist_dict! {
+            "name" => "decomposeComponents",
+            "pre" => true,
+            "include" => glyph_list(&["Aacute", "Agrave"]),
+        });
+        assert_eq!(
+            decompose_components_from_lib(&include),
+            Some(FilterScope::Include(
+                ["Aacute", "Agrave"].map(GlyphName::from).into()
+            ))
+        );
+
+        let exclude = ufo2ft_filters(plist_dict! {
+            "name" => "decomposeComponents",
+            "exclude" => glyph_list(&["Aacute"]),
+        });
+        assert_eq!(
+            decompose_components_from_lib(&exclude),
+            Some(FilterScope::Exclude(["Aacute"].map(GlyphName::from).into()))
+        );
+    }
+
+    #[test]
+    fn malformed_decompose_components_filter_is_ignored() {
+        let absent = ufo2ft_filters(plist_dict! { "name" => "propagateAnchors" });
+        assert_eq!(decompose_components_from_lib(&absent), None);
+
+        let both = ufo2ft_filters(plist_dict! {
+            "name" => "decomposeComponents",
+            "include" => glyph_list(&["Aacute"]),
+            "exclude" => glyph_list(&["Agrave"]),
+        });
+        assert_eq!(decompose_components_from_lib(&both), None);
+
+        let not_a_list = ufo2ft_filters(plist_dict! {
+            "name" => "decomposeComponents",
+            "include" => "Aacute",
+        });
+        assert_eq!(decompose_components_from_lib(&not_a_list), None);
+    }
+
     #[test]
     fn glyph_categories_from_plist() {
         let categories = plist_dict! {
@@ -4377,7 +4533,7 @@ mod tests {
         let mut source = load_designspace("wght_var.designspace");
         let ds = Arc::get_mut(&mut source.designspace).unwrap();
         ds.lib.insert(FEATURE_WRITERS_LIB_KEY.into(), value);
-        let context = Context::new_root(Flags::default(), None, None);
+        let context = Context::new_root(Flags::default());
         let task_context = context.copy_for_work(
             Access::None,
             AccessBuilder::new()
@@ -4430,7 +4586,7 @@ mod tests {
 
     #[test]
     fn unsupported_feature_writer_option_is_error() {
-        let _ = env_logger::builder().is_test(true).try_init();
+        let _ = tracing_subscriber::fmt().with_test_writer().try_init();
         let entry = plist_dict! {
             "class" => "KernFeatureWriter",
             "options" => plist_dict! { "quantization" => 2i64 },

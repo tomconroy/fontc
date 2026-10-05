@@ -1,6 +1,6 @@
 [package]
 name = "glyphs2fontir"
-version = "0.6.0"
+version = "1.0.0"
 edition = "2024"
 license = "MIT/Apache-2.0"
 description = "Converts www.glyphsapp.com files to font ir for compilation."
@@ -11,18 +11,19 @@ categories = ["text-processing", "parsing", "graphics"]
 [features]
 
 [dependencies]
-fontdrasil = { version = "0.4.0", path = "../fontdrasil" }
-fontir = { version = "0.5.0", path = "../fontir" }
-glyphs-reader = { version = "0.5.0", path = "../glyphs-reader" }
+fontdrasil = { version = "1.0.0", path = "../fontdrasil" }
+fontir = { version = "1.0.0", path = "../fontir" }
+glyphs-reader = { version = "1.0.0", path = "../glyphs-reader" }
 
 smol_str.workspace = true
 log.workspace = true
-env_logger.workspace = true
+tracing.workspace = true
 
 thiserror.workspace = true
 
 kurbo.workspace = true
 ordered-float.workspace = true
+regex.workspace = true
 indexmap.workspace = true
 
 write-fonts.workspace = true
@@ -33,3 +34,4 @@ chrono.workspace = true
 diff.workspace = true
 tempfile.workspace = true
 pretty_assertions.workspace = true
+tracing-subscriber.workspace = true

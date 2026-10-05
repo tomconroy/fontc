@@ -27,10 +27,6 @@ pub struct Args {
     #[arg(short, long)]
     source: Option<PathBuf>,
 
-    /// Whether to write IR to disk.
-    #[arg(short, long, default_value = "false")]
-    pub emit_ir: bool,
-
     /// Output file name (default: build/font.ttf)
     #[arg(short, long)]
     pub output_file: Option<PathBuf>,
@@ -71,13 +67,13 @@ pub struct Args {
     #[arg(long, default_value = "false")]
     pub decompose_components: bool,
 
-    /// Whether to out timing data, notably a visualization of threadpool execution of tasks.
+    /// Whether to output timing data in Chrome trace format (written to trace.json in build dir).
     ///
-    /// See <https://github.com/googlefonts/fontc/pull/443>
+    /// The generated JSON file can be viewed at https://ui.perfetto.dev/.
     #[arg(long, default_value = "false")]
     pub emit_timing: bool,
 
-    /// Working directory for the build process. If emit-ir is on, written here.
+    /// Working directory for the build process.
     #[arg(short, long, default_value = "build")]
     pub build_dir: PathBuf,
 
@@ -117,7 +113,7 @@ pub struct Args {
 
     /// Set the log level, either globally or per module. Defaults to warn.
     ///
-    /// See <https://docs.rs/env_logger/latest/env_logger/#enabling-logging> for format.
+    /// See <https://docs.rs/tracing-subscriber/latest/tracing_subscriber/filter/struct.EnvFilter.html#directives> for format.
     #[arg(long)]
     pub log: Option<String>,
 
@@ -224,6 +220,11 @@ impl Args {
             .unwrap_or_else(|| self.input_source.as_ref().unwrap());
         Input::try_from(path.as_path())
     }
+
+    /// Returns the trace path if timing output is enabled.
+    pub fn trace_path(&self) -> Option<PathBuf> {
+        self.emit_timing.then(|| self.build_dir.join("trace.json"))
+    }
 }
 
 impl ValidatedRegex {
@@ -269,9 +270,7 @@ impl TryInto<Options> for Args {
     fn try_into(self) -> Result<Options, Self::Error> {
         let flags = self.flags();
         let flags_to_disable = self.flags_to_disable();
-        let timing_file = self.emit_timing.then(|| self.build_dir.join("threads.svg"));
         let debug_dir = self.emit_debug.then(|| self.build_dir.join("debug/"));
-        let ir_dir = self.emit_ir.then(|| self.build_dir.clone());
         Ok(Options {
             flags,
             flags_to_disable,
@@ -283,9 +282,7 @@ impl TryInto<Options> for Args {
                     Flavor::Otf => "font.otf",
                 }))
             }),
-            timing_file,
             debug_dir,
-            ir_dir,
             instance: self.instance,
         })
     }

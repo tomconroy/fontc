@@ -69,7 +69,7 @@ pub(crate) struct AllLookups {
     gsub_debug_info: Vec<Option<LookupDebugInfo>>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub(crate) enum PositionLookup {
     Single(LookupBuilder<SinglePosBuilder>),
     Pair(LookupBuilder<PairPosBuilder>),
@@ -108,7 +108,7 @@ impl_into_lookup!(MarkToLigBuilder, PositionLookup, MarkToLig);
 impl_into_lookup!(CursivePosBuilder, PositionLookup, Cursive);
 impl_into_lookup!(SingleSubBuilder, SubstitutionLookup, Single);
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub(crate) enum SubstitutionLookup {
     Single(LookupBuilder<SingleSubBuilder>),
     Multiple(LookupBuilder<MultipleSubBuilder>),
@@ -259,7 +259,7 @@ impl PositionLookup {
         }
     }
 
-    fn kind(&self) -> Kind {
+    pub(crate) fn kind(&self) -> Kind {
         match self {
             PositionLookup::Single(_) => Kind::GposType1,
             PositionLookup::Pair(_) => Kind::GposType2,
@@ -285,6 +285,41 @@ impl PositionLookup {
             PositionLookup::Contextual(lookup) => lookup.force_subtable_break(),
             PositionLookup::ChainedContextual(lookup) => lookup.force_subtable_break(),
             PositionLookup::Extension(_) => unreachable!("Extension lookup has no subtable break"),
+        }
+    }
+
+    fn infer_glyph_classes(&self, f: &mut impl FnMut(GlyphId16, GlyphClassDef)) {
+        match self {
+            PositionLookup::MarkToBase(lookup) => {
+                for subtable in &lookup.subtables {
+                    subtable
+                        .base_glyphs()
+                        .for_each(|k| f(k, GlyphClassDef::Base));
+                    subtable
+                        .mark_glyphs()
+                        .for_each(|k| f(k, GlyphClassDef::Mark));
+                }
+            }
+            PositionLookup::MarkToLig(lookup) => {
+                for subtable in &lookup.subtables {
+                    subtable
+                        .lig_glyphs()
+                        .for_each(|k| f(k, GlyphClassDef::Ligature));
+                    subtable
+                        .mark_glyphs()
+                        .for_each(|k| f(k, GlyphClassDef::Mark));
+                }
+            }
+            PositionLookup::MarkToMark(lookup) => {
+                for subtable in &lookup.subtables {
+                    subtable
+                        .mark1_glyphs()
+                        .chain(subtable.mark2_glyphs())
+                        .for_each(|k| f(k, GlyphClassDef::Mark));
+                }
+            }
+            PositionLookup::Extension(inner) => inner.infer_glyph_classes(f),
+            _ => (),
         }
     }
 }
@@ -606,6 +641,24 @@ impl AllLookups {
         }
     }
 
+    pub(crate) fn gpos(&self) -> &[PositionLookup] {
+        &self.gpos
+    }
+
+    pub(crate) fn gsub(&self) -> &[SubstitutionLookup] {
+        &self.gsub
+    }
+
+    pub(crate) fn named(&self) -> &HashMap<SmolStr, LookupId> {
+        &self.named
+    }
+
+    /// Replace the GPOS lookups with a merged set; the count must not change.
+    pub(crate) fn set_gpos(&mut self, gpos: Vec<PositionLookup>) {
+        assert_eq!(gpos.len(), self.gpos.len());
+        self.gpos = gpos;
+    }
+
     pub(crate) fn debug_info(&self) -> (&[Option<LookupDebugInfo>], &[Option<LookupDebugInfo>]) {
         (&self.gsub_debug_info, &self.gpos_debug_info)
     }
@@ -739,12 +792,26 @@ impl AllLookups {
                 Some((id, None))
             }
         } else if let Some(name) = self.current_name.take() {
-            self.named.insert(name.clone(), LookupId::Empty);
-            // there was a named block with no rules, return the empty lookup
+            self.named.entry(name.clone()).or_insert(LookupId::Empty);
+            // no rules since the block (or its last script/language statement)
+            // began, return the empty lookup
             Some((LookupId::Empty, Some(name)))
         } else {
             None
         }
+    }
+
+    /// Finish the current lookup, but not the named lookup block containing it.
+    ///
+    /// Inside a named block the name is bound to the finished lookup. Any rules
+    /// that follow go in a new lookup, and the name is rebound to that.
+    pub(crate) fn finish_current_keep_name(&mut self) -> Option<LookupId> {
+        let lookup = self.current.take()?;
+        let id = self.push(lookup, self.current_use_extension);
+        if let Some(name) = self.current_name.clone() {
+            self.named.insert(name, id);
+        }
+        Some(id)
     }
 
     pub(crate) fn promote_single_sub_to_multi_if_necessary(&mut self) {
@@ -794,45 +861,12 @@ impl AllLookups {
 
     pub(crate) fn infer_glyph_classes(&self, mut f: impl FnMut(GlyphId16, GlyphClassDef)) {
         for lookup in &self.gpos {
-            match lookup {
-                PositionLookup::MarkToBase(lookup) => {
-                    for subtable in &lookup.subtables {
-                        subtable
-                            .base_glyphs()
-                            .for_each(|k| f(k, GlyphClassDef::Base));
-                        subtable
-                            .mark_glyphs()
-                            .for_each(|k| f(k, GlyphClassDef::Mark));
-                    }
-                }
-                PositionLookup::MarkToLig(lookup) => {
-                    for subtable in &lookup.subtables {
-                        subtable
-                            .lig_glyphs()
-                            .for_each(|k| f(k, GlyphClassDef::Ligature));
-                        subtable
-                            .mark_glyphs()
-                            .for_each(|k| f(k, GlyphClassDef::Mark));
-                    }
-                }
-                PositionLookup::MarkToMark(lookup) => {
-                    for subtable in &lookup.subtables {
-                        subtable
-                            .mark1_glyphs()
-                            .chain(subtable.mark2_glyphs())
-                            .for_each(|k| f(k, GlyphClassDef::Mark));
-                    }
-                }
-                _ => (),
-            }
+            lookup.infer_glyph_classes(&mut f);
         }
         //TODO: the spec says to do gsub too, but fonttools doesn't?
     }
 
     /// Return the aalt-relevant lookups for this lookup Id.
-    ///
-    /// If lookup is GSUB type 1 or 3, return a single lookup.
-    /// If contextual, returns any referenced single-sub lookups.
     pub(crate) fn aalt_lookups(&self, id: LookupId) -> Vec<&SubstitutionLookup> {
         let mut collect = Vec::new();
         let mut seen = HashSet::new();
@@ -852,7 +886,15 @@ impl AllLookups {
         if !seen.insert(id) {
             return;
         }
+        self.collect_aalt_lookup(lookup, collect, seen);
+    }
 
+    fn collect_aalt_lookup<'a>(
+        &'a self,
+        lookup: &'a SubstitutionLookup,
+        collect: &mut Vec<&'a SubstitutionLookup>,
+        seen: &mut HashSet<LookupId>,
+    ) {
         match lookup {
             SubstitutionLookup::Single(_)
             | SubstitutionLookup::Alternate(_)
@@ -869,6 +911,7 @@ impl AllLookups {
                 .iter()
                 .flat_map(|sub| sub.iter_lookups())
                 .for_each(|id| self.aalt_lookups_impl(id, collect, seen)),
+            SubstitutionLookup::Extension(inner) => self.collect_aalt_lookup(inner, collect, seen),
             _ => (),
         }
     }

@@ -42,9 +42,21 @@ JSON:
     where keys are the name of the compiler that failed, and the body is a
     dictionary with "command" and "stderr" fields, where the "command" field
     is the command that was used to run that compiler.
+
+    If fontmake fails, that "command" and "stderr" are also written to
+    fontmake.failure.json in the build directory, and a later run that does not
+    rebuild fontmake reports them again instead of building.
+
+Exit codes:
+    0   the two fonts compare as identical
+    2   the fonts differ, or a compiler failed (see JSON, above)
+    3   --expected_fontc_ttf_hash was passed and the font fontc produced hashed
+        to it, so we stopped without comparing anything. The sha256 of the font
+        fontc produced is always written to fontc.sha256 in the build directory.
 """
 
 import dataclasses
+import hashlib
 import json
 import os
 import re
@@ -91,6 +103,10 @@ FLAVOR_OTF = "otf"
 # maximum chars of stderr to include when reporting errors; prevents
 # too much bloat when run in CI
 MAX_ERR_LEN = 1000
+# file in the build dir holding the sha256 of the font fontc produced
+FONTC_TTF_HASH_FILE = "fontc.sha256"
+# exit code used when --expected_fontc_ttf_hash matched and we skipped the diff
+UNCHANGED_EXIT_CODE = 3
 
 # --instance policies are namespaced with a leading '@' so that a source with an
 # instance literally named 'default' is still reachable by name
@@ -326,6 +342,34 @@ def build_fontc(
         # ("Family Bold"), so only the location means the same thing to both
         cmd += ["--instance", instance.fontc_arg()]
     build(cmd, build_dir)
+
+
+# Where we record how fontmake failed, in place of the font it did not produce.
+# Like the font, it is reused until --rebuild deletes it.
+def failure_file(ttf_path: Path) -> Path:
+    return ttf_path.with_suffix(".failure.json")
+
+
+def save_fontmake_failure(fontmake_ttf: Path, failure: dict):
+    failure_file(fontmake_ttf).write_text(json.dumps(failure))
+
+
+def load_fontmake_failure(fontmake_ttf: Path) -> Optional[dict]:
+    path = failure_file(fontmake_ttf)
+    if not path.is_file():
+        return None
+    try:
+        failure = json.loads(path.read_text())
+    except (OSError, ValueError) as e:
+        eprint(f"ignoring unreadable {rel_user(path)}: {e}")
+        return None
+    if not isinstance(failure, dict) or not all(
+        isinstance(failure.get(k), str) for k in ("command", "stderr")
+    ):
+        eprint(f"ignoring malformed {rel_user(path)}")
+        return None
+    eprint(f"reusing {rel_user(path)}")
+    return {"command": failure["command"], "stderr": failure["stderr"]}
 
 
 def build_fontmake(
@@ -581,7 +625,7 @@ def source_is_variable(path: Path) -> bool:
             for vm in virtual_masters:
                 for entry in vm:
                     if entry.get("Axis") == axis.name:
-                        values.append(entry["Location"])
+                        values.append(float(entry["Location"]))
             if min(values) != max(values):
                 return True
         return False
@@ -847,6 +891,29 @@ def print_instances(source: Path):
 def copy(old, new):
     shutil.copyfile(old, new)
     return new
+
+
+def hash_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+# Record the hash of the font fontc just produced, and if the caller told us what
+# hash it has already seen, exit without doing any of the comparison work: the
+# same two fonts always produce the same diff, so the caller's result stands.
+def write_hash_and_maybe_exit_early(
+    fontc_ttf: Path, build_dir: Path, expected_hash: Optional[str]
+):
+    if not fontc_ttf.is_file():
+        return
+    fontc_ttf_hash = hash_file(fontc_ttf)
+    (build_dir / FONTC_TTF_HASH_FILE).write_text(fontc_ttf_hash)
+    if expected_hash == fontc_ttf_hash:
+        eprint(f"fontc output unchanged ({fontc_ttf_hash[:12]}), skipping comparison")
+        sys.exit(UNCHANGED_EXIT_CODE)
 
 
 def get_name_to_id_map(ttx: etree.ElementTree):
@@ -1764,22 +1831,22 @@ def jsonify_output(output: dict[str, dict[str, Any]]):
     different_lines = 0
     for tag in all_tags:
         if tag not in fontc:
-            different_lines += len(fontmake[tag])
+            different_lines += line_count(fontmake[tag])
             out[tag] = "fontmake"
         elif tag not in fontmake:
-            different_lines += len(fontc[tag])
+            different_lines += line_count(fontc[tag])
             out[tag] = "fontc"
         else:
             s1 = fontc[tag]
             s2 = fontmake[tag]
             if s1 != s2:
                 ratio = diff_ratio(s1, s2)
-                n_lines = max(len(s1), len(s2))
+                n_lines = max(line_count(s1), line_count(s2))
                 same_lines += int(n_lines * ratio)
                 different_lines += int(n_lines * (1 - ratio))
                 out[tag] = ratio
             else:
-                same_lines += len(s1)
+                same_lines += line_count(s1)
 
     # then also add in size differences, if any
     for tag, size_diff in sizes.items():
@@ -1811,6 +1878,10 @@ def extract_comparables(font_xml, build_dir: Path, compiler: str) -> dict[str, s
         comparables[tag] = table_str
 
     return comparables
+
+
+def line_count(text) -> int:
+    return len(text.splitlines())
 
 
 # the line-wise ratio of difference, i.e. the fraction of lines that are the same
@@ -1888,6 +1959,7 @@ def delete_things_we_must_rebuild(
                 font_path.with_suffix(".ttx"),
                 font_path.with_suffix(".markkern.txt"),
                 font_path.with_suffix(".ligcaret.txt"),
+                failure_file(font_path),
             ]
             if not skip_fonts:
                 paths.append(font_path)
@@ -2120,17 +2192,26 @@ def main(argv):
                     "command": " ".join(e.command),
                     "stderr": e.msg[-MAX_ERR_LEN:],
                 }
-        with timed("build fontmake"):
-            try:
-                if compare == "default":
-                    build_fontmake(source, build_dir, instance)
-                else:
-                    run_gftools(source, FLAGS.config, build_dir)
-            except BuildFail as e:
-                failures["fontmake"] = {
-                    "command": " ".join(e.command),
-                    "stderr": e.msg[-MAX_ERR_LEN:],
-                }
+        if "fontc" not in failures:
+            write_hash_and_maybe_exit_early(
+                fontc_out, build_dir, FLAGS.expected_fontc_ttf_hash
+            )
+        fontmake_failure = load_fontmake_failure(fontmake_out)
+        if fontmake_failure is not None:
+            failures["fontmake"] = fontmake_failure
+        else:
+            with timed("build fontmake"):
+                try:
+                    if compare == "default":
+                        build_fontmake(source, build_dir, instance)
+                    else:
+                        run_gftools(source, FLAGS.config, build_dir)
+                except BuildFail as e:
+                    failures["fontmake"] = {
+                        "command": " ".join(e.command),
+                        "stderr": e.msg[-MAX_ERR_LEN:],
+                    }
+                    save_fontmake_failure(fontmake_out, failures["fontmake"])
 
     report_errors_and_exit_if_there_were_any(failures)
 

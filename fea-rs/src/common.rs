@@ -37,9 +37,19 @@ pub enum GlyphIdent {
     Cid(u16),
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub(crate) struct MarkClass {
     pub(crate) members: Vec<(GlyphClass, Option<AnchorBuilder>)>,
+}
+
+impl MarkClass {
+    /// `true` if no member of this class contributes any glyphs.
+    ///
+    /// Such a class never registers its name with the GPOS mark builders, so
+    /// attaching to it would panic; see `CompilationCtx::define_mark_class`.
+    pub(crate) fn is_empty(&self) -> bool {
+        self.members.iter().all(|(glyphs, _)| glyphs.is_empty())
+    }
 }
 
 impl From<u16> for GlyphIdent {
@@ -83,12 +93,29 @@ impl GlyphOrClass {
         }
     }
 
+    pub(crate) fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
     pub(crate) fn is_class(&self) -> bool {
         matches!(self, GlyphOrClass::Class(_))
     }
 
     pub(crate) fn is_null(&self) -> bool {
         matches!(self, GlyphOrClass::Null)
+    }
+
+    /// If this is a class, sort and deduplicate the glyphs.
+    ///
+    /// This is for positions where the class will become a coverage table,
+    /// so order doesn't matter.
+    pub(crate) fn canonicalize(&mut self) {
+        if let GlyphOrClass::Class(class) = self {
+            class.sort_and_dedup();
+            if let [gid] = class.items() {
+                *self = GlyphOrClass::Glyph(*gid);
+            }
+        }
     }
 
     pub(crate) fn to_class(&self) -> Option<GlyphClass> {
@@ -99,13 +126,6 @@ impl GlyphOrClass {
         }
     }
 
-    pub(crate) fn to_glyph(&self) -> Option<GlyphId16> {
-        match self {
-            GlyphOrClass::Glyph(gid) => Some(*gid),
-            _ => None,
-        }
-    }
-
     /// If this is a glyph or a class with exactly one, return it.
     pub(crate) fn single_glyph(&self) -> Option<GlyphId16> {
         match self {
@@ -113,28 +133,6 @@ impl GlyphOrClass {
             GlyphOrClass::Class(class) if class.len() == 1 => class.iter().next(),
             _ => None,
         }
-    }
-
-    /// Combine the glyphs from `other` into this value.
-    ///
-    /// After this call, `self` contains the union of the glyphs of both
-    /// operands, in order of first appearance, as a `Class` variant.
-    ///
-    /// Duplicates are dropped. This matters because the result is an *input
-    /// sequence position* of a merged contextual rule, and a position that
-    /// contains more than one glyph disqualifies the whole lookup from being
-    /// encoded as a format 1 (single-glyph) subtable; a repeated glyph must
-    /// not be what makes that decision. fonttools does the same thing, by
-    /// merging the two positions as a `set`: see
-    /// `Builder._add_contextual_rule` in `fontTools/feaLib/builder.py`.
-    pub(crate) fn extend(&mut self, other: &GlyphOrClass) {
-        let mut seen = GlyphSet::default();
-        *self = GlyphOrClass::Class(
-            self.iter()
-                .chain(other.iter())
-                .filter(|gid| seen.insert(*gid))
-                .collect(),
-        );
     }
 
     pub(crate) fn iter(&self) -> impl Iterator<Item = GlyphId16> + '_ {
@@ -167,5 +165,11 @@ impl GlyphOrClass {
             idx %= self.len();
             next
         })
+    }
+}
+
+impl std::iter::FromIterator<GlyphId16> for GlyphOrClass {
+    fn from_iter<T: IntoIterator<Item = GlyphId16>>(iter: T) -> Self {
+        GlyphOrClass::Class(iter.into_iter().collect())
     }
 }

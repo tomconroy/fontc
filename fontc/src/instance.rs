@@ -40,7 +40,10 @@ use fontdrasil::{
 };
 use fontir::{
     instance::{self, InstanceSpec},
-    ir::{FeaturesSource, Glyph, GlyphAnchors, GlyphInstance, KerningLocations, StaticMetadata},
+    ir::{
+        FeatureSources, FeaturesSource, Glyph, GlyphAnchors, GlyphInstance, KerningLocations,
+        StaticMetadata,
+    },
     orchestration::{Context, WorkId},
 };
 
@@ -76,10 +79,18 @@ pub(crate) fn pin_frontend(fe_root: &Context, spec: &InstanceSpec) -> Result<Pin
     let asked_for = instance::resolve_user(&source_metadata, spec)?;
     let location = normalize(&source_metadata, &asked_for)?;
 
-    if let Some(features) = context.features.try_get()
-        && fea_declares_a_conditionset(&features)?
-    {
-        return Err(Error::InstanceOfSourceWithFeaConditionSet);
+    if let Some(features) = context.features.try_get() {
+        if fea_declares_a_conditionset(features.default_source())? {
+            return Err(Error::InstanceOfSourceWithFeaConditionSet);
+        }
+        // An instance's features are the default source's alone: ufo2ft's
+        // instantiator copies the default source's feature text into every
+        // instance UFO, so there is nothing to merge across masters.
+        if features.n_sources() > 1 {
+            context
+                .features
+                .set(FeatureSources::single(features.default_source().clone()));
+        }
     }
 
     log::info!("Pinning at {location:?}");

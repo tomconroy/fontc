@@ -21,10 +21,10 @@ use write_fonts::{
             },
         },
         layout::{
-            ConditionFormat1, ConditionSet, FeatureVariations, LookupFlag,
+            ConditionFormat1, ConditionSet, LookupFlag,
             builders::{CaretValueBuilder as CaretValue, DeviceOrDeltas, Metric},
         },
-        variations::{common_builder::RemapVarStore, ivs_builder::VariationStoreBuilder},
+        variations::VariationRegion,
     },
     types::{NameId, Tag},
 };
@@ -32,6 +32,7 @@ use write_fonts::{
 use crate::{
     Diagnostic, GlyphIdent, GlyphMap, Kind, NodeOrToken, Opts,
     common::{GlyphClass, GlyphId16, GlyphOrClass, GlyphSet, MarkClass},
+    compile::output::PendingCompilation,
     parse::ParseTree,
     token_tree::{
         Token,
@@ -42,7 +43,7 @@ use crate::{
 
 use super::{
     VariationInfo,
-    feature_writer::{FeatureBuilder, FeatureProvider, InsertionPoint},
+    feature_writer::{FeatureProvider, InsertionPoint},
     features::{
         AaltFeature, ActiveFeature, AllFeatures, ConditionSetMap, CvParams, SizeFeature,
         SpecialVerticalFeatureState,
@@ -90,7 +91,6 @@ pub struct CompilationCtx<'a, F: FeatureProvider, V: VariationInfo> {
     lookup_flags: LookupFlagInfo,
     active_feature: Option<ActiveFeature>,
     vertical_feature: SpecialVerticalFeatureState,
-    script: Option<Tag>,
     glyph_class_defs: HashMap<SmolStr, GlyphClass>,
     mark_classes: HashMap<SmolStr, MarkClass>,
     anchor_defs: HashMap<SmolStr, (Anchor, usize)>,
@@ -133,7 +133,6 @@ impl<'a, F: FeatureProvider, V: VariationInfo> CompilationCtx<'a, F, V> {
             lookup_flags: Default::default(),
             active_feature: Default::default(),
             vertical_feature: Default::default(),
-            script: Default::default(),
             mark_attach_class_id: Default::default(),
             mark_filter_sets: Default::default(),
             opts,
@@ -174,213 +173,38 @@ impl<'a, F: FeatureProvider, V: VariationInfo> CompilationCtx<'a, F, V> {
                 self.error(span, format!("unhandled top-level item: '{}'", item.kind()));
             }
         }
-
-        // NOTE: this is the easiest place for us to do this, but we
-        // could potentially be more performant by running this in parallel,
-        // immediately after parsing?
-        let lig_carets = self.run_feature_writer_if_present();
-
-        self.finalize_gdef_table(lig_carets);
-        self.features
-            .finalize_aalt(&mut self.lookups, &self.default_lang_systems);
-        self.features.dedupe_lookups();
     }
 
-    pub(crate) fn build(&mut self) -> Result<(Compilation, Vec<Diagnostic>), Vec<Diagnostic>> {
-        if self.errors.iter().any(Diagnostic::is_error) {
-            return Err(self.errors.clone());
+    pub(crate) fn get_pending_compilation(self) -> PendingCompilation {
+        PendingCompilation {
+            tree: self.tree.clone(),
+            features: self.features,
+            lookups: self.lookups,
+            tables: self.tables,
+            default_lang_systems: self.default_lang_systems,
+            conditionset_defs: self.conditionset_defs,
+            insert_markers: self.insert_markers,
+            mark_filter_sets: self.mark_filter_sets,
+            mark_classes: self.mark_classes,
+            mark_attach_class_id: self.mark_attach_class_id,
+            errors: self.errors,
+            opts: self.opts,
+            lig_carets_from_feature_writer: Default::default(),
+
+            axis_count: self
+                .variation_info
+                .map(|info| info.axis_count())
+                .unwrap_or_default(),
         }
-
-        let mut name_builder = self.tables.name.clone();
-        let stat = self
-            .tables
-            .stat
-            .as_ref()
-            .map(|raw| raw.build(&mut name_builder));
-
-        // the var store builder is required so that variable metrics/anchors
-        // in the GPOS table can be collected into an ItemVariationStore
-        let axis_count = self
-            .variation_info
-            .map(|info| info.axis_count())
-            .unwrap_or_default();
-        let mut ivs = VariationStoreBuilder::new(axis_count);
-
-        let (mut gsub, mut gpos) = self.lookups.build(&self.features, &mut ivs, &self.opts);
-        // if ivs hasn't been used, we don't want to create a GDEF table just for it.
-        if !ivs.is_empty() {
-            self.tables
-                .gdef
-                .get_or_insert_with(|| {
-                    // If we're creating a new GdefBuilder here, it means
-                    // finalize_gdef_table() discarded the previous one because
-                    // it was empty. That means no explicit glyph classes were
-                    // declared in the FEA, so mark the classes as inferred.
-                    // https://github.com/googlefonts/fontc/issues/1847
-                    super::tables::GdefBuilder {
-                        glyph_classes_were_inferred: true,
-                        ..Default::default()
-                    }
-                })
-                .var_store = Some(ivs);
-        // but if we _do_ have a gdef table, always add the var store,
-        // since we might still add ligature carets to it
-        } else if let Some(gdef) = self.tables.gdef.as_mut() {
-            gdef.var_store = Some(ivs);
-        }
-
-        let (gdef, key_map) = match self.tables.gdef.as_ref().map(|raw| raw.build()) {
-            Some((gdef, key_map)) => (Some(gdef), key_map),
-            None => (None, None),
-        };
-
-        let feature_params = self.features.build_feature_params(&mut name_builder);
-
-        if let Some(gsub) = gsub.as_mut() {
-            if let Some(variations) = gsub.feature_variations.as_mut() {
-                sort_feature_variations(variations, |condset| {
-                    self.conditionset_defs.sort_order(condset)
-                });
-            }
-            for record in gsub.feature_list.feature_records.iter_mut() {
-                if let Some(params) = feature_params.get(&record.feature_tag) {
-                    record.feature.feature_params = params.clone().into();
-                }
-            }
-        }
-        if let Some(gpos) = gpos.as_mut() {
-            if let Some(key_map) = key_map {
-                // all VariationIndex tables (in value records and anchors)
-                // currently have temporary indices; now that we've built the
-                // ItemVariationStore we need to go and update them all.
-                gpos.remap_variation_indices(&key_map);
-            }
-            if let Some(variations) = gpos.feature_variations.as_mut() {
-                sort_feature_variations(variations, |condset| {
-                    self.conditionset_defs.sort_order(condset)
-                });
-            }
-
-            for record in gpos.feature_list.feature_records.iter_mut() {
-                if let Some(params) = feature_params.get(&record.feature_tag) {
-                    record.feature.feature_params = params.clone().into();
-                }
-            }
-        }
-
-        let gdef_classes = self.tables.gdef.as_ref().and_then(|gdef| {
-            (!gdef.glyph_classes_were_inferred).then(|| gdef.glyph_classes.clone())
-        });
-
-        if self.opts.compile_debg {
-            let (gsub_info, gpos_info) = self.lookups.debug_info();
-            self.tables.debg = Some(super::tables::DebgBuilder::new(
-                gsub_info.to_vec(),
-                gpos_info.to_vec(),
-            ));
-        }
-
-        Ok((
-            Compilation {
-                head: self.tables.head.as_ref().map(|raw| raw.build(None)),
-                hhea: self.tables.hhea.clone(),
-                vhea: self.tables.vhea.clone(),
-                os2: self.tables.os2.as_ref().map(|raw| raw.build()),
-                os2_builder: self.tables.os2.clone(),
-                gdef,
-                base: self.tables.base.as_ref().map(|raw| raw.build()),
-                name: name_builder.build(),
-                stat,
-                gsub,
-                gpos,
-                opts: self.opts.clone(),
-                gdef_classes,
-                insert_markers: self.insert_markers.clone(),
-                debg: self.tables.debg.as_ref().map(|d| d.build(self.tree)),
-            },
-            self.errors.clone(),
-        ))
     }
 
-    // returns the ligcaret values; we add them after finalizing gdef
-    fn run_feature_writer_if_present(&mut self) -> BTreeMap<GlyphId16, Vec<CaretValue>> {
-        let Some(writer) = self.feature_writer else {
-            return Default::default();
-        };
-
-        let mut builder = FeatureBuilder::new(
-            &self.default_lang_systems,
-            &mut self.tables,
-            &mut self.mark_filter_sets,
-        );
-        writer.add_features(&mut builder);
-        let mut external_features = builder.finish();
-
-        // we need to register any ConditionSets here, because we want a
-        // stable sort order when we compile
-        if let Some(conditions) = external_features.feature_variations.as_ref() {
-            for conditionset in conditions.conditions.iter().map(|(cs, _)| cs) {
-                self.conditionset_defs.register_use(conditionset);
-            }
+    pub(crate) fn build(mut self) -> Result<(Compilation, Vec<Diagnostic>), Vec<Diagnostic>> {
+        let feature_provider = self.feature_writer.take();
+        let mut pending = self.get_pending_compilation();
+        if let Some(provider) = feature_provider {
+            pending.run_feature_provider(provider);
         }
-        external_features.merge_into(&mut self.lookups, &mut self.features, &self.insert_markers);
-        external_features.lig_carets
-    }
-
-    /// Infer/update GDEF table as required.
-    ///
-    /// If a GDEF table is not explicitly defined, we are supposed to create one,
-    /// and even if a GDEF table *is* defined, we are supposed to compute certain
-    /// of its subtables based on other items encountered in the feature file
-    ///
-    /// References:
-    ///
-    /// <http://adobe-type-tools.github.io/afdko/OpenTypeFeatureFileSpecification.html#4f-markclass>
-    /// <http://adobe-type-tools.github.io/afdko/OpenTypeFeatureFileSpecification.html#9b-gdef-table>
-    fn finalize_gdef_table(&mut self, generated_lig_carets: BTreeMap<GlyphId16, Vec<CaretValue>>) {
-        // if the FEA included a GDEF block, use that, otherwise create an empty table
-        let mut gdef = self.tables.gdef.take().unwrap_or_default();
-        // infer glyph classes, if they were not declared explicitly
-        if gdef.glyph_classes.is_empty() {
-            gdef.glyph_classes_were_inferred = true;
-            self.lookups.infer_glyph_classes(|glyph, class_id| {
-                gdef.glyph_classes.insert(glyph, class_id);
-            });
-            for glyph in self
-                .mark_classes
-                .values()
-                .flat_map(|class| class.members.iter().map(|(cls, _)| cls.iter()))
-                .flatten()
-            {
-                gdef.glyph_classes.insert(glyph, GlyphClassDef::Mark);
-            }
-        }
-
-        if !self.mark_attach_class_id.is_empty() {
-            gdef.mark_attach_class.extend(
-                self.mark_attach_class_id
-                    .iter()
-                    .flat_map(|(cls, id)| cls.iter().map(|gid| (gid, *id))),
-            );
-        }
-
-        if !self.mark_filter_sets.is_empty() {
-            let mut sorted = self
-                .mark_filter_sets
-                .iter()
-                .map(|(cls, id)| (*id, cls.clone()))
-                .collect::<Vec<_>>();
-            sorted.sort_unstable();
-            gdef.mark_glyph_sets = sorted.into_iter().map(|(_, cls)| cls).collect();
-        }
-
-        if gdef.ligature_pos.is_empty() {
-            gdef.ligature_pos = generated_lig_carets;
-        }
-
-        if !gdef.is_empty() {
-            self.tables.gdef = Some(gdef);
-        }
+        pending.build()
     }
 
     fn error(&mut self, range: Range<usize>, message: impl Into<String>) {
@@ -428,7 +252,6 @@ impl<'a, F: FeatureProvider, V: VariationInfo> CompilationCtx<'a, F, V> {
 
         self.vertical_feature.end_feature();
         self.lookup_flags.clear();
-        self.script = None;
     }
 
     fn start_lookup_block(&mut self, name: &Token, use_extension: bool) {
@@ -462,43 +285,43 @@ impl<'a, F: FeatureProvider, V: VariationInfo> CompilationCtx<'a, F, V> {
     }
 
     fn set_language(&mut self, stmt: typed::Language) {
-        let language = stmt.tag().to_raw();
-        let script = self.script.unwrap_or(tags::SCRIPT_DFLT);
-        self.set_script_language(
+        let languages = stmt.tags().map(|tag| tag.to_raw()).collect::<Vec<_>>();
+        let script = self
+            .active_feature
+            .as_ref()
+            .unwrap() // language statement only allowed in feature block
+            .current_lang_sys()
+            .script;
+        self.set_script_languages(
             script,
-            language,
+            languages,
             stmt.exclude_dflt().is_some(),
             stmt.required().is_some(),
         );
     }
 
+    /// The logic in this fn is surprisingly treacherous.
+    ///
+    /// See <https://github.com/fonttools/fonttools/pull/4169> for the most
+    /// comprehensive explanation.
     fn set_script(&mut self, stmt: typed::Script) {
         let script = stmt.tag().to_raw();
+        let system = LanguageSystem {
+            script,
+            language: tags::LANG_DFLT,
+        };
 
-        // fonttools logic here is kind of particular, so let's match it literally
-        //https://github.com/fonttools/fonttools/blob/5ae2943a43/Lib/fontTools/feaLib/builder.py#L1239
-        //
-        // note that fonttools compares the whole *set* of active language
-        // systems, and that at the top of a feature block that set is the set
-        // of default language systems (builder.py, start_feature). So in a file
-        // whose only 'languagesystem' statement is 'languagesystem xxxx dflt',
-        // a leading 'script xxxx;' is a no-op: the current script stays 'DFLT'
-        // (which start_feature also assigns), and the rules that follow are
-        // registered under DFLT/dflt rather than under xxxx.
-        if self
+        let system_is_current = self
             .active_feature
             .as_ref()
             .unwrap()
-            .active_systems_are_only(LanguageSystem {
-                script,
-                language: tags::LANG_DFLT,
-            })
-        {
-            return;
-        }
+            .is_only_current_system(system);
 
-        self.script = Some(script);
-        self.lookup_flags.clear();
+        // a script statement naming the already-current system does not reset
+        // the lookupflag.
+        if !system_is_current {
+            self.lookup_flags.clear();
+        }
 
         self.set_script_language(script, tags::LANG_DFLT, false, false);
     }
@@ -510,18 +333,30 @@ impl<'a, F: FeatureProvider, V: VariationInfo> CompilationCtx<'a, F, V> {
         exclude_dflt: bool,
         required: bool,
     ) {
-        let system = LanguageSystem { script, language };
-        if let Some((id, _name)) = self.lookups.finish_current() {
+        self.set_script_languages(script, [language], exclude_dflt, required);
+    }
+
+    fn set_script_languages(
+        &mut self,
+        script: Tag,
+        languages: impl IntoIterator<Item = Tag>,
+        exclude_dflt: bool,
+        required: bool,
+    ) {
+        if let Some(id) = self.lookups.finish_current_keep_name() {
             self.add_lookup_to_current_feature_if_present(id);
         }
-        let key = self
-            .active_feature
-            .as_mut()
-            .unwrap()
-            .set_system(system, exclude_dflt);
+        let keys = self.active_feature.as_mut().unwrap().set_systems(
+            languages
+                .into_iter()
+                .map(|language| LanguageSystem { script, language }),
+            exclude_dflt,
+        );
 
         if required {
-            self.features.add_required(key);
+            for key in keys {
+                self.features.add_required(key);
+            }
         }
     }
 
@@ -705,6 +540,14 @@ impl<'a, F: FeatureProvider, V: VariationInfo> CompilationCtx<'a, F, V> {
         let replace_ids = replace
             .map(|r| self.resolve_glyph_or_class(r))
             .unwrap_or(GlyphOrClass::Null);
+        // treat singleton class as single glyph, per the spec:
+        // "If the replacement is a singleton glyph class, then the rule
+        // will be treated identically to a format B rule":
+        // http://adobe-type-tools.github.io/afdko/OpenTypeFeatureFileSpecification.html#5a-gsub-lookuptype-1-single-substitution
+        let replace_ids = match replace_ids.single_glyph() {
+            Some(gid) => GlyphOrClass::Glyph(gid),
+            None => replace_ids,
+        };
         match (target_ids, replace_ids) {
             (GlyphOrClass::Null, _) => {
                 self.error(target.range(), "NULL is not a valid substitution target");
@@ -713,14 +556,6 @@ impl<'a, F: FeatureProvider, V: VariationInfo> CompilationCtx<'a, F, V> {
             (GlyphOrClass::Glyph(_), GlyphOrClass::Class(_)) => {
                 self.error(replace.unwrap().range(), "cannot sub glyph by glyph class");
                 None
-            }
-            // treat singleton class as single glyph, per the spec:
-            // "If the replacement is a singleton glyph class, then the rule
-            // will be treated identically to a format B rule":
-            // http://adobe-type-tools.github.io/afdko/OpenTypeFeatureFileSpecification.html#5a-gsub-lookuptype-1-single-substitution
-            (GlyphOrClass::Class(c1), GlyphOrClass::Class(c2)) if c2.len() == 1 => {
-                let g2 = *c2.into_iter().next().unwrap();
-                Some((GlyphOrClass::Class(c1), GlyphOrClass::Glyph(g2)))
             }
             (GlyphOrClass::Class(c1), GlyphOrClass::Class(c2)) if c1.len() != c2.len() => {
                 self.error(
@@ -839,15 +674,11 @@ impl<'a, F: FeatureProvider, V: VariationInfo> CompilationCtx<'a, F, V> {
                     }
                 };
                 let lookup = self.ensure_current_lookup_type(Kind::GsubType6, node.range());
-                let mut to_return = None;
-                for target in sequence_enumerator(&target) {
-                    to_return = Some(
-                        lookup
-                            .as_gsub_contextual()
-                            .add_anon_gsub_type_4(target, replacement),
-                    );
-                }
-                to_return
+                Some(
+                    lookup
+                        .as_gsub_contextual()
+                        .add_anon_gsub_type_4(sequence_enumerator(&target), replacement),
+                )
             } else {
                 let target = input.items().next().unwrap().target();
                 let arity = rule.replacements().count();
@@ -940,6 +771,10 @@ impl<'a, F: FeatureProvider, V: VariationInfo> CompilationCtx<'a, F, V> {
             })
             .collect::<Vec<_>>();
 
+        if self.report_empty_contextual_input(node, &context) {
+            return;
+        }
+
         let lookup = self.ensure_current_lookup_type(Kind::GsubType6, node.range());
         lookup.add_contextual_rule(backtrack, context, lookahead);
     }
@@ -957,10 +792,13 @@ impl<'a, F: FeatureProvider, V: VariationInfo> CompilationCtx<'a, F, V> {
         let target = input.target();
         let replacement = node.inline_rule().and_then(|r| r.replacements().next());
         //FIXME: warn if there are actual lookups here, we don't support that
-        if let Some((target, replacement)) =
+        if let Some((target_ids, replacement)) =
             self.validate_single_sub_inputs(&target, replacement.as_ref())
         {
-            let context = target
+            if self.report_empty_glyph_class(&target_ids, target.range()) {
+                return;
+            }
+            let context = target_ids
                 .iter()
                 .zip(replacement.into_iter_for_target())
                 .collect();
@@ -1039,6 +877,10 @@ impl<'a, F: FeatureProvider, V: VariationInfo> CompilationCtx<'a, F, V> {
             let class_name = mark_class_node.text().to_owned();
             let mark_class = self.mark_classes.get(&class_name).unwrap();
 
+            if mark_class.is_empty() {
+                continue;
+            }
+
             // access the lookup through the field, so the borrow checker
             // doesn't think we're borrowing all of self
             //TODO: we do validation here because our validation pass isn't smart
@@ -1101,6 +943,10 @@ impl<'a, F: FeatureProvider, V: VariationInfo> CompilationCtx<'a, F, V> {
                 let class_name = mark_class_node.text();
                 let mark_class = self.mark_classes.get(class_name).unwrap();
 
+                if mark_class.is_empty() {
+                    continue;
+                }
+
                 // access the lookup through the field, so the borrow checker
                 // doesn't think we're borrowing all of self
                 //TODO: we do validation here because our validation pass isn't smart
@@ -1147,6 +993,10 @@ impl<'a, F: FeatureProvider, V: VariationInfo> CompilationCtx<'a, F, V> {
             let mark_class_node = mark.mark_class_name().expect("checked in validation");
             let class_name = mark_class_node.text();
             let mark_class = self.mark_classes.get(mark_class_node.text()).unwrap();
+
+            if mark_class.is_empty() {
+                continue;
+            }
 
             //TODO: we do validation here because our validation pass isn't smart
             //enough. We need to not just validate a rule, but every rule in a lookup.
@@ -1229,7 +1079,10 @@ impl<'a, F: FeatureProvider, V: VariationInfo> CompilationCtx<'a, F, V> {
 
                 (glyphs, lookups)
             })
-            .collect();
+            .collect::<Vec<_>>();
+        if self.report_empty_contextual_input(node, &context) {
+            return;
+        }
         self.ensure_current_lookup_type(Kind::GposType8, node.range())
             .add_contextual_rule(backtrack, context, lookahead);
     }
@@ -1247,9 +1100,38 @@ impl<'a, F: FeatureProvider, V: VariationInfo> CompilationCtx<'a, F, V> {
             .input()
             .items()
             .map(|item| (self.resolve_glyph_or_class(&item.target()), Vec::new()))
-            .collect();
+            .collect::<Vec<_>>();
+        if self.report_empty_contextual_input(rule, &context) {
+            return;
+        }
         let lookup = self.ensure_current_lookup_type(kind, rule.range());
         lookup.add_contextual_rule(backtrack, context, lookahead);
+    }
+
+    /// Report any empty glyph class in a contextual rule's input sequence.
+    ///
+    /// Such a rule can never match, and cannot be built. Returns `true` if
+    /// anything was reported, in which case the rule must not be added.
+    fn report_empty_contextual_input(
+        &mut self,
+        node: &impl ContextualRuleNode,
+        context: &[(GlyphOrClass, Vec<LookupId>)],
+    ) -> bool {
+        let input = node.input();
+        let mut found_empty = false;
+        for (item, (glyphs, _)) in input.items().zip(context) {
+            found_empty |= self.report_empty_glyph_class(glyphs, item.target().range());
+        }
+        found_empty
+    }
+
+    /// Report `glyphs` if it is an empty class, returning whether it was.
+    fn report_empty_glyph_class(&mut self, glyphs: &GlyphOrClass, range: Range<usize>) -> bool {
+        if glyphs.is_empty() {
+            self.error(range, "Empty glyph class in contextual rule");
+            return true;
+        }
+        false
     }
 
     /// Resolve a value record, ignoring zero values
@@ -1347,28 +1229,27 @@ impl<'a, F: FeatureProvider, V: VariationInfo> CompilationCtx<'a, F, V> {
         let mut locations = HashMap::new();
         for metric_loc in metric.location_values() {
             let mut pos = NormalizedLocation::new();
-            for axis_value in metric_loc.location().items() {
-                let tag = axis_value.axis_tag().to_raw();
-                // All the tags are valid if we made it here, safe to unwrap
-                let (_, axis) = var_info.axis(tag).unwrap();
-                let coord = match axis_value.value().parse() {
-                    super::AxisLocation::Normalized(value) => NormalizedCoord::new(value),
-                    super::AxisLocation::User(value) => {
-                        UserCoord::new(value).to_normalized(&axis.converter)
-                    }
-                    super::AxisLocation::Design(value) => {
-                        DesignCoord::new(value).to_normalized(&axis.converter)
-                    }
-                };
-                pos.insert(tag, coord);
+            if let Some(location) = metric_loc.location() {
+                for axis_value in location.items() {
+                    let tag = axis_value.axis_tag().to_raw();
+                    // All the tags are valid if we made it here, safe to unwrap
+                    let (_, axis) = var_info.axis(tag).unwrap();
+                    let coord = match axis_value.value().parse() {
+                        super::AxisLocation::Normalized(value) => NormalizedCoord::new(value),
+                        super::AxisLocation::User(value) => {
+                            UserCoord::new(value).to_normalized(&axis.converter)
+                        }
+                        super::AxisLocation::Design(value) => {
+                            DesignCoord::new(value).to_normalized(&axis.converter)
+                        }
+                    };
+                    pos.insert(tag, coord);
+                }
             }
             locations.insert(pos, metric_loc.value().parse_signed());
         }
         match var_info.resolve_variable_metric(&locations) {
-            Ok((default, deltas)) => Metric {
-                default,
-                device_or_deltas: DeviceOrDeltas::Deltas(deltas),
-            },
+            Ok((default, deltas)) => metric_from_deltas(default, deltas),
             Err(e) => {
                 self.error(metric.range(), format!("failed to compute deltas: '{e}'"));
                 Default::default()
@@ -1407,10 +1288,7 @@ impl<'a, F: FeatureProvider, V: VariationInfo> CompilationCtx<'a, F, V> {
         let locations = var_info.resolve_variable_metric(&locations);
 
         match locations {
-            Ok((default, deltas)) => Metric {
-                default,
-                device_or_deltas: DeviceOrDeltas::Deltas(deltas),
-            },
+            Ok((default, deltas)) => metric_from_deltas(default, deltas),
             Err(e) => {
                 self.error(
                     number_value.range(),
@@ -1436,7 +1314,14 @@ impl<'a, F: FeatureProvider, V: VariationInfo> CompilationCtx<'a, F, V> {
 
     fn define_mark_class(&mut self, class_decl: typed::MarkClassDef) {
         let class_items = class_decl.glyph_class();
-        let class_items = self.resolve_glyph_or_class(&class_items).into();
+        let class_items: GlyphClass = self.resolve_glyph_or_class(&class_items).into();
+
+        if class_items.is_empty() {
+            self.error(
+                class_decl.glyph_class().range(),
+                "Empty glyph class in mark class definition",
+            );
+        }
 
         let anchor = self.resolve_anchor(&class_decl.anchor());
         let class_name = class_decl.mark_class_name();
@@ -2380,18 +2265,6 @@ fn sequence_enumerator_impl(
     }
 }
 
-fn sort_feature_variations(
-    variations: &mut FeatureVariations,
-    order_fn: impl Fn(&ConditionSet) -> usize,
-) {
-    variations
-        .feature_variation_records
-        .sort_by_key(|record| match record.condition_set.as_ref() {
-            Some(condition) => order_fn(condition),
-            None => order_fn(&Default::default()),
-        })
-}
-
 /// Returns a span suitable for associating an error.
 ///
 /// If this is a token, we take the whole token. If it's a node, we take
@@ -2405,6 +2278,22 @@ fn get_reasonable_length_span(node: &NodeOrToken) -> Range<usize> {
             let end = range.end.min(range.start + MAX_SPAN_LEN_FOR_NODES);
             range.start..end
         }
+    }
+}
+
+/// A variable scalar whose value is the same at every master is just a scalar.
+///
+/// Matches feaLib's `VariableScalar.does_vary`:
+/// <https://github.com/fonttools/fonttools/blob/34be2443a/Lib/fontTools/feaLib/variableScalar.py#L58-L61>
+pub(crate) fn metric_from_deltas(default: i16, deltas: Vec<(VariationRegion, i16)>) -> Metric {
+    let device_or_deltas = if deltas.iter().all(|(_, delta)| *delta == 0) {
+        DeviceOrDeltas::None
+    } else {
+        DeviceOrDeltas::Deltas(deltas)
+    };
+    Metric {
+        default,
+        device_or_deltas,
     }
 }
 
@@ -2438,8 +2327,8 @@ mod tests {
     fn sequence_enumerator_smoke_test() {
         let sequence = vec![
             GlyphOrClass::Glyph(GlyphId16::new(1)),
-            GlyphOrClass::Class([2_u16, 3, 4].iter().copied().map(GlyphId16::new).collect()),
-            GlyphOrClass::Class([8, 9].iter().copied().map(GlyphId16::new).collect()),
+            [2, 3, 4].into_iter().map(GlyphId16::new).collect(),
+            [8, 9].into_iter().map(GlyphId16::new).collect(),
         ];
 
         assert_eq!(

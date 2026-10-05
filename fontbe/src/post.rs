@@ -78,6 +78,7 @@ impl Work<Context, AnyWorkId, Error> for PostWork {
     }
 
     /// Generate [post](https://learn.microsoft.com/en-us/typography/opentype/spec/post)
+    #[tracing::instrument(name = "fontbe::PostWork::exec", skip_all)]
     fn exec(&self, context: &Context) -> Result<(), Error> {
         // TODO a more serious post
         let static_metadata = context.ir.static_metadata.get();

@@ -58,6 +58,7 @@ impl Work<Context, AnyWorkId, Error> for GvarWork {
     }
 
     /// Generate [gvar](https://learn.microsoft.com/en-us/typography/opentype/spec/gvar)
+    #[tracing::instrument(name = "fontbe::GvarWork::exec", skip_all)]
     fn exec(&self, context: &Context) -> Result<(), Error> {
         // We built the gvar fragments alongside glyphs, now we need to glue them together into a gvar table
         let static_metadata = context.ir.static_metadata.get();
@@ -84,12 +85,10 @@ impl Work<Context, AnyWorkId, Error> for GvarWork {
         });
         let gvar = Gvar::new(variations, axis_count).map_err(Error::GvarError)?;
 
-        let raw_gvar = dump_table(&gvar)
-            .map_err(|e| Error::DumpTableError {
-                e,
-                context: "gvar".into(),
-            })?
-            .into();
+        let raw_gvar = dump_table(&gvar).map_err(|e| Error::DumpTableError {
+            e,
+            context: "gvar".into(),
+        })?;
         context.gvar.set(raw_gvar);
 
         Ok(())

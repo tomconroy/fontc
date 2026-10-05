@@ -634,28 +634,44 @@ fn deepest_composites_first(context: &Context, glyph_order: &GlyphOrder) -> Vec<
     ordered
 }
 
+/// Decompose the glyphs the `--decompose-components` flag or the source's
+/// `decomposeComponents` filter asks for.
+///
+/// ufo2ft runs this as a pre filter, ahead of the consistency checks and
+/// flattening below, so a composite that references a decomposed glyph
+/// sees a simple glyph.
+fn decompose_components(context: &Context) -> Result<(), BadGlyph> {
+    let static_metadata = context.static_metadata.get();
+    let decompose_all = context.flags.contains(Flags::DECOMPOSE_COMPONENTS);
+    let scope = static_metadata.misc.decompose_components.as_ref();
+    if !decompose_all && scope.is_none() {
+        return Ok(());
+    }
+    // like ufo2ft's filters, deepest composites first
+    let ordered = deepest_composites_first(context, &context.preliminary_glyph_order.get());
+    for glyph_name in ordered.iter() {
+        let glyph = context.get_glyph(glyph_name.clone());
+        if glyph.emit_to_binary
+            && !glyph.default_instance().components.is_empty()
+            && (decompose_all || scope.is_some_and(|scope| scope.contains(glyph_name)))
+        {
+            convert_components_to_contours(context, &glyph)?;
+        }
+    }
+    Ok(())
+}
+
 /// Run some optional transformations on the glyphs listed.
 ///
-/// This includes decomposing all components, or only those with non-identity
-/// 2x2 transforms, and flattening nested composite glyphs so that they all
-/// have depth 1 (no components that reference components).
+/// This includes decomposing components with non-identity 2x2 transforms, and
+/// flattening nested composite glyphs so that they all have depth 1 (no
+/// components that reference components).
 fn apply_optional_transformations(
     context: &Context,
     glyph_order: &GlyphOrder,
 ) -> Result<(), BadGlyph> {
     // like ufo2ft's filters, deepest composites first
     let ordered = deepest_composites_first(context, glyph_order);
-
-    // If we are decomposing all components, the rest of the flags can be ignored
-    if context.flags.contains(Flags::DECOMPOSE_COMPONENTS) {
-        for glyph_name in ordered.iter() {
-            let glyph = context.get_glyph(glyph_name.clone());
-            if !glyph.default_instance().components.is_empty() {
-                convert_components_to_contours(context, &glyph)?;
-            }
-        }
-        return Ok(());
-    }
 
     // If both --flatten-components and --decompose-transformed-components flags
     // are set, we want to decompose any transformed components first and *then*
@@ -827,6 +843,7 @@ impl Work<Context, WorkId, Error> for GlyphOrderWork {
             .build()
     }
 
+    #[tracing::instrument(name = "fontir::GlyphOrderWork::exec", skip_all)]
     fn exec(&self, context: &Context) -> Result<(), Error> {
         // We should now have access to *all* the glyph IR
         // Some of it may need to be massaged to produce BE glyphs
@@ -850,6 +867,8 @@ impl Work<Context, WorkId, Error> for GlyphOrderWork {
         // infers Base from anchors and prunes Ligature without anchors. When false (ufo2ft),
         // it just copies preliminary categories as-is.
         recompute_gdef_categories(context)?;
+
+        decompose_components(context)?;
 
         // then generate the final glyph order and do final glyph processing
         let arc_current = context.preliminary_glyph_order.get();
@@ -986,6 +1005,9 @@ fn recompute_gdef_categories(context: &Context) -> Result<(), Error> {
 
     for (_work_id, glyph) in context.glyphs.all() {
         let glyph_name = glyph.name.clone();
+        if preliminary.excluded.contains(&glyph_name) {
+            continue;
+        }
 
         // Check if this glyph has attaching anchors (non-underscore) in any location.
         // Attaching anchors are anything that is not Mark (e.g. Base, Ligature,
@@ -1039,8 +1061,9 @@ mod tests {
 
     use crate::{
         ir::{
-            AnchorBuilder, Component, GdefCategories, GlobalMetric, GlobalMetricsBuilder, Glyph,
-            GlyphBuilder, GlyphInstance, GlyphOrder, PreliminaryGdefCategories, StaticMetadata,
+            AnchorBuilder, Component, FilterScope, GdefCategories, GlobalMetric,
+            GlobalMetricsBuilder, Glyph, GlyphBuilder, GlyphInstance, GlyphOrder,
+            PreliminaryGdefCategories, StaticMetadata,
         },
         orchestration::{Context, Flags, WorkId},
     };
@@ -1107,9 +1130,7 @@ mod tests {
             false,
         )
         .unwrap();
-        // No ir_dir, we don't want to write anything down
-        let ctx =
-            Context::new_root(Flags::default(), None, None).copy_for_work(Access::All, Access::All);
+        let ctx = Context::new_root(Flags::default()).copy_for_work(Access::All, Access::All);
         ctx.static_metadata.set(meta);
         ctx
     }
@@ -1472,7 +1493,7 @@ mod tests {
         let mut outer = TestGlyph::new("outer");
         outer.add_component("mid", mid_to_outer);
 
-        let context = Context::new_root(Flags::DECOMPOSE_COMPONENTS, None, None)
+        let context = Context::new_root(Flags::DECOMPOSE_COMPONENTS)
             .copy_for_work(Access::All, Access::All);
         context
             .static_metadata
@@ -1694,6 +1715,35 @@ mod tests {
         // because the non-id 2x2 transform of the shallow_component would have
         // infected the deep_component and caused it to be decomposed.
         assert_is_flattened_component(&context, test_data.deep_component.name);
+    }
+
+    #[test]
+    fn decompose_components_filter_before_flattening() {
+        let test_data = deep_component();
+        let mut context = test_context();
+        context.flags.set(Flags::FLATTEN_COMPONENTS, true);
+        let mut meta = (*context.static_metadata.get()).clone();
+        meta.misc.decompose_components = Some(FilterScope::Include(
+            [test_data.shallow_component.name.clone()].into(),
+        ));
+        context.static_metadata.set(meta);
+        context.preliminary_glyph_order.set(test_data.glyph_order());
+        test_data.write_to(&context);
+
+        decompose_components(&context).unwrap();
+        apply_optional_transformations(&context, &test_data.glyph_order()).unwrap();
+
+        // the shallow_component is listed so it was converted to a simple glyph
+        assert_is_simple_glyph(&context, test_data.shallow_component.name.clone());
+        // the deep_component is not listed, and since the shallow_component is
+        // now simple, flattening leaves it referencing that rather than the
+        // shape the shallow_component used to reference
+        assert_is_flattened_component(&context, test_data.deep_component.name.clone());
+        let deep_component = context.get_glyph(test_data.deep_component.name);
+        assert_eq!(
+            deep_component.component_names().collect::<Vec<_>>(),
+            vec![&test_data.shallow_component.name]
+        );
     }
 
     trait AffineLike {
@@ -2130,7 +2180,7 @@ mod tests {
 
     #[test]
     fn non_export_component_has_intermediate_layer() {
-        let _ = env_logger::builder().is_test(true).try_init();
+        let _ = tracing_subscriber::fmt().with_test_writer().try_init();
         // https://github.com/googlefonts/fontc/issues/1592
         let [loc1, intermediate, loc2] = make_wght_locations([0.0, 0.5, 1.0]);
 
@@ -2232,7 +2282,7 @@ mod tests {
     // this tests that we also interpolate the component transform.
     #[test]
     fn nested_composite_with_intermediate_layer_not_present_in_component() {
-        let _ = env_logger::builder().is_test(true).try_init();
+        let _ = tracing_subscriber::fmt().with_test_writer().try_init();
         let [loc1, intermediate, loc2] = make_wght_locations([0.0, 0.5, 1.0]);
 
         let mut composite = TestGlyph::new("a");
@@ -2285,7 +2335,7 @@ mod tests {
     fn composite_with_intermediate_component_layer_and_another_nested_compoonent_without_intermediates()
      {
         // based on ecaron in Savate.glyphs
-        let _ = env_logger::builder().is_test(true).try_init();
+        let _ = tracing_subscriber::fmt().with_test_writer().try_init();
 
         let [loc1, intermediate, loc2] = make_wght_locations([0.0, 0.5, 1.0]);
         let mut ecaron = TestGlyph::new("ecaron");
@@ -2548,6 +2598,7 @@ mod tests {
                 categories: Default::default(),
                 infer_from_anchors: true,
                 mark_category_glyphs: Default::default(),
+                excluded: Default::default(),
             });
         ctx.gdef_categories.set(GdefCategories::default());
 

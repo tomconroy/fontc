@@ -89,12 +89,11 @@ pub(crate) fn build_cff2(context: &Context) -> Result<CffOutput, Error> {
         }
     }
 
-    // fontTools stops a region tent at the end of normalized space; fontc's
-    // usual model stops it at the most extreme master it can see. The two
-    // agree for the model over every master, but not for a sub-model over the
-    // masters one sparse glyph has — and CFF2 writes those tents into its
-    // variation store verbatim. So this path gets its own model.
-    let global_model = VariationModel::new_full_axis_ranges(locations, axis_order.clone());
+    // Region tents reach the end of normalized space, as in fontTools, not
+    // just the most extreme master a model can see. That matters for a
+    // sub-model over the masters one sparse glyph has, because CFF2 writes
+    // those tents into its variation store verbatim.
+    let global_model = VariationModel::new(locations, axis_order.clone());
     let masters: Vec<NormalizedLocation> = global_model.locations().cloned().collect();
     let default_index = masters
         .iter()
@@ -340,7 +339,7 @@ impl<'a> SubModels<'a> {
                     .filter(|(_, taking_part)| **taking_part)
                     .map(|(location, _)| location.clone())
                     .collect();
-                VariationModel::new_full_axis_ranges(locations, self.axis_order.clone())
+                VariationModel::new(locations, self.axis_order.clone())
             };
             self.cache.insert(mask.to_vec(), model);
         }
@@ -616,7 +615,7 @@ mod tests {
     /// A model over the given `wght` positions, built the way the CFF2 work
     /// builds one.
     fn model(positions: &[f64]) -> VariationModel {
-        VariationModel::new_full_axis_ranges(
+        VariationModel::new(
             positions.iter().copied().map(wght).collect::<HashSet<_>>(),
             vec![Tag::new(b"wght")],
         )

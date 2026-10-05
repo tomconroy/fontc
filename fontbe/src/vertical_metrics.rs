@@ -68,6 +68,7 @@ impl Work<Context, AnyWorkId, Error> for VerticalMetricsWork {
     /// * [vmtx](https://learn.microsoft.com/en-us/typography/opentype/spec/vmtx)
     /// * [vhea](https://learn.microsoft.com/en-us/typography/opentype/spec/vhea)
     /// * [VORG](https://learn.microsoft.com/en-us/typography/opentype/spec/vorg), for CFF builds
+    #[tracing::instrument(name = "fontbe::VerticalMetricsWork::exec", skip_all)]
     fn exec(&self, context: &Context) -> Result<(), Error> {
         let static_metadata = context.ir.static_metadata.get();
 
@@ -176,12 +177,10 @@ impl Work<Context, AnyWorkId, Error> for VerticalMetricsWork {
         context.vhea.set(vhea);
 
         let vmtx = Vmtx::new(metrics.long_metrics, metrics.first_side_bearings);
-        let raw_vmtx = dump_table(&vmtx)
-            .map_err(|e| Error::DumpTableError {
-                e,
-                context: "vmtx".into(),
-            })?
-            .into();
+        let raw_vmtx = dump_table(&vmtx).map_err(|e| Error::DumpTableError {
+            e,
+            context: "vmtx".into(),
+        })?;
         context.vmtx.set(raw_vmtx);
 
         if build_vorg && let Some(vorg) = build_vorg_table(&vertical_origins) {

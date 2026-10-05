@@ -1,8 +1,24 @@
 """Tests for ttx_diff.core."""
 
+import hashlib
+import json
+
+import pytest
 from lxml import etree
 
-from ttx_diff.core import strip_fontc_version_tag, unwrap_extension_lookups
+from ttx_diff.core import (
+    FONTC_TTF_HASH_FILE,
+    UNCHANGED_EXIT_CODE,
+    delete_things_we_must_rebuild,
+    failure_file,
+    hash_file,
+    jsonify_output,
+    load_fontmake_failure,
+    save_fontmake_failure,
+    strip_fontc_version_tag,
+    unwrap_extension_lookups,
+    write_hash_and_maybe_exit_early,
+)
 
 
 def _make_tree(xml_str):
@@ -144,3 +160,97 @@ def test_strip_keeps_non_stamp_fontc_note():
     want = _name_tree("Version 1.000;fontc is broken")
     strip_fontc_version_tag(got)
     assert etree.tostring(got) == etree.tostring(want)
+
+
+def test_hash_file_matches_hashlib(tmp_path):
+    font = tmp_path / "fontc.ttf"
+    font.write_bytes(b"not really a font" * 1000)
+    assert hash_file(font) == hashlib.sha256(font.read_bytes()).hexdigest()
+
+
+def test_write_hash_records_the_hash(tmp_path):
+    font = tmp_path / "fontc.ttf"
+    font.write_bytes(b"pretend this is a font")
+    write_hash_and_maybe_exit_early(font, tmp_path, None)
+    assert (tmp_path / FONTC_TTF_HASH_FILE).read_text() == hash_file(font)
+
+
+def test_write_hash_exits_when_the_hash_matches(tmp_path):
+    font = tmp_path / "fontc.ttf"
+    font.write_bytes(b"pretend this is a font")
+    with pytest.raises(SystemExit) as exit:
+        write_hash_and_maybe_exit_early(font, tmp_path, hash_file(font))
+    assert exit.value.code == UNCHANGED_EXIT_CODE
+
+
+def test_write_hash_continues_when_the_hash_differs(tmp_path):
+    font = tmp_path / "fontc.ttf"
+    font.write_bytes(b"pretend this is a font")
+    write_hash_and_maybe_exit_early(font, tmp_path, "0" * 64)
+    assert (tmp_path / FONTC_TTF_HASH_FILE).read_text() == hash_file(font)
+
+
+# fontc failing to build is not a result we can cache, so there is nothing to
+# record and nothing to skip
+def test_write_hash_is_a_noop_without_a_font(tmp_path):
+    write_hash_and_maybe_exit_early(tmp_path / "fontc.ttf", tmp_path, "0" * 64)
+    assert not (tmp_path / FONTC_TTF_HASH_FILE).exists()
+
+
+FONTMAKE_FAILURE = {"command": "fontmake -o variable", "stderr": "oh no"}
+
+
+def test_fontmake_failure_round_trip(tmp_path):
+    fontmake_ttf = tmp_path / "fontmake.ttf"
+    assert load_fontmake_failure(fontmake_ttf) is None
+    save_fontmake_failure(fontmake_ttf, FONTMAKE_FAILURE)
+    assert load_fontmake_failure(fontmake_ttf) == FONTMAKE_FAILURE
+
+
+@pytest.mark.parametrize(
+    "contents",
+    [
+        "{ not json",
+        "[1, 2]",
+        json.dumps({"command": "fontmake"}),
+        json.dumps({"command": "fontmake", "stderr": 1}),
+    ],
+)
+def test_malformed_fontmake_failure_is_ignored(tmp_path, contents):
+    fontmake_ttf = tmp_path / "fontmake.ttf"
+    failure_file(fontmake_ttf).write_text(contents)
+    assert load_fontmake_failure(fontmake_ttf) is None
+
+
+# fontc_crater relies on --rebuild fontc keeping the failure alongside the
+# other fontmake files it copies in
+def test_rebuild_treats_the_failure_like_fontmake_output(tmp_path):
+    fontmake_ttf = tmp_path / "fontmake.ttf"
+    fontc_ttf = tmp_path / "fontc.ttf"
+    save_fontmake_failure(fontmake_ttf, FONTMAKE_FAILURE)
+    delete_things_we_must_rebuild("fontc", fontmake_ttf, fontc_ttf)
+    assert load_fontmake_failure(fontmake_ttf) == FONTMAKE_FAILURE
+    delete_things_we_must_rebuild("fontmake", fontmake_ttf, fontc_ttf)
+    assert load_fontmake_failure(fontmake_ttf) is None
+
+
+def test_jsonify_output_weights_by_line_count():
+    # two tables with the same number of lines but very different line
+    # lengths must contribute equally to the overall score
+    long_lines = "\n".join(["x" * 100] * 10).encode()
+    short_lines = "\n".join(["y"] * 10).encode()
+    fontc = {"long": long_lines, "short": short_lines}
+    fontmake = {"long": long_lines, "short": "\n".join(["z"] * 10).encode()}
+    out = jsonify_output({"fontc": fontc, "fontmake": fontmake})["success"]
+    assert out["short"] == 0.0
+    assert out["total"] == pytest.approx(0.5)
+
+
+def test_jsonify_output_missing_table_counts_lines():
+    long_lines = "\n".join(["x" * 100] * 10).encode()
+    short_lines = "\n".join(["y"] * 10).encode()
+    fontc = {"same": short_lines}
+    fontmake = {"same": short_lines, "extra": long_lines}
+    out = jsonify_output({"fontc": fontc, "fontmake": fontmake})["success"]
+    assert out["extra"] == "fontmake"
+    assert out["total"] == pytest.approx(0.5)

@@ -14,18 +14,24 @@ smol_str = { version = "0.3.0", features = ["serde"] }
 regex = "1.7.1"
 thiserror = "2.0"
 log = "0.4"
-env_logger = "0.11.0"
+# attributes allows us to use the #instrument #[instrument()] macro.
+tracing = { version = "0.1", features = ["attributes"] }
+tracing-chrome = "0.7.2"
+tracing-log = "0.2"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 parking_lot = "0.12.1"
 # "string" lets us pass a runtime-built version string to #[command(version = ...)]
 clap = { version = "4.0.32", features = ["derive", "string"] }
 rayon = "1.6"
-icu_properties = "=2.1"
+# unicode18.rs contains deltas against this exact version's baked data.
+icu_properties = "=2.1.2"
 smallvec = {version = "1.15", features = ["const_new"]}
 unicode-normalization = "0.1.25"
+tinystr = "0.8.0"
 
 # fontations etc
-write-fonts = { version = "0.51.0", features = ["serde", "read"] }
-skrifa = { version = "0.45.1", features = ["traversal"] }
+write-fonts = { version = "0.53.0", features = ["serde", "read", "tables"]  }
+skrifa = { version = "0.47.0" }
 norad = { version = "0.18.4", default-features = false }
 
 # dev dependencies
@@ -58,10 +64,10 @@ members = [
 # Local fontations override while CFF writing is unreleased; drop once
 # write-fonts with ps::cff::v1 is published.
 [patch.crates-io]
-font-types = { git = "https://github.com/tomconroy/fontations.git", rev = "668202b5" }
-read-fonts = { git = "https://github.com/tomconroy/fontations.git", rev = "668202b5" }
-write-fonts = { git = "https://github.com/tomconroy/fontations.git", rev = "668202b5" }
-skrifa = { git = "https://github.com/tomconroy/fontations.git", rev = "668202b5" }
+font-types = { git = "https://github.com/tomconroy/fontations.git", rev = "d2f1d740" }
+read-fonts = { git = "https://github.com/tomconroy/fontations.git", rev = "d2f1d740" }
+write-fonts = { git = "https://github.com/tomconroy/fontations.git", rev = "d2f1d740" }
+skrifa = { git = "https://github.com/tomconroy/fontations.git", rev = "d2f1d740" }
 # norad with linebender/norad#414 (empty guideline names); drop once norad
 # ships a release past 0.18.4.
 norad = { git = "https://github.com/linebender/norad.git", rev = "1c8ac19b1a1a4d21bb27d72161b63043cd42cc52" }

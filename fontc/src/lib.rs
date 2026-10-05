@@ -4,7 +4,6 @@ mod error;
 mod instance;
 #[cfg(not(feature = "rayon"))]
 mod norayon;
-mod timing;
 mod version;
 pub mod work;
 mod workload;
@@ -15,11 +14,9 @@ pub use fontir::instance::InstanceSpec; // Re-export for library users
 pub use fontir::orchestration::Flags; // Re-export for library users
 use fontra2fontir::source::FontraIrSource;
 use glyphs2fontir::source::GlyphsIrSource;
-pub use timing::JobTimer;
 use ufo2fontir::source::DesignSpaceIrSource;
 use workload::Workload;
 
-use fontbe::orchestration::AnyWorkId;
 use std::{
     ffi::OsStr,
     fs,
@@ -69,6 +66,7 @@ impl Input {
     }
 
     /// Creates the implementation of [`Source`] to feed to fontir.
+    #[tracing::instrument(skip_all)]
     pub fn create_source(&self) -> Result<Box<dyn Source>, Error> {
         match self {
             Input::DesignSpacePath(path) => Ok(Box::new(DesignSpaceIrSource::new(path)?)),
@@ -145,8 +143,6 @@ pub struct Options {
     pub skip_features: bool,
     pub compile_debg: bool,
     pub output_file: Option<PathBuf>,
-    pub timing_file: Option<PathBuf>,
-    pub ir_dir: Option<PathBuf>,
     pub debug_dir: Option<PathBuf>,
     /// Compile one static instance of a variable source instead of the
     /// variable font.
@@ -164,35 +160,15 @@ pub struct Options {
 ///
 /// Returns [`Error::NoOutputFile`] if `options.output_file` is `None`.
 #[cfg(feature = "cli")]
-pub fn run(input: Input, options: Options, mut timer: JobTimer) -> Result<(), Error> {
+#[tracing::instrument(skip_all)]
+pub fn run(input: Input, options: Options) -> Result<(), Error> {
     if options.output_file.is_none() {
         return Err(Error::NoOutputFile);
     }
 
-    let time = timer
-        .create_timer(AnyWorkId::InternalTiming("create_source"), 0)
-        .run();
     let source = input.create_source()?;
-    timer.add(time.complete());
 
-    let (_fe_root, be_root, mut timer) = generate_font_internal(source, &options, timer)?;
-
-    if let Some(timing_file) = options.timing_file.as_ref() {
-        let out_file = std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(timing_file)
-            .map_err(|source| Error::FileIo {
-                path: timing_file.clone(),
-                source,
-            })?;
-        let mut buf = std::io::BufWriter::new(out_file);
-        timer.write_svg(&mut buf).map_err(|source| Error::FileIo {
-            path: timing_file.clone(),
-            source,
-        })?;
-    }
+    let (_fe_root, be_root) = generate_font_internal(source, &options)?;
 
     // At long last!
     write_font_file(&options, &be_root)
@@ -213,43 +189,35 @@ fn merge_compilation_flags(options: &Options, source: &dyn Source) -> Flags {
 /// This is the library entry point to fontc.
 /// The font is returned as bytes and `output_file` is ignored.
 pub fn generate_font(source: Box<dyn Source>, options: Options) -> Result<Vec<u8>, Error> {
-    let (_fe_root, be_root, _timer) =
-        generate_font_internal(source, &options, JobTimer::default())?;
-    Ok(be_root.font.get().get().to_vec())
+    let (_fe_root, be_root) = generate_font_internal(source, &options)?;
+    Ok(be_root.font.get().to_vec())
 }
 
 fn generate_font_internal(
     source: Box<dyn Source>,
     options: &Options,
-    mut timer: JobTimer,
-) -> Result<(FeContext, BeContext, JobTimer), Error> {
+) -> Result<(FeContext, BeContext), Error> {
     debug!("Running with options {options:#?}");
-    let time = timer
-        .create_timer(AnyWorkId::InternalTiming("Init config"), 0)
-        .run();
     init_paths(options)?;
-    timer.add(time.complete());
 
     let flags = merge_compilation_flags(options, &*source);
 
     let workload = Workload::new(
         source,
-        timer,
         options.skip_features,
         flags,
         options.instance.clone(),
     )?;
-    let fe_root = FeContext::new_root(flags, options.instance.clone(), options.ir_dir.clone());
+    let fe_root = FeContext::new_root_for_instance(flags, options.instance.clone());
     let be_root = BeContext::new_root(
         flags,
         Some(version().into()),
-        options.ir_dir.clone(),
         options.debug_dir.clone(),
         options.compile_debg,
         &fe_root,
     );
-    let timer = workload.exec(&fe_root, &be_root)?;
-    Ok((fe_root, be_root, timer))
+    workload.exec(&fe_root, &be_root)?;
+    Ok((fe_root, be_root))
 }
 
 pub fn require_dir(dir: &Path) -> Result<(), Error> {
@@ -280,46 +248,22 @@ pub fn init_paths(options: &Options) -> Result<(), Error> {
         require_dir(parent)?;
     }
 
-    if let Some(ir_dir) = options.ir_dir.as_ref() {
-        require_dir(&fontir::paths::Paths::anchor_ir_dir(ir_dir))?;
-        require_dir(&fontir::paths::Paths::glyph_ir_dir(ir_dir))?;
-        require_dir(&fontbe::paths::Paths::glyph_dir(ir_dir))?;
-    }
     if let Some(debug_dir) = options.debug_dir.as_ref() {
         require_dir(debug_dir)?;
     }
     Ok(())
 }
 
+#[tracing::instrument(skip_all)]
 pub fn write_font_file(options: &Options, be_context: &BeContext) -> Result<(), Error> {
     // Not much to do if no output file is desired
     let Some(output_file) = options.output_file.as_ref() else {
         return Ok(());
     };
-    let ir_font_path = options
-        .ir_dir
-        .as_ref()
-        .map(|d| fontbe::paths::Paths::target_file(d, &fontbe::orchestration::WorkId::Font));
-    match ir_font_path {
-        Some(ref ir_path) if ir_path != output_file => {
-            // IR enabled with custom output path: move from IR location
-            fs::rename(ir_path, output_file).map_err(|source| Error::FileIo {
-                path: output_file.clone(),
-                source,
-            })?;
-        }
-        None => {
-            // No IR: write from memory
-            fs::write(output_file, be_context.font.get().get()).map_err(|source| {
-                Error::FileIo {
-                    path: output_file.clone(),
-                    source,
-                }
-            })?;
-        }
-        _ => {} // IR path == output_file, already written by persistence
-    }
-    Ok(())
+    fs::write(output_file, &*be_context.font.get()).map_err(|source| Error::FileIo {
+        path: output_file.clone(),
+        source,
+    })
 }
 
 #[cfg(test)]
@@ -339,27 +283,23 @@ pub fn testdata_dir() -> std::path::PathBuf {
 mod tests {
 
     use std::{
-        collections::{BTreeMap, HashMap, HashSet, VecDeque},
-        fs::{self, File},
-        io::Read,
+        collections::{BTreeMap, HashMap, HashSet},
+        fs,
         path::Path,
         sync::Arc,
     };
 
     use chrono::{Duration, TimeZone, Utc};
-    use fontbe::orchestration::{
-        AnyWorkId, Context as BeContext, Glyph, LocaFormatWrapper, WorkId as BeWorkIdentifier,
-    };
+    use fontbe::orchestration::{AnyWorkId, Context as BeContext, WorkId as BeWorkIdentifier};
     use fontdrasil::{
         coords::{NormalizedCoord, NormalizedLocation},
         orchestration::Access,
-        paths::string_to_filename,
         types::{GlyphName, WidthClass},
         variations::{Tent, VariationRegion},
     };
     use fontir::{
         ir::{self, GlobalMetric, GlyphOrder, KernGroup, KernPair, KernSide},
-        orchestration::{Context as FeContext, Persistable, WorkId as FeWorkIdentifier},
+        orchestration::{Context as FeContext, WorkId as FeWorkIdentifier},
     };
     use kurbo::{Point, Rect};
     use log::info;
@@ -378,7 +318,7 @@ mod tests {
                 cpal::ColorRecord,
                 gasp::GaspRangeBehavior,
                 glyf::{self, CompositeGlyph, CurvePoint, Glyf},
-                gpos::{AnchorTable, Gpos, MarkBasePosFormat1, PositionLookup},
+                gpos::{AnchorTable, Gpos, MarkBasePosFormat1, PositionLookup, SinglePos},
                 gsub::{SingleSubst, SubstitutionLookup},
                 hmtx::Hmtx,
                 layout::FeatureParams,
@@ -396,7 +336,7 @@ mod tests {
             loca::LocaFormat,
             meta::{DataMapRecord, Metadata, ScriptLangTag},
         },
-        types::{F2Dot14, GlyphId, GlyphId16, NameId, Tag},
+        types::{F2Dot14, GlyphId, GlyphId16, NameId, Tag, Version16Dot16},
     };
 
     use super::*;
@@ -419,7 +359,6 @@ mod tests {
         fn for_test(build_dir: &Path) -> Options {
             Options {
                 output_file: Some(build_dir.join("font.ttf")),
-                ir_dir: Some(build_dir.to_path_buf()),
                 ..Default::default()
             }
         }
@@ -427,8 +366,7 @@ mod tests {
 
     impl TestCompile {
         fn new(source_file: &str, adjust_options: impl Fn(Options) -> Options) -> TestCompile {
-            let timer = JobTimer::new();
-            let _ = env_logger::builder().is_test(true).try_init();
+            let _ = tracing_subscriber::fmt().with_test_writer().try_init();
 
             let temp_dir = tempdir().unwrap();
             let options = adjust_options(Options::for_test(temp_dir.path()));
@@ -441,19 +379,16 @@ mod tests {
 
             init_paths(&options).unwrap();
 
-            let fe_context =
-                FeContext::new_root(flags, options.instance.clone(), options.ir_dir.clone());
+            let fe_context = FeContext::new_root_for_instance(flags, options.instance.clone());
             let be_context = BeContext::new_root(
                 flags,
                 Some(crate::version().into()),
-                options.ir_dir.clone(),
                 options.debug_dir.clone(),
                 options.compile_debg,
                 &fe_context.read_only(),
             );
             let workload = Workload::new(
                 source,
-                timer,
                 options.skip_features,
                 flags,
                 options.instance.clone(),
@@ -474,17 +409,28 @@ mod tests {
         fn run(&mut self) {
             let completed = self
                 .workload
-                .run_for_test(&self.fe_context, &self.be_context);
+                .run_for_test(&self.fe_context, &self.be_context)
+                .expect("compile failed");
 
             self.work_executed = completed;
 
             write_font_file(&self.options, &self.be_context).unwrap();
 
-            self.raw_font = self.be_context.font.get().get().to_vec();
+            self.raw_font = self.be_context.font.get().to_vec();
         }
 
         fn compile_source(source: &str) -> TestCompile {
             TestCompile::compile(source, |options| options)
+        }
+
+        /// Run a compile we expect to fail, and return the error
+        ///
+        /// Unlike [`TestCompile::run`] this leaves the contexts intact, so the
+        /// state we got to before failing can be inspected.
+        fn run_expect_err(&mut self) -> Error {
+            self.workload
+                .run_for_test(&self.fe_context, &self.be_context)
+                .expect_err("compile should have failed")
         }
 
         fn compile(source: &str, adjust_options: impl Fn(Options) -> Options) -> TestCompile {
@@ -520,7 +466,11 @@ mod tests {
         }
 
         fn glyphs(&self) -> Glyphs {
-            Glyphs::new(self.temp.path())
+            Glyphs {
+                loca_format: *self.be_context.loca_format.get(),
+                raw_glyf: self.be_context.glyf.get().to_vec(),
+                raw_loca: self.be_context.loca.get().to_vec(),
+            }
         }
 
         fn font(&self) -> FontRef<'_> {
@@ -528,20 +478,12 @@ mod tests {
         }
 
         fn read_be_glyph(&self, name: &str) -> RawGlyph {
-            let raw_glyph = read_file(
-                self.temp.path(),
-                &Path::new("glyphs").join(string_to_filename(name, ".glyf")),
-            );
-            let read: &mut dyn Read = &mut raw_glyph.as_slice();
-            Glyph::read(read).data
+            let id = AnyWorkId::Be(BeWorkIdentifier::GlyfFragment(name.into()));
+            self.be_context.glyphs.get(&id).data.clone()
         }
 
         fn read_ir_glyph(&self, name: &str) -> ir::Glyph {
-            let raw_glyph = read_file(
-                self.temp.path(),
-                &Path::new("glyph_ir").join(string_to_filename(name, ".yml")),
-            );
-            ir::Glyph::read(&mut raw_glyph.as_slice())
+            (*self.fe_context.get_glyph(name)).clone()
         }
     }
 
@@ -552,17 +494,6 @@ mod tests {
     }
 
     impl Glyphs {
-        fn new(build_dir: &Path) -> Self {
-            Glyphs {
-                loca_format: LocaFormatWrapper::read(
-                    &mut File::open(build_dir.join("loca.format")).unwrap(),
-                )
-                .into(),
-                raw_glyf: read_file(build_dir, Path::new("glyf.table")),
-                raw_loca: read_file(build_dir, Path::new("loca.table")),
-            }
-        }
-
         fn read(&self) -> Vec<Option<glyf::Glyph<'_>>> {
             let glyf = Glyf::read(FontData::new(&self.raw_glyf)).unwrap();
             let loca = Loca::read(
@@ -594,7 +525,7 @@ mod tests {
             FeWorkIdentifier::KernInstance(NormalizedLocation::for_pos(&[("wght", 0.0)])).into(),
             FeWorkIdentifier::KernInstance(NormalizedLocation::for_pos(&[("wght", 1.0)])).into(),
             BeWorkIdentifier::Features.into(),
-            BeWorkIdentifier::FeaturesAst.into(),
+            BeWorkIdentifier::DEFAULT_FEATURES_AST.into(),
             BeWorkIdentifier::Avar.into(),
             BeWorkIdentifier::Cmap.into(),
             BeWorkIdentifier::Colr.into(),
@@ -694,7 +625,9 @@ mod tests {
         let gsub = font.gsub();
         assert!(
             gpos.is_ok() && gsub.is_ok(),
-            "\ngpos: {gpos:?}\ngsub: {gsub:?}"
+            "\ngpos: {:?}\ngsub: {:?}",
+            gpos.err(),
+            gsub.err()
         );
 
         result
@@ -714,31 +647,133 @@ mod tests {
         assert_compiles_with_gpos_and_gsub("fea_include_resolve.designspace", |o| o);
     }
 
+    // The strongest check we have on the merge: two masters with their own
+    // features.fea must produce exactly what one features.fea written in
+    // variable syntax produces.
     #[test]
-    fn compile_fea_of_the_default_master_when_masters_disagree() {
-        // ufo2ft compiles exactly one feature file into a variable font, the
-        // default master's (VariableFeatureCompiler is handed
-        // designSpaceDoc.findDefault()); masters that disagree are not an
-        // error. fea_differ's default master (Regular, deliberately the second
-        // source) has 'liga'; the other master has 'dlig'.
-        let result = TestCompile::compile_source("fea_differ.designspace");
-        let gsub = result.font().gsub().unwrap();
-        let features = gsub.feature_list().unwrap();
-        let tags = features
-            .feature_records()
-            .iter()
-            .map(|rec| rec.feature_tag())
-            .collect::<Vec<_>>();
-        assert_eq!(vec![Tag::new(b"liga")], tags);
+    fn masters_whose_gsub_disagrees_are_rejected() {
+        // fontmake compiles each master's features and has varLib merge them,
+        // which fails when the masters' GSUB differs. fea_differ's default
+        // master (Regular, deliberately the second source) has 'liga'; the
+        // other master has 'dlig'.
+        let mut result = TestCompile::new("fea_differ.designspace", |options| options);
+        let error = result.run_expect_err();
+        let Error::Backend(fontbe::error::Error::FeaMergeError(_)) = &error else {
+            panic!("expected a merge error, got {error:?}");
+        };
     }
 
     #[test]
-    fn compile_fea_with_includes_no_ir() {
-        assert_compiles_with_gpos_and_gsub("fea_include.designspace", |mut args| {
-            args.ir_dir = None;
-            args.debug_dir = None;
-            args
-        });
+    fn merged_fea_matches_variable_syntax_fea() {
+        let merged = TestCompile::compile_source("variable_fea/VarFea.designspace");
+        let one_shot = TestCompile::compile_source("variable_fea/VarFeaOneShot.designspace");
+
+        for tag in [Tag::new(b"GPOS"), Tag::new(b"GDEF")] {
+            let merged = merged.font().table_data(tag).map(|d| d.as_bytes().to_vec());
+            let one_shot = one_shot
+                .font()
+                .table_data(tag)
+                .map(|d| d.as_bytes().to_vec());
+            assert!(merged.is_some(), "{tag} should be present");
+            assert_eq!(merged, one_shot, "{tag} differs from the one-shot compile");
+        }
+    }
+
+    // A point axis is not in the variation model, so it must not stop us from
+    // recognizing the default master's FEA.
+    #[test]
+    fn merged_fea_with_point_axis() {
+        let point_axis = TestCompile::compile_source("variable_fea/VarFeaPointAxis.designspace");
+        let no_point_axis = TestCompile::compile_source("variable_fea/VarFea.designspace");
+
+        for tag in [Tag::new(b"GPOS"), Tag::new(b"GDEF")] {
+            let point_axis = point_axis
+                .font()
+                .table_data(tag)
+                .map(|d| d.as_bytes().to_vec());
+            let no_point_axis = no_point_axis
+                .font()
+                .table_data(tag)
+                .map(|d| d.as_bytes().to_vec());
+            assert!(point_axis.is_some(), "{tag} should be present");
+            assert_eq!(
+                point_axis, no_point_axis,
+                "{tag} differs from the compile without a point axis"
+            );
+        }
+    }
+
+    #[test]
+    fn masters_with_unmergeable_fea_are_rejected() {
+        // GSUB cannot vary: only the GsubBold master has a liga feature, so
+        // there is nothing sensible to merge and the BE must say so.
+        let mut result =
+            TestCompile::new("variable_fea/VarFeaGsubMismatch.designspace", |options| {
+                options
+            });
+        let error = result.run_expect_err();
+        let Error::Backend(fontbe::error::Error::FeaMergeError(merge_error)) = &error else {
+            panic!("expected a merge error, got {error:?}");
+        };
+        assert_eq!(
+            merge_error.to_string(),
+            "master 1: GSUB lookups differ from the default master"
+        );
+    }
+
+    #[test]
+    fn masters_with_differing_fea_are_merged() {
+        // Regular has `pos A <10 0 20 0>`, Bold `pos A <30 0 40 0>`; each is
+        // compiled by its own job and the two are merged into one variable
+        // single positioning lookup.
+        let result = TestCompile::compile_source("variable_fea/VarFea.designspace");
+
+        // both masters' fea got compiled, in their own jobs
+        let mut compiled = result
+            .be_context
+            .fea_asts
+            .all()
+            .iter()
+            .map(|(id, ast)| {
+                assert_eq!(*id, BeWorkIdentifier::FeaturesAst(ast.idx).into());
+                ast.idx
+            })
+            .collect::<Vec<_>>();
+        compiled.sort();
+        assert_eq!(compiled, vec![0, 1]);
+
+        let font = result.font();
+        let gpos = font.gpos().unwrap();
+        let lookup = gpos.lookup_list().unwrap().lookups().get(0).unwrap();
+        let PositionLookup::Single(lookup) = lookup else {
+            panic!("expected a single positioning lookup");
+        };
+        let SinglePos::Format1(single) = lookup.subtables().get(0).unwrap() else {
+            panic!("expected SinglePosFormat1");
+        };
+        let value = single.value_record();
+
+        // the default master's values, with a device table pointing at deltas
+        assert_eq!(value.x_placement(), Some(10));
+        assert_eq!(value.x_advance(), Some(20));
+        assert!(
+            value.x_placement_device().is_some() && value.x_advance_device().is_some(),
+            "both varying fields should carry a VariationIndex"
+        );
+
+        // Bold is +20 on both fields, so one shared delta set of 20
+        let ivs = font
+            .gdef()
+            .unwrap()
+            .item_var_store()
+            .expect("merged GPOS needs an ItemVariationStore")
+            .unwrap();
+        let deltas = ivs
+            .item_variation_data()
+            .iter()
+            .flat_map(|data| delta_sets(&data.unwrap().unwrap()))
+            .collect::<Vec<_>>();
+        assert_eq!(deltas, vec![vec![20]]);
     }
 
     #[test]
@@ -790,29 +825,6 @@ mod tests {
 
         assert_eq!(1, glyph.sources().len());
         (result, (*glyph).clone())
-    }
-
-    fn read_file(build_dir: &Path, path: &Path) -> Vec<u8> {
-        assert!(build_dir.is_dir(), "{build_dir:?} isn't a directory?!");
-        let path = build_dir.join(path);
-        if !path.exists() {
-            // When a path is missing it's very helpful to know what's present
-            use std::io::Write;
-            let mut stderr = std::io::stderr().lock();
-            writeln!(stderr, "Build dir tree").unwrap();
-            let mut pending = VecDeque::new();
-            pending.push_back(build_dir);
-            while let Some(pending_dir) = pending.pop_front() {
-                for entry in fs::read_dir(pending_dir).unwrap() {
-                    let entry = entry.unwrap();
-                    writeln!(stderr, "{}", entry.path().to_str().unwrap()).unwrap();
-                }
-            }
-        }
-        assert!(path.exists(), "{path:?} not found");
-        let mut buf = Vec::new();
-        File::open(path).unwrap().read_to_end(&mut buf).unwrap();
-        buf
     }
 
     #[test]
@@ -1014,7 +1026,7 @@ mod tests {
         // the glyph 'O' contains several quad splines
         let uppercase_o = &glyphs[result.get_glyph_index("O").unwrap() as usize];
         let Some(glyf::Glyph::Simple(glyph)) = uppercase_o else {
-            panic!("Expected 'O' to be a simple glyph, got {uppercase_o:?}");
+            panic!("Expected 'O' to be a simple glyph");
         };
         assert_eq!(2, glyph.number_of_contours());
         assert_eq!(35, glyph.num_points());
@@ -1073,7 +1085,7 @@ mod tests {
         let glyph_data = result.glyphs();
         let glyphs = glyph_data.read();
         let Some(glyf::Glyph::Composite(glyph)) = &glyphs[non_uniform_scale_idx as usize] else {
-            panic!("Expected a composite\n{glyphs:#?}");
+            panic!("Expected a composite");
         };
         let component = glyph.components().next().unwrap();
         assert_eq!(period_idx, component.glyph.to_u16() as u32);
@@ -1113,7 +1125,7 @@ mod tests {
         let glyph_data = result.glyphs();
         let glyphs = glyph_data.read();
         let Some(glyf::Glyph::Composite(glyph)) = &glyphs[gid as usize] else {
-            panic!("Expected a composite\n{glyphs:#?}");
+            panic!("Expected a composite");
         };
 
         let components: Vec<_> = glyph.components().collect();
@@ -1143,14 +1155,14 @@ mod tests {
         let Some(glyf::Glyph::Simple(..)) =
             &glyphs[result.get_glyph_index("simple_transform_again").unwrap() as usize]
         else {
-            panic!("Expected a simple glyph\n{glyphs:#?}");
+            panic!("Expected a simple glyph");
         };
 
         // Identity 2x2, should be left as a component
         let Some(glyf::Glyph::Composite(..)) =
             &glyphs[result.get_glyph_index("translate_only").unwrap() as usize]
         else {
-            panic!("Expected a composite glyph\n{glyphs:#?}");
+            panic!("Expected a composite glyph");
         };
     }
 
@@ -1168,6 +1180,50 @@ mod tests {
                 panic!("Expected a simple glyph at index {i}");
             };
         }
+    }
+
+    #[test]
+    fn decompose_components_filter_include_list() {
+        let temp_dir = copy_source("HVVAR/SingleModel_Direct");
+        let mut src = temp_dir.path().to_path_buf();
+
+        let lib_file = src.join("SingleModelDirect-Regular.ufo/lib.plist");
+        let lib = fs::read_to_string(&lib_file).unwrap().replacen(
+            "<dict>",
+            r#"<dict>
+    <key>com.github.googlei18n.ufo2ft.filters</key>
+    <array>
+      <dict>
+        <key>name</key>
+        <string>decomposeComponents</string>
+        <key>pre</key>
+        <true/>
+        <key>include</key>
+        <array>
+          <string>Aacute</string>
+        </array>
+      </dict>
+      <dict>
+        <key>name</key>
+        <string>flattenComponents</string>
+      </dict>
+    </array>"#,
+            1,
+        );
+        fs::write(&lib_file, lib).unwrap();
+
+        src.push("SingleModelDirect.designspace");
+        let mut result = TestCompile::new(src.to_str().unwrap(), |o| o);
+        result.run();
+
+        assert!(
+            matches!(result.read_be_glyph("Aacute"), RawGlyph::Simple(_)),
+            "Aacute is in the include list and should be decomposed"
+        );
+        assert!(
+            matches!(result.read_be_glyph("Agrave"), RawGlyph::Composite(_)),
+            "Agrave is not in the include list and should stay a composite"
+        );
     }
 
     #[test]
@@ -1221,6 +1277,69 @@ mod tests {
         }
     }
 
+    // (codepoint, selector, glyph name or None for the default glyph), in subtable order
+    fn variant_mappings(result: &TestCompile) -> Vec<(u32, u32, Option<GlyphName>)> {
+        use write_fonts::read::tables::cmap::MapVariant;
+        let font = result.font();
+        font.charmap()
+            .variant_mappings()
+            .map(|(codepoint, selector, variant)| {
+                let name = match variant {
+                    MapVariant::UseDefault => None,
+                    MapVariant::Variant(gid) => {
+                        Some(result.get_glyph_name(gid.try_into().unwrap()).unwrap())
+                    }
+                };
+                (codepoint, selector, name)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn cmap_format_14_from_ufo_lib() {
+        let result = TestCompile::compile_source("UnicodeVariationSequences.ufo");
+        assert_eq!(
+            variant_mappings(&result),
+            vec![
+                (0x7C, 0xFE00, Some("bar.uv001".into())),
+                (0x1F170, 0xFE0E, Some("u1F170.text".into())),
+                (0x2B, 0xFE0F, None),
+                (0x7C, 0xFE0F, None),
+                (0x1F170, 0xFE0F, None),
+                (0x20, 0xE0100, None),
+            ]
+        );
+        // the base mappings are unaffected
+        let font = result.font();
+        let charmap = font.charmap();
+        assert_eq!(
+            [0x20u32, 0x2B, 0x7C, 0x1F170].map(|cp| charmap.map(cp).map(|gid| gid.to_u32())),
+            [Some(1), Some(3), Some(2), Some(5)]
+        );
+    }
+
+    #[test]
+    fn cmap_format_14_from_glyph_names() {
+        let result = TestCompile::compile_source("glyphs3/UnicodeVariationSequences.glyphs");
+        assert_eq!(
+            variant_mappings(&result),
+            vec![
+                (0x61, 0xFE00, Some("a.uv001".into())),
+                (0x62, 0xFE0F, Some("b.uv016".into())),
+                (0x61, 0xE0100, Some("a.uv017".into())),
+            ]
+        );
+    }
+
+    #[test]
+    fn no_cmap_format_14_without_sequences() {
+        let result = TestCompile::compile_source("glyphs2/Component.glyphs");
+        assert!(variant_mappings(&result).is_empty());
+        let raw_cmap = dump_table(result.be_context.cmap.get().as_ref()).unwrap();
+        let cmap = Cmap::read(FontData::new(&raw_cmap)).unwrap();
+        assert!(cmap.encoding_records().iter().all(|r| r.encoding_id() != 5));
+    }
+
     /// When instances disagree on codepoints, we use the default master's codepoints.
     /// This must not produce a cmap conflict (duplicate mappings or missing entries).
     #[test]
@@ -1249,7 +1368,7 @@ mod tests {
         let result = TestCompile::compile_source("glyphs2/NotDef.glyphs");
 
         let raw_hmtx = result.be_context.hmtx.get();
-        let hmtx = Hmtx::read_with_args(FontData::new(raw_hmtx.get()), 1).unwrap();
+        let hmtx = Hmtx::read(FontData::new(&raw_hmtx), 1).unwrap();
         assert_eq!(
             vec![(600, 250)],
             hmtx.h_metrics()
@@ -1277,8 +1396,7 @@ mod tests {
         assert_eq!(Some(1), maxp.max_contours);
 
         let raw_hmtx = result.be_context.hmtx.get();
-        let hmtx =
-            Hmtx::read_with_args(FontData::new(raw_hmtx.get()), hhea.number_of_h_metrics).unwrap();
+        let hmtx = Hmtx::read(FontData::new(&raw_hmtx), hhea.number_of_h_metrics).unwrap();
         assert_eq!(
             vec![(425, 175)],
             hmtx.h_metrics()
@@ -1573,11 +1691,8 @@ mod tests {
     }
 
     #[test]
-    fn compile_without_ir() {
-        let result = TestCompile::compile("glyphs2/WghtVar.glyphs", |mut args| {
-            args.ir_dir = None;
-            args
-        });
+    fn compile_writes_only_the_font() {
+        let result = TestCompile::compile_source("glyphs2/WghtVar.glyphs");
 
         let outputs = fs::read_dir(result.temp.path())
             .unwrap()
@@ -1994,6 +2109,54 @@ mod tests {
         assert_eq!(categories.get(".notdef"), None);
     }
 
+    // The glyphs split from color layers keep the parent's attaching anchors but
+    // glyphsLib never classifies them: it builds public.openTypeCategories before
+    // creating them. https://github.com/googlefonts/fontc/issues/1870
+    #[test]
+    fn color_layer_glyphs_get_no_gdef_class() {
+        for source in [
+            "glyphs3/COLRv0-2layers.glyphs",
+            "glyphs3/COLRv1-manyshapes-per-glyph.glyphs",
+        ] {
+            let result = TestCompile::compile_source(source);
+            let categories = &result.fe_context.gdef_categories.get().categories;
+            assert_eq!(categories.get("A"), Some(&GlyphClassDef::Base), "{source}");
+            assert_eq!(categories.get("A.color0"), None, "{source}");
+            assert_eq!(categories.get("A.color1"), None, "{source}");
+        }
+
+        let result = TestCompile::compile_source("glyphs3/COLRv0-marks.glyphs");
+        let categories = &result.fe_context.gdef_categories.get().categories;
+        for mark in ["circumflexcomb", "mymark", "mymark2"] {
+            assert_eq!(categories.get(mark), Some(&GlyphClassDef::Mark), "{mark}");
+            assert_eq!(categories.get(format!("{mark}.color0").as_str()), None);
+        }
+    }
+
+    // Glyphs.app zeroes the advance of a nonspacing mark's color layer glyphs
+    #[test]
+    fn colr0_mark_layer_glyphs_have_zero_advance() {
+        let result = TestCompile::compile_source("glyphs3/COLRv0-marks.glyphs");
+        let width = |name: &str| {
+            result
+                .fe_context
+                .glyphs
+                .get(&FeWorkIdentifier::Glyph(name.into()))
+                .default_instance()
+                .width
+        };
+        for (name, expected) in [
+            ("circumflexcomb", 0.0),
+            ("circumflexcomb.color0", 0.0),
+            ("mymark", 0.0),
+            ("mymark.color0", 0.0),
+            ("mymark2", 0.0),
+            ("mymark2.color0", 0.0),
+        ] {
+            assert_eq!(width(name), expected, "{name}");
+        }
+    }
+
     /// Build mapping from glyphs-reader master id to normalized location.
     fn build_master_id_to_location<'a>(
         expected: &'a glyphs_reader::Font,
@@ -2134,6 +2297,32 @@ mod tests {
             !result.fe_context.flags.contains(Flags::PROPAGATE_ANCHORS),
             "PROPAGATE_ANCHORS flag should not be set"
         );
+    }
+
+    #[test]
+    fn propagate_anchors_with_unrelated_ufo2ft_filter() {
+        let result =
+            TestCompile::compile_source("glyphs3/UfoFiltersWithoutPropagateAnchors.glyphs");
+        let anchors = result
+            .fe_context
+            .anchors
+            .get(&FeWorkIdentifier::Anchor("Aacute".into()));
+        let names = anchors
+            .anchors
+            .iter()
+            .map(|anchor| anchor.original_name.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(names, ["top"]);
+    }
+
+    #[test]
+    fn propagate_anchors_filter_loses_to_custom_parameter() {
+        let result = TestCompile::compile_source("glyphs3/UfoFiltersDontPropagateAnchors.glyphs");
+        let anchors = result
+            .fe_context
+            .anchors
+            .try_get(&FeWorkIdentifier::Anchor("Aacute".into()));
+        assert!(anchors.is_none() || anchors.unwrap().anchors.is_empty());
     }
 
     /// Verify anchors propagate through a single-layer smart component.
@@ -2365,6 +2554,60 @@ mod tests {
                     .collect::<Vec<_>>(),
             )
         );
+    }
+
+    #[test]
+    fn generates_glyphs_stat_labels() {
+        use write_fonts::read::tables::stat::AxisValue;
+
+        // Regular and Bold instances with a Variable Font Setting; the Black
+        // instance at 900 lies outside the wght axis and gets no value
+        let result = TestCompile::compile_source("glyphs3/StatLabels.glyphs");
+        let font = result.font();
+        let name = font.name().unwrap();
+        let stat = font.stat().unwrap();
+
+        assert_eq!(
+            stat.design_axes()
+                .unwrap()
+                .iter()
+                .map(|axis| axis.axis_tag())
+                .collect::<Vec<_>>(),
+            [Tag::new(b"wght"), Tag::new(b"ital")]
+        );
+        assert_eq!(
+            resolve_name(&name, stat.elided_fallback_name_id().unwrap()).unwrap(),
+            "Regular"
+        );
+
+        let values = stat.offset_to_axis_values().unwrap().unwrap();
+        assert_eq!(values.axis_values().len(), 3);
+
+        let AxisValue::Format3(regular) = values.axis_values().get(0).unwrap() else {
+            panic!("expected style-linked Regular weight");
+        };
+        assert_eq!(regular.axis_index(), 0);
+        assert_eq!(
+            resolve_name(&name, regular.value_name_id()).unwrap(),
+            "Regular"
+        );
+        assert_eq!(regular.value().to_f64(), 400.0);
+        assert_eq!(regular.linked_value().to_f64(), 700.0);
+
+        let AxisValue::Format1(bold) = values.axis_values().get(1).unwrap() else {
+            panic!("expected unlinked Bold weight");
+        };
+        assert_eq!(bold.axis_index(), 0);
+        assert_eq!(resolve_name(&name, bold.value_name_id()).unwrap(), "Bold");
+        assert_eq!(bold.value().to_f64(), 700.0);
+
+        let AxisValue::Format3(roman) = values.axis_values().get(2).unwrap() else {
+            panic!("expected style-linked synthetic Roman value");
+        };
+        assert_eq!(roman.axis_index(), 1);
+        assert_eq!(resolve_name(&name, roman.value_name_id()).unwrap(), "Roman");
+        assert_eq!(roman.value().to_f64(), 0.0);
+        assert_eq!(roman.linked_value().to_f64(), 1.0);
     }
 
     fn assert_simple_kerning(source: &str) {
@@ -2874,7 +3117,7 @@ mod tests {
     // https://github.com/googlefonts/ufo2ft/issues/992.
     #[test]
     fn divergent_kern_groups_resolved_against_each_master() {
-        let _ = env_logger::builder().is_test(true).try_init();
+        let _ = tracing_subscriber::fmt().with_test_writer().try_init();
         let tmp = tempdir().unwrap();
         let designspace = write_kern_fixture(
             tmp.path(),
@@ -2971,7 +3214,7 @@ mod tests {
 
     #[test]
     fn kernless_master_divergent_groups_do_not_reach_reconciliation() {
-        let _ = env_logger::builder().is_test(true).try_init();
+        let _ = tracing_subscriber::fmt().with_test_writer().try_init();
         let tmp = tempdir().unwrap();
         let two = write_kern_fixture(
             &tmp.path().join("two"),
@@ -3011,7 +3254,7 @@ mod tests {
     // https://github.com/googlefonts/ufo2ft/issues/992.
     #[test]
     fn regrouped_kern_groups_refine_by_kerned_signature() {
-        let _ = env_logger::builder().is_test(true).try_init();
+        let _ = tracing_subscriber::fmt().with_test_writer().try_init();
         let tmp = tempdir().unwrap();
         let designspace = write_kern_fixture(
             tmp.path(),
@@ -3182,7 +3425,7 @@ mod tests {
             })
             .collect::<Vec<_>>();
         assert_eq!(region_coords, vec![[0.0, 0.0, 0.0], [0.0, 1.0, 1.0]]);
-        assert_eq!(varstore.item_variation_data_count(), 1, "{varstore:#?}");
+        assert_eq!(varstore.item_variation_data_count(), 1);
         let vardata = varstore.item_variation_data().get(0).unwrap().unwrap();
         assert_eq!(vardata.region_indexes(), &[0]);
         assert_eq!(vec![vec![-350]], delta_sets(&vardata));
@@ -3540,7 +3783,7 @@ mod tests {
         assert_var_regions(&varstore, &vec![vec![[0.0, 1.0, 1.0]]]);
 
         // we expect one ItemVariationData and one delta set per glyph
-        assert_eq!(varstore.item_variation_data_count(), 1, "{varstore:#?}");
+        assert_eq!(varstore.item_variation_data_count(), 1);
         let vardata = varstore.item_variation_data().get(0).unwrap().unwrap();
         assert_eq!(vardata.region_indexes(), &[0]);
         assert_eq!(
@@ -3584,7 +3827,7 @@ mod tests {
         let varstore = hvar.item_variation_store().unwrap();
         assert_var_regions(&varstore, &vec![vec![[0.0, 1.0, 1.0]]]);
         // we expect one ItemVariationData and 4 delta sets, one per glyph
-        assert_eq!(varstore.item_variation_data_count(), 1, "{varstore:#?}");
+        assert_eq!(varstore.item_variation_data_count(), 1);
         let vardata = varstore.item_variation_data().get(0).unwrap().unwrap();
         assert_eq!(vardata.region_indexes(), &[0]);
         assert_eq!(
@@ -3669,14 +3912,12 @@ mod tests {
                 .map(|coord| F2Dot14::from_f32(coord.to_f64() as _))
                 .collect();
             match &self.table {
-                MetricVariationTable::Hvar(hvar) => hvar
-                    .advance_width_delta(gid.into(), &coords)
-                    .unwrap()
-                    .to_f64(),
-                MetricVariationTable::Vvar(vvar) => vvar
-                    .advance_height_delta(gid.into(), &coords)
-                    .unwrap()
-                    .to_f64(),
+                MetricVariationTable::Hvar(hvar) => {
+                    hvar.advance_delta(gid.into(), &coords).unwrap().to_i32() as f64
+                }
+                MetricVariationTable::Vvar(vvar) => {
+                    vvar.advance_delta(gid.into(), &coords).unwrap().to_i32() as f64
+                }
             }
         }
     }
@@ -4557,6 +4798,51 @@ mod tests {
         );
     }
 
+    /// Variation regions reach the end of the axis, not the outermost master.
+    ///
+    /// The test font's wght axis runs 400..900 but its heaviest master is at 700, so
+    /// nothing sits at normalized 1.0; masters land at 0, 0.4 (a sparse brace layer)
+    /// and 0.6. We used to stop each region at the outermost master, which cut variation
+    /// off entirely past wght 700: <https://github.com/googlefonts/fontc/issues/2012>
+    #[test]
+    fn variation_regions_reach_end_of_axis() {
+        let result = TestCompile::compile_source("wght_var_wide_axis.designspace");
+        let font = result.font();
+        let gvar = font.gvar().unwrap();
+
+        let var_data = gvar
+            .glyph_variation_data(result.get_gid("bar").into())
+            .unwrap()
+            .expect("'bar' varies at every master");
+
+        // an absent intermediate region means the implied one, per
+        // https://learn.microsoft.com/en-us/typography/opentype/spec/otvarcommonformats#tuple-variation-store-header
+        let regions = var_data
+            .tuples()
+            .map(|tuple| {
+                let peak = tuple.peak().get(0).unwrap();
+                let start = tuple
+                    .intermediate_start()
+                    .map(|t| t.get(0).unwrap())
+                    .unwrap_or_else(|| peak.min(F2Dot14::ZERO));
+                let end = tuple
+                    .intermediate_end()
+                    .map(|t| t.get(0).unwrap())
+                    .unwrap_or_else(|| peak.max(F2Dot14::ZERO));
+                (start, peak, end)
+            })
+            .collect::<Vec<_>>();
+
+        let f2dot14 = |v| F2Dot14::from_f32(v);
+        assert_eq!(
+            vec![
+                (f2dot14(0.0), f2dot14(0.4), f2dot14(1.0)),
+                (f2dot14(0.4), f2dot14(0.6), f2dot14(1.0)),
+            ],
+            regions
+        );
+    }
+
     #[test]
     fn compile_empty_gvar_with_correct_axis_count() {
         // The test font contains a 'wght' axis and only 1 UFO source with a variable
@@ -4982,7 +5268,7 @@ mod tests {
 
     #[test]
     fn use_base_table_from_fea() {
-        let _ = env_logger::builder().is_test(true).try_init();
+        let _ = tracing_subscriber::fmt().with_test_writer().try_init();
         let result = TestCompile::compile_source("CustomBaseTableInFea.ufo");
         let font = result.font();
         let base = font.base().unwrap();
@@ -5343,7 +5629,7 @@ mod tests {
     ) -> PaintGlyph<'a> {
         let paint = root_paint(compile, colr, glyph_name);
         let Paint::Glyph(paint) = paint else {
-            panic!("Expected a PaintGlyph for {glyph_name}, got {paint:#?}");
+            panic!("Expected a PaintGlyph for {glyph_name}");
         };
         paint
     }
@@ -5481,6 +5767,17 @@ mod tests {
     }
 
     #[test]
+    fn colr_no_cliplist_for_variable_font() {
+        let result = TestCompile::compile_source("glyphs3/COLRv1-var.glyphs");
+        let font = result.font();
+        font.fvar().expect("fvar");
+        let colr = font.colr().unwrap();
+        let base_glyph_list = colr.base_glyph_list().unwrap().unwrap();
+        assert_eq!(1, base_glyph_list.num_base_glyph_paint_records());
+        assert!(colr.clip_list().is_none());
+    }
+
+    #[test]
     fn colr_split_not_required() {
         // Only one paint, no need to split blah.color#
         let result = TestCompile::compile_source("glyphs3/COLRv1-grayscale.glyphs");
@@ -5523,18 +5820,15 @@ mod tests {
             .iter()
             .map(|p| {
                 let Ok(Paint::Glyph(paint_glyph)) = p else {
-                    panic!("Bad paint {p:?}");
+                    panic!("Bad paint");
                 };
                 paint_glyph.paint().unwrap()
             })
             .collect::<Vec<_>>();
-        assert!(
-            matches!(
-                layers.as_slice(),
-                [Paint::LinearGradient(_), Paint::Solid(_),]
-            ),
-            "{layers:#?}"
-        );
+        assert!(matches!(
+            layers.as_slice(),
+            [Paint::LinearGradient(_), Paint::Solid(_),]
+        ));
     }
 
     #[test]
@@ -5584,7 +5878,7 @@ mod tests {
             .iter()
             .map(|p| {
                 let Ok(Paint::Glyph(paint_glyph)) = p else {
-                    panic!("Bad paint {p:?}");
+                    panic!("Bad paint");
                 };
                 paint_glyph.paint().unwrap()
             })
@@ -5596,7 +5890,7 @@ mod tests {
             Paint::LinearGradient(g3),
         ] = layers.as_slice()
         else {
-            panic!("Expected 4 LinearGradients, got {layers:#?}");
+            panic!("Expected 4 LinearGradients");
         };
 
         let coords = [g0, g1, g2, g3].map(|g| {
@@ -5700,6 +5994,44 @@ mod tests {
     }
 
     #[test]
+    fn colr0_from_variable_glyphs() {
+        let result = TestCompile::compile_source("glyphs3/COLRv0-2masters-brace.glyphs");
+        // Same COLR structure as the single-master case
+        assert_colr0(&result, &[("A", &[("A.color0", 1), ("A.color1", 0)])]);
+        // The color glyphs interpolate between the masters instead of being
+        // frozen at the default one, and the intermediate color layer
+        // (colorPalette 1, wght 550) contributes a second gvar tuple to
+        // A.color0 only; in particular the base glyph must not absorb it as
+        // one of its own sources. Matches fontmake with glyphsLib >= 6.14.0.
+        assert_eq!(gvar_tuple_count(&result, "A"), 1);
+        assert_eq!(gvar_tuple_count(&result, "A.color0"), 2);
+        assert_eq!(gvar_tuple_count(&result, "A.color1"), 1);
+    }
+
+    #[test]
+    fn colr0_component_anchors_are_not_propagated() {
+        // The color layer's mark component attaches to top at the default
+        // master and top_1 elsewhere. Propagation into the split glyph would
+        // create top_1 without a default value, as in Cairo Play.
+        let result = TestCompile::compile_source("glyphs3/COLRv0-component-anchors.glyphs");
+        let anchors_of = |glyph_name: &str| {
+            result
+                .fe_context
+                .get_anchor(glyph_name)
+                .anchors
+                .iter()
+                .map(|anchor| (anchor.original_name.to_string(), anchor.positions.len()))
+                .collect::<Vec<_>>()
+        };
+        // Keep the color layer's explicit anchor, without gaining top/top_1
+        // from its components.
+        assert_eq!(vec![("bottom".to_string(), 2)], anchors_of("A.color0"));
+
+        // The ordinary base glyph still gets its component's anchors.
+        assert!(anchors_of("A").iter().any(|(name, _)| name == "top"));
+    }
+
+    #[test]
     fn colr0_from_ufo_multi_palette() {
         let result = TestCompile::compile_source("COLRv0-multi-palette.ufo");
         // Two base glyphs: "a" with 2 layers, "b" with 1 layer
@@ -5732,7 +6064,7 @@ mod tests {
         // (in the lookup list) to be ordered like fontmake, which means sorted
         // by the glyphnames of the rules, not the GIDs.
 
-        let _ = env_logger::builder().is_test(true).try_init();
+        let _ = tracing_subscriber::fmt().with_test_writer().try_init();
         let result = TestCompile::compile_source("dspace_rules/Basic.designspace");
         let gsub = result.font().gsub().unwrap();
         let features = gsub.feature_list().unwrap();
@@ -5777,7 +6109,7 @@ mod tests {
         // do we put lookups in the right order?
         // - aalt goes at the front
         // - except for rvrn, which goes at the front-front
-        let _ = env_logger::builder().is_test(true).try_init();
+        let _ = tracing_subscriber::fmt().with_test_writer().try_init();
         let result = TestCompile::compile_source("dspace_rules/Basic.designspace");
         let gsub = result.font().gsub().unwrap();
         let feature_list = gsub.feature_list().unwrap();
@@ -5831,7 +6163,7 @@ mod tests {
     #[test]
     fn designspace_rvrn_feature_variation() {
         // do we create a feature variation record, pointing at the expected values?
-        let _ = env_logger::builder().is_test(true).try_init();
+        let _ = tracing_subscriber::fmt().with_test_writer().try_init();
         let result = TestCompile::compile_source("dspace_rules/Basic.designspace");
         let gsub = result.font().gsub().unwrap();
         let feature_list = gsub.feature_list().unwrap();
@@ -5856,7 +6188,7 @@ mod tests {
 
     #[test]
     fn glyphs_feature_variations() {
-        let _ = env_logger::builder().is_test(true).try_init();
+        let _ = tracing_subscriber::fmt().with_test_writer().try_init();
         let result = TestCompile::compile_source("glyphs3/LibreFranklin-bracketlayer.glyphs");
         let gsub = result.font().gsub().unwrap();
         let lookup_list = gsub.lookup_list().unwrap();
@@ -5884,7 +6216,7 @@ mod tests {
     #[test]
     fn glyphs_feature_variations_custom_feature() {
         // honor the 'Feature for Feature Variations' key
-        let _ = env_logger::builder().is_test(true).try_init();
+        let _ = tracing_subscriber::fmt().with_test_writer().try_init();
         let result = TestCompile::compile_source("glyphs2/WorkSans-minimal-bracketlayer.glyphs");
         let gsub = result.font().gsub().unwrap();
         let lookup_list = gsub.lookup_list().unwrap();
@@ -5900,7 +6232,7 @@ mod tests {
     #[test]
     fn glyphs_fea_include_file() {
         // ensure that we resolve inclue statements in glyphs sources
-        let _ = env_logger::builder().is_test(true).try_init();
+        let _ = tracing_subscriber::fmt().with_test_writer().try_init();
         let result = TestCompile::compile_source("glyphs_fea_include/glyphs_include.glyphs");
         let gsub = result.font().gsub().unwrap();
         let feature_list = gsub.feature_list().unwrap();
@@ -6044,6 +6376,7 @@ mod tests {
         let vhea = font.vhea().expect("should include vertical table");
 
         // Explicit global metrics in sources.
+        assert_eq!(vhea.version(), Version16Dot16::VERSION_1_1);
         assert_eq!(vhea.ascender().to_i16(), 3456);
         assert_eq!(vhea.descender().to_i16(), -789);
         assert_eq!(vhea.line_gap().to_i16(), 12);
@@ -6162,6 +6495,96 @@ mod tests {
         let yen_bracket = glyphs[yen_bracket_gid.to_u32() as usize].as_ref().unwrap();
         assert_eq!(get_component_gids(yen), [peso_gid]);
         assert_eq!(get_component_gids(yen_bracket), [peso_bracket_gid]);
+    }
+
+    // https://glyphsapp.com/learn/switching-shapes#reverse-bracket-layers
+    // In ReverseBracketLayers, Aacute's Bold master is a [100<wg] layer and its
+    // blank alternate is the design used below 100; in the Mirror file, the
+    // same holds for A. Glyphs 3.5 (3532) exports both files the same way:
+    // one feature variation substituting both glyphs from 100 upwards, with
+    // 'top' anchors at x=10..30 on the default glyph and x=20..40 on the
+    // alternate.
+    #[rstest]
+    #[case::reverse("glyphs3/ReverseBracketLayers.glyphs")]
+    #[case::mirror("glyphs3/ReverseBracketLayersMirror.glyphs")]
+    fn reverse_bracket_layers(#[case] source: &str) {
+        let result = TestCompile::compile_source(source);
+        let static_metadata = result.fe_context.static_metadata.get();
+        let rules = &static_metadata.variations.as_ref().unwrap().rules;
+        assert_eq!(rules.len(), 1);
+        let conditions = rules[0]
+            .conditions
+            .iter()
+            .flat_map(|set| set.iter())
+            .map(|cond| {
+                (
+                    cond.axis,
+                    cond.min.map(|c| c.to_f64()),
+                    cond.max.map(|c| c.to_f64()),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(conditions, [(Tag::new(b"wght"), Some(100.0), Some(150.0))]);
+        let mut subs = rules[0]
+            .substitutions
+            .iter()
+            .map(|sub| (sub.replace.as_str(), sub.with.as_str()))
+            .collect::<Vec<_>>();
+        subs.sort();
+        assert_eq!(
+            subs,
+            [
+                ("A", "A.BRACKET.varAlt01"),
+                ("Aacute", "Aacute.BRACKET.varAlt01")
+            ]
+        );
+
+        for (glyph_name, light_x, bold_x) in [
+            ("Aacute", 10.0, 30.0),
+            ("Aacute.BRACKET.varAlt01", 20.0, 40.0),
+        ] {
+            let anchors = result
+                .fe_context
+                .anchors
+                .get(&FeWorkIdentifier::Anchor(glyph_name.into()));
+            assert_eq!(anchors.anchors.len(), 1);
+            let positions = &anchors.anchors[0].positions;
+            for (wght, x) in [(0.0, light_x), (1.0, bold_x)] {
+                let loc = NormalizedLocation::for_pos(&[("wght", wght)]);
+                assert_eq!(
+                    positions.get(&loc),
+                    Some(&Point::new(x, 700.0)),
+                    "{glyph_name}"
+                );
+            }
+        }
+    }
+
+    // Glyph B has an alternate layer with blank [] axis rules for each master,
+    // stored before the master layer, which also has blank axis rules. Glyphs
+    // 3.5 (3532) exports B from the master layers only, without a substitution
+    // (checked before the Bcomp composite and the anchors were added). Bcomp
+    // then gets no bracket variant either, and takes B's master anchors.
+    #[test]
+    fn blank_alternate_layers() {
+        let result = TestCompile::compile_source("glyphs3/BlankAlternateLayers.glyphs");
+        let static_metadata = result.fe_context.static_metadata.get();
+        assert!(static_metadata.variations.is_none());
+        for name in ["B.BRACKET.varAlt01", "Bcomp.BRACKET.varAlt01"] {
+            assert!(result.get_glyph_index(name).is_none(), "{name}");
+        }
+        let anchors = result
+            .fe_context
+            .anchors
+            .get(&FeWorkIdentifier::Anchor("Bcomp".into()));
+        assert_eq!(anchors.anchors.len(), 1);
+        for (wght, x) in [(0.0, 100.0), (1.0, 200.0)] {
+            let loc = NormalizedLocation::for_pos(&[("wght", wght)]);
+            assert_eq!(
+                anchors.anchors[0].positions.get(&loc),
+                Some(&Point::new(x, 700.0))
+            );
+        }
     }
 
     #[test]
@@ -6348,16 +6771,14 @@ mod tests {
     fn compile_in_memory() {
         // In memory and no paths
         let result = TestCompile::compile("glyphs3/WghtVar.glyphs", |mut args| {
-            args.ir_dir = None;
             args.debug_dir = None;
             args.output_file = None;
-            args.timing_file = None;
             args
         });
 
         assert_ne!(
             0,
-            result.be_context.font.get().get().len(),
+            result.be_context.font.get().len(),
             "We should still produce a font"
         );
         let temp_files = result.temp.path().read_dir().unwrap().collect::<Vec<_>>();

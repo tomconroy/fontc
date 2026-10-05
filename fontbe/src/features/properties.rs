@@ -4,8 +4,10 @@ use std::{
     hash::Hash,
 };
 
+use fontdrasil::unicode18;
+use fontir::ir::{GlyphOrder, StaticMetadata};
 use icu_properties::{
-    CodePointMapData, PropertyNamesShort, PropertyParser,
+    PropertyParser,
     props::{BidiClass, Script},
 };
 use tinystr::tinystr;
@@ -25,8 +27,7 @@ pub const HIRA: UnicodeShortName = tinystr!(4, "Hira");
 pub const KANA: UnicodeShortName = tinystr!(4, "Kana");
 pub const HRKT: UnicodeShortName = tinystr!(4, "Hrkt");
 
-/// The type used by icu4x for script names
-pub type UnicodeShortName = tinystr::TinyAsciiStr<4>;
+pub use fontdrasil::unicode18::UnicodeShortName;
 
 /// The writing direction of a script
 #[derive(Clone, Debug, Copy, Hash, PartialEq, Eq, PartialOrd, Ord)]
@@ -89,7 +90,7 @@ impl ScriptDirection {
 // <https://github.com/googlefonts/ufo2ft/blob/f6b4f42460b340c/Lib/ufo2ft/featureWriters/kernFeatureWriter.py#L49>
 /// returns none for neutral characters
 fn unicode_bidi_type(c: u32) -> Option<BidiClass> {
-    match CodePointMapData::<BidiClass>::new().get32(c) {
+    match unicode18::bidi_class(c) {
         BidiClass::RightToLeft | BidiClass::ArabicLetter => Some(BidiClass::RightToLeft),
         BidiClass::LeftToRight | BidiClass::ArabicNumber | BidiClass::EuropeanNumber => {
             Some(BidiClass::LeftToRight)
@@ -98,12 +99,48 @@ fn unicode_bidi_type(c: u32) -> Option<BidiClass> {
     }
 }
 
+/// The glyphs that rules can substitute for each glyph.
+///
+/// This is ufo2ft's `extraSubstitutions`.
+pub(crate) type ExtraSubstitutions = HashMap<GlyphId16, IntSet<GlyphId16>>;
+
+/// Collect the substitutions made by the font's feature variation rules.
+///
+/// These come from designspace rules and Glyphs bracket layers. Substitutions
+/// that name a glyph missing from the glyph order are skipped.
+///
+/// This is equivalent to [ufo2ft's `extraSubstitutions`], which is built
+/// inline rather than by a dedicated function.
+///
+/// [ufo2ft's `extraSubstitutions`]: https://github.com/googlefonts/ufo2ft/blob/b4890b5/Lib/ufo2ft/_compilers/baseCompiler.py#L266-L269
+pub(crate) fn extra_substitutions(
+    static_metadata: &StaticMetadata,
+    glyph_order: &GlyphOrder,
+) -> ExtraSubstitutions {
+    let mut result = ExtraSubstitutions::new();
+    let substitutions = static_metadata
+        .variations
+        .iter()
+        .flat_map(|variations| &variations.rules)
+        .flat_map(|rule| &rule.substitutions);
+    for sub in substitutions {
+        if let (Some(replace), Some(with)) = (
+            glyph_order.glyph_id(&sub.replace),
+            glyph_order.glyph_id(&sub.with),
+        ) {
+            result.entry(replace).or_default().insert(with);
+        }
+    }
+    result
+}
+
 // equivalent to the 'classify' method in ufo2ft:
 // <https://github.com/googlefonts/ufo2ft/blob/cea60d71dfcf0b1c0f/Lib/ufo2ft/util.py#L287>
 fn classify<T, F, CM>(
     char_map: &CM,
     mut props_fn: F,
     gsub: Option<&Gsub>,
+    extra_substitutions: &ExtraSubstitutions,
 ) -> Result<BTreeMap<T, IntSet<GlyphId16>>, ReadError>
 where
     T: Ord + Eq,
@@ -140,6 +177,16 @@ where
             );
         }
     }
+
+    for glyphs in sets.values_mut() {
+        let mut to_append = IntSet::new();
+        for glyph in glyphs.iter() {
+            if let Some(substitutes) = extra_substitutions.get(&glyph) {
+                to_append.union(substitutes);
+            }
+        }
+        glyphs.union(&to_append);
+    }
     Ok(sets)
 }
 
@@ -147,6 +194,7 @@ pub(crate) fn glyphs_matching_predicate(
     glyphs: &impl CharMap,
     predicate: impl Fn(u32) -> Option<bool>,
     gsub: Option<&Gsub>,
+    extra_substitutions: &ExtraSubstitutions,
 ) -> Result<IntSet<GlyphId16>, ReadError> {
     classify(
         glyphs,
@@ -156,6 +204,7 @@ pub(crate) fn glyphs_matching_predicate(
             }
         },
         gsub,
+        extra_substitutions,
     )
     .map(|mut items| items.remove(&true).unwrap_or_default())
 }
@@ -164,10 +213,8 @@ pub(crate) fn glyphs_matching_predicate(
 // https://github.com/googlefonts/ufo2ft/blob/01d3faee/Lib/ufo2ft/util.py#L591
 pub fn unicode_script_extensions(cp: u32) -> impl Iterator<Item = UnicodeShortName> {
     let mut seen_hrkt = false;
-    icu_properties::script::ScriptWithExtensions::new()
-        .get_script_extensions_val32(cp)
-        .iter()
-        .flat_map(get_script_short_name)
+    unicode18::script_extensions(cp)
+        .into_iter()
         .filter_map(move |script| {
             if script == HIRA || script == KANA {
                 if seen_hrkt {
@@ -192,6 +239,7 @@ pub(crate) fn scripts_by_glyph(
     glyphs: &impl CharMap,
     known_scripts: &HashSet<UnicodeShortName>,
     gsub: Option<&Gsub>,
+    extra_substitutions: &ExtraSubstitutions,
 ) -> Result<HashMap<GlyphId16, HashSet<UnicodeShortName>>, ReadError> {
     let mut result = HashMap::new();
     for (script, glyphs) in classify(
@@ -208,6 +256,7 @@ pub(crate) fn scripts_by_glyph(
             }
         },
         gsub,
+        extra_substitutions,
     )? {
         for glyph in glyphs.iter() {
             result.entry(glyph).or_insert(HashSet::new()).insert(script);
@@ -220,11 +269,13 @@ pub(crate) fn scripts_by_glyph(
 pub(crate) fn glyphs_by_bidi_class(
     glyphs: &impl CharMap,
     gsub: Option<&Gsub>,
+    extra_substitutions: &ExtraSubstitutions,
 ) -> Result<BTreeMap<BidiClass, IntSet<GlyphId16>>, ReadError> {
     classify(
         glyphs,
         |codepoint, buf| buf.extend(unicode_bidi_type(codepoint)),
         gsub,
+        extra_substitutions,
     )
 }
 
@@ -232,11 +283,13 @@ pub(crate) fn glyphs_by_bidi_class(
 pub(crate) fn glyphs_by_script_direction(
     glyphs: &impl CharMap,
     gsub: Option<&Gsub>,
+    extra_substitutions: &ExtraSubstitutions,
 ) -> Result<BTreeMap<ScriptDirection, IntSet<GlyphId16>>, ReadError> {
     classify(
         glyphs,
         |cp, buf| buf.extend(unicode_script_direction(cp)),
         gsub,
+        extra_substitutions,
     )
 }
 
@@ -282,14 +335,7 @@ impl<T: Ord + Eq, U: Clone> BinarySearchExact<T, U> for &[(T, U)] {
 
 /// Get the unicode script property for this code point
 fn script_for_codepoint(cp: u32) -> Option<UnicodeShortName> {
-    get_script_short_name(icu_properties::script::ScriptWithExtensions::new().get_script_val32(cp))
-}
-
-pub(crate) fn get_script_short_name(script: Script) -> Option<UnicodeShortName> {
-    let lookup = PropertyNamesShort::<Script>::new();
-    lookup
-        .get(script)
-        .and_then(|script| tinystr::TinyStr4::try_from_str(script).ok())
+    unicode18::script(cp)
 }
 
 /// Takes an OpenType script tag and returns a unicode script identifier
@@ -341,7 +387,9 @@ pub(crate) fn script_to_ot_tags(script: &UnicodeShortName) -> impl Iterator<Item
     let mut out = [None, None];
     if let Some(tag) = SCRIPT_EXCEPTIONS.binary_search_exact(&script.as_str()) {
         out[0] = Some(tag);
-    } else if PropertyParser::<Script>::new().get_strict(script).is_none() {
+    } else if !unicode18::is_new_script(*script)
+        && PropertyParser::<Script>::new().get_strict(script).is_none()
+    {
         out[0] = Some(DFLT_SCRIPT);
     } else {
         out[0] = NEW_SCRIPT_TAGS.binary_search_exact(&script.as_str());
@@ -406,6 +454,29 @@ mod tests {
         assert_eq!(other.collect::<Vec<_>>(), ["Knda", "Nand", "Tutg"]);
     }
 
+    #[test]
+    fn unicode_18_script_and_bidi_properties() {
+        // U+1CF5 lost Deva from Script_Extensions in Unicode 18. When it is
+        // unambiguous, the kern feature writer adds Bengali to known scripts.
+        assert_eq!(
+            unicode_script_extensions(0x1CF5).collect::<Vec<_>>(),
+            ["Beng"]
+        );
+
+        let mut scripts = unicode_script_extensions(0x0B83).collect::<Vec<_>>();
+        scripts.sort();
+        assert_eq!(scripts, ["Knda", "Mlym", "Taml", "Telu"]);
+        assert_eq!(script_for_codepoint(0x11DF0), Some(tinystr!(4, "Beng")));
+        assert_eq!(unicode_bidi_type(0x11DF0), None);
+        for (script, tag) in [
+            (tinystr!(4, "Jurc"), Tag::new(b"jurc")),
+            (tinystr!(4, "Pcun"), Tag::new(b"pcun")),
+            (tinystr!(4, "Seal"), Tag::new(b"seal")),
+        ] {
+            assert_eq!(script_to_ot_tags(&script).collect::<Vec<_>>(), [tag]);
+        }
+    }
+
     // https://github.com/googlefonts/ufo2ft/issues/901
     // I'm not sure that ufo2ft's behaviour is the best choice, but for the times
     // being we will match it.
@@ -441,13 +512,80 @@ mod tests {
         let charmap = HashMap::from([('a' as u32, a_gid)]);
 
         // a contrived predicate that is only true for the 'a' glyph.
-        let reachable_from_a =
-            glyphs_matching_predicate(&charmap, |uv| Some(uv == 'a' as u32), Some(&read_gsub))
-                .unwrap();
+        let reachable_from_a = glyphs_matching_predicate(
+            &charmap,
+            |uv| Some(uv == 'a' as u32),
+            Some(&read_gsub),
+            &Default::default(),
+        )
+        .unwrap();
 
         // 'b' should not be reachable because 'neutral_glyph' doesn't match our
         // predicate
         assert!(reachable_from_a.contains(a_gid) && reachable_from_a.len() == 1);
+    }
+
+    // https://github.com/googlefonts/ufo2ft/blob/b4890b5/Lib/ufo2ft/util.py#L375-L380
+    #[test]
+    fn extra_substitutions_apply_once_after_gsub_closure() {
+        use crate::features::test_helpers::LayoutOutputBuilder;
+        use fontdrasil::types::GlyphName;
+        use fontir::ir::{Rule, VariableFeature};
+
+        let glyph_order: GlyphOrder = [
+            ".notdef",
+            "a",
+            "a.sc",
+            "a.sc.alt",
+            "a.alt",
+            "a.alt.alt",
+            "a.alt.sc",
+            "alpha",
+            "alpha.alt",
+        ]
+        .into_iter()
+        .map(GlyphName::new)
+        .collect();
+        let layout = LayoutOutputBuilder::new()
+            .with_glyph_order(glyph_order.clone())
+            .with_user_fea("feature smcp { sub a by a.sc; sub a.alt by a.alt.sc; } smcp;")
+            .with_variations(VariableFeature {
+                features: vec![Tag::new(b"rvrn")],
+                rules: vec![Rule::for_test(
+                    &[],
+                    &[
+                        ("a", "a.alt"),
+                        ("a", "a.missing"),
+                        ("a.alt", "a.alt.alt"),
+                        ("a.sc", "a.sc.alt"),
+                        ("alpha", "alpha.alt"),
+                    ],
+                )],
+            })
+            .build();
+        let extra = extra_substitutions(&layout.static_metadata, &glyph_order);
+        let gid = |name: &str| glyph_order.glyph_id(name).unwrap();
+        assert_eq!(extra.len(), 4);
+        assert_eq!(extra[&gid("a")].iter().collect::<Vec<_>>(), [gid("a.alt")]);
+
+        // Greek is not a known script, so alpha is neutral
+        let charmap = HashMap::from([('a' as u32, gid("a")), ('α' as u32, gid("alpha"))]);
+        let known_scripts = HashSet::from([tinystr!(4, "Latn")]);
+        let gsub = layout.first_pass_fea.gsub();
+        let scripts = scripts_by_glyph(&charmap, &known_scripts, gsub.as_ref(), &extra).unwrap();
+
+        let mut latin = scripts
+            .iter()
+            .map(|(gid, scripts)| {
+                assert_eq!(scripts, &HashSet::from([tinystr!(4, "Latn")]));
+                glyph_order
+                    .glyph_name(gid.to_u16() as usize)
+                    .unwrap()
+                    .as_str()
+            })
+            .collect::<Vec<_>>();
+        latin.sort();
+        assert_eq!(latin, ["a", "a.alt", "a.sc", "a.sc.alt"]);
     }
 
     #[test]

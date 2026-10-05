@@ -6,6 +6,5 @@ pub mod glyph;
 pub mod instance;
 pub mod ir;
 pub mod orchestration;
-pub mod paths;
 pub mod propagate_anchors;
 pub mod source;

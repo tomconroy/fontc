@@ -644,6 +644,18 @@ impl<'a, V: VariationInfo> ValidationCtx<'a, V> {
         self.validate_feature_statements(tag_raw, node.statements());
     }
 
+    fn validate_language(&mut self, node: &typed::Language) {
+        let tags = node.tags().collect::<Vec<_>>();
+        if tags.len() > 1
+            && let Some(dflt) = tags.iter().find(|tag| tag.to_raw() == tags::LANG_DFLT)
+        {
+            self.error(
+                dflt.range(),
+                "'dflt' can only be used alone in a language statement",
+            );
+        }
+    }
+
     // shared between features and feature variations
     fn validate_feature_statements<'b>(
         &mut self,
@@ -653,12 +665,13 @@ impl<'a, V: VariationInfo> ValidationCtx<'a, V> {
         let mut has_seen_rule = false;
         for item in iter {
             if item.kind() == Kind::ScriptNode
-                || item.kind() == Kind::LanguageNode
                 || item.kind() == Kind::SubtableNode
                 || item.kind() == Kind::Semi
                 || item.kind() == Kind::Comment
             {
                 // lgtm
+            } else if let Some(node) = typed::Language::cast(item) {
+                self.validate_language(&node);
             } else if let Some(node) = typed::CvParameters::cast(item) {
                 if !tags::is_character_variant(feature_tag) {
                     self.error(
@@ -1533,8 +1546,19 @@ impl<'a, V: VariationInfo> ValidationCtx<'a, V> {
             return;
         };
 
+        let mut bare_default_seen = false;
         for location_val in metric.location_values() {
-            for item in location_val.location().items() {
+            let Some(location) = location_val.location() else {
+                if bare_default_seen {
+                    self.error(
+                        location_val.range(),
+                        "duplicate value for the default location",
+                    );
+                }
+                bare_default_seen = true;
+                continue;
+            };
+            for item in location.items() {
                 let Some((_, axis)) = var_info.axis(item.axis_tag().to_raw()) else {
                     self.error(item.axis_tag().range(), "unknown axis");
                     continue;

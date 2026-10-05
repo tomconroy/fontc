@@ -8,7 +8,7 @@ repository = "https://github.com/googlefonts/fontc"
 readme = "README.md"
 
 [dependencies]
-fontc = { version = "0.6.0", path = "../fontc" }
+fontc = { version = "1.0.0", path = "../fontc" }
 
 google-fonts-sources = "0.11.1"
 maud = "0.27.0"
@@ -23,6 +23,6 @@ clap.workspace = true
 serde_yaml.workspace = true
 serde_json.workspace = true
 tempfile.workspace = true
-env_logger.workspace = true
+tracing-subscriber.workspace = true
 log.workspace = true
 

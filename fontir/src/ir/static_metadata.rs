@@ -4,7 +4,6 @@ use std::{
     borrow::Cow,
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     fmt::Debug,
-    io::Read,
 };
 
 use chrono::{DateTime, Utc};
@@ -24,8 +23,6 @@ use fontdrasil::{
 
 use super::GlobalMetric;
 use super::feature_writers::FeatureWriterSpec;
-use crate::orchestration::Persistable;
-
 /// Glyph names mapped to postscript names
 pub type PostscriptNames = HashMap<GlyphName, GlyphName>;
 
@@ -71,6 +68,9 @@ pub struct StaticMetadata {
     ///
     /// If empty this is a static font.
     pub axes: Axes,
+
+    /// The avar version 2 axis mappings.
+    pub axis_mappings: Vec<AxisMapping>,
 
     /// Named locations in variation space
     pub named_instances: Vec<NamedInstance>,
@@ -420,6 +420,11 @@ pub struct PreliminaryGdefCategories {
     /// component propagation.
     #[serde(default)]
     pub mark_category_glyphs: BTreeSet<GlyphName>,
+    /// Glyphs that never get a GDEF class, even if `categories` or anchors
+    /// would assign one; e.g. the glyphs split from Glyphs.app color layers,
+    /// which glyphsLib only creates after it has computed categories.
+    #[serde(default)]
+    pub excluded: BTreeSet<GlyphName>,
 }
 
 /// Final GDEF categories after anchor propagation has been applied.
@@ -427,6 +432,59 @@ pub struct PreliminaryGdefCategories {
 pub struct GdefCategories {
     /// A map of glyphs to categories.
     pub categories: BTreeMap<GlyphName, GlyphClassDef>,
+}
+
+/// A STAT axis value label.
+///
+/// The values are in user coordinates.
+///
+/// <https://learn.microsoft.com/en-us/typography/opentype/spec/stat#axis-value-tables>
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct AxisValueLabel {
+    pub name: String,
+    pub value: OrderedFloat<f64>,
+    pub min_value: Option<OrderedFloat<f64>>,
+    pub max_value: Option<OrderedFloat<f64>>,
+    pub linked_value: Option<OrderedFloat<f64>>,
+    pub elidable: bool,
+    pub older_sibling: bool,
+}
+
+/// A STAT design axis and its axis value labels.
+///
+/// This mirrors a designspace v5 axis with its `<labels>`, as fontTools'
+/// `getStatAxes` turns them into STAT axis records: every source axis gets
+/// a record, fvar axis or not, in source order. Explicit `axisOrdering`,
+/// localized label names and format 4 location labels are not modelled yet.
+///
+/// <https://learn.microsoft.com/en-us/typography/opentype/spec/stat#axis-records>
+/// <https://fonttools.readthedocs.io/en/latest/designspaceLib/xml.html#labels-element-axis>
+/// <https://github.com/fonttools/fonttools/blob/7af8bf5cbf/Lib/fontTools/varLib/stat.py#L52-L84>
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct StatAxis {
+    pub tag: Tag,
+    pub name: String,
+    pub labels: Vec<AxisValueLabel>,
+}
+
+impl StatAxis {
+    /// A STAT design axis for an fvar axis, with no labels.
+    pub fn from_axis(axis: &Axis) -> Self {
+        StatAxis {
+            tag: axis.tag,
+            name: axis.ui_label_name().to_string(),
+            labels: Vec::new(),
+        }
+    }
+}
+
+/// An avar version 2 axis mapping.
+///
+/// <https://github.com/harfbuzz/boring-expansion-spec/blob/main/avar2.md#processing>
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct AxisMapping {
+    pub input: NormalizedLocation,
+    pub output: NormalizedLocation,
 }
 
 /// Metadata primarily feeding the OS/2 table.
@@ -513,6 +571,62 @@ pub struct MiscMetadata {
     /// `None` means the key was absent (use the built-in defaults); `Some` fully
     /// replaces the defaults (an empty list disables all automatic features).
     pub feature_generation: Option<Vec<FeatureWriterSpec>>,
+
+    /// STAT design axes, in order, with their axis value labels.
+    ///
+    /// [`StaticMetadata::new`] seeds this with the fvar axes and no labels;
+    /// [`StaticMetadata::set_stat`] replaces the whole list, which is how a
+    /// frontend emits axes that have no fvar counterpart, such as point axes
+    /// pruned from fvar or the STAT-only `ital` axis glyphsLib synthesizes.
+    pub stat_axes: Vec<StatAxis>,
+
+    /// STAT elided fallback name.
+    pub elided_fallback_name: Option<String>,
+
+    /// Unicode Variation Sequences: variation selector => base codepoint => glyph name.
+    ///
+    /// The shape of <https://unifiedfontobject.org/versions/ufo3/lib.plist/#publicunicodevariationsequences>.
+    pub unicode_variation_sequences: BTreeMap<u32, BTreeMap<u32, GlyphName>>,
+
+    /// The `decomposeComponents` ufo2ft filter, if the source lists it.
+    pub decompose_components: Option<FilterScope>,
+}
+
+/// The glyphs a ufo2ft filter applies to: all of them, or an `include` or
+/// `exclude` list of glyph names.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub enum FilterScope {
+    All,
+    Include(BTreeSet<GlyphName>),
+    Exclude(BTreeSet<GlyphName>),
+}
+
+impl FilterScope {
+    /// Build from a filter entry's `include` and `exclude` values.
+    ///
+    /// ufo2ft rejects an entry that has both, and treats each as a list of glyph
+    /// names; `names` converts the source's list type, returning `None` for
+    /// anything else. `None` means the entry is malformed and should be ignored.
+    pub fn from_lists<T>(
+        include: Option<&T>,
+        exclude: Option<&T>,
+        names: impl Fn(&T) -> Option<BTreeSet<GlyphName>>,
+    ) -> Option<FilterScope> {
+        match (include, exclude) {
+            (None, None) => Some(FilterScope::All),
+            (Some(include), None) => names(include).map(FilterScope::Include),
+            (None, Some(exclude)) => names(exclude).map(FilterScope::Exclude),
+            (Some(_), Some(_)) => None,
+        }
+    }
+
+    pub fn contains(&self, glyph_name: &GlyphName) -> bool {
+        match self {
+            FilterScope::All => true,
+            FilterScope::Include(names) => names.contains(glyph_name),
+            FilterScope::Exclude(names) => !names.contains(glyph_name),
+        }
+    }
 }
 
 /// The `postscript*` keys of UFO fontinfo, mostly CFF hinting data.
@@ -897,6 +1011,7 @@ impl StaticMetadata {
                 .map(|(string, key)| (key, string)),
         );
 
+        let stat_axes = variable_axes.iter().map(StatAxis::from_axis).collect();
         let variation_model = VariationModel::new(global_locations, variable_axes.axis_order());
 
         let default_location = axes
@@ -909,6 +1024,7 @@ impl StaticMetadata {
             names,
             all_source_axes: Axes::new(axes),
             axes: variable_axes,
+            axis_mappings: Default::default(),
             named_instances,
             variation_model,
             default_location,
@@ -944,12 +1060,81 @@ impl StaticMetadata {
                 us_width_class: None,
                 gasp: Vec::new(),
                 feature_generation: None,
+                stat_axes,
+                elided_fallback_name: None,
+                unicode_variation_sequences: Default::default(),
+                decompose_components: None,
             },
             variations: None,
         })
     }
 
-    /// The default on all variable axes.
+    /// Set the STAT design axes with their axis value labels and the elided
+    /// fallback name, and register their names in the name map.
+    ///
+    /// Names are registered in the order fontTools' `buildStatTable` visits
+    /// them, the elided fallback then each axis name followed by its value
+    /// names, so that name IDs match fontmake's. The fallback and the value
+    /// names reuse the lowest existing record with the same string, which is
+    /// how "Regular" ends up on name ID 2 or 17 as the STAT spec suggests.
+    /// An axis name only reuses a font-specific record (ID >= 256): the STAT
+    /// spec originally required axis name IDs above 255 (fontTools #1985,
+    /// fixed in #1986; OTS still warns on IDs 26..255), and fontc already
+    /// registers fvar axis names there (#1502), which STAT then shares.
+    /// <https://github.com/fonttools/fonttools/blob/7af8bf5cbf/Lib/fontTools/otlLib/builder.py#L3044-L3050>
+    /// <https://github.com/fonttools/fonttools/blob/7af8bf5cbf/Lib/fontTools/otlLib/builder.py#L3156-L3160>
+    pub fn set_stat(&mut self, stat_axes: Vec<StatAxis>, elided_fallback_name: Option<String>) {
+        let mut name_id_gen = self
+            .names
+            .keys()
+            .map(|key| key.name_id.to_u16())
+            .max()
+            .unwrap_or(255)
+            .max(255);
+        let mut reusable_names: HashMap<String, BTreeSet<NameId>> = self
+            .reverse_names()
+            .into_iter()
+            .map(|(name, ids)| (name.to_owned(), ids))
+            .collect();
+        let mut new_names = Vec::new();
+        let mut register_if_new = |name: &str, min_name_id: NameId| {
+            if reusable_names
+                .get(name)
+                .is_some_and(|ids| ids.last().is_some_and(|id| *id >= min_name_id))
+            {
+                return;
+            }
+            name_id_gen += 1;
+            let name_id = NameId::new(name_id_gen);
+            reusable_names
+                .entry(name.to_owned())
+                .or_default()
+                .insert(name_id);
+            new_names.push((NameKey::new(name_id, name), name.to_owned()));
+        };
+        let any_name_id = NameId::new(0);
+        let font_specific_name_id = NameId::new(256);
+        if let Some(name) = elided_fallback_name
+            .as_deref()
+            .filter(|_| !stat_axes.is_empty())
+        {
+            register_if_new(name, any_name_id);
+        }
+        for axis in stat_axes.iter() {
+            register_if_new(&axis.name, font_specific_name_id);
+            for label in axis.labels.iter() {
+                register_if_new(&label.name, any_name_id);
+            }
+        }
+        self.names.extend(new_names);
+        self.misc.stat_axes = stat_axes;
+        self.misc.elided_fallback_name = elided_fallback_name;
+    }
+
+    /// The default on every source axis, point axes included.
+    ///
+    /// Subset to [`Self::axes`] before comparing with a location in the
+    /// variation model.
     pub fn default_location(&self) -> &NormalizedLocation {
         &self.default_location
     }
@@ -1034,36 +1219,6 @@ impl Panose {
     }
 }
 
-impl Persistable for StaticMetadata {
-    fn read(from: &mut dyn Read) -> Self {
-        serde_yaml::from_reader(from).unwrap()
-    }
-
-    fn write(&self, to: &mut dyn std::io::Write) {
-        serde_yaml::to_writer(to, self).unwrap();
-    }
-}
-
-impl Persistable for GdefCategories {
-    fn read(from: &mut dyn Read) -> Self {
-        serde_yaml::from_reader(from).unwrap()
-    }
-
-    fn write(&self, to: &mut dyn std::io::Write) {
-        serde_yaml::to_writer(to, self).unwrap();
-    }
-}
-
-impl Persistable for PreliminaryGdefCategories {
-    fn read(from: &mut dyn Read) -> Self {
-        serde_yaml::from_reader(from).unwrap()
-    }
-
-    fn write(&self, to: &mut dyn std::io::Write) {
-        serde_yaml::to_writer(to, self).unwrap();
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use fontdrasil::coords::UserCoord;
@@ -1082,6 +1237,7 @@ mod tests {
             units_per_em: 1000,
             all_source_axes: vec![axis.clone(), point_axis].into(),
             axes: Axes::new(vec![axis.clone()]),
+            axis_mappings: Default::default(),
             named_instances: vec![NamedInstance {
                 name: "Nobody".to_string(),
                 postscript_name: None,
@@ -1142,6 +1298,10 @@ mod tests {
                     mode: FeatureWriterMode::Append,
                     features: None,
                 }]),
+                stat_axes: Vec::new(),
+                elided_fallback_name: None,
+                unicode_variation_sequences: Default::default(),
+                decompose_components: None,
             },
             number_values: Default::default(),
             // a Glyphs source always sets this, and the round-trip tests
@@ -1275,6 +1435,138 @@ mod tests {
             static_metadata.postscript_default().into_owned(),
             PostscriptSettings::default()
         );
+    }
+
+    #[test]
+    fn no_fallback_name_without_stat_axes() {
+        let mut static_metadata = test_static_metadata();
+        let before = static_metadata.names.len();
+
+        static_metadata.set_stat(Vec::new(), Some("Regular".to_string()));
+
+        assert_eq!(before, static_metadata.names.len());
+    }
+
+    #[test]
+    fn label_names_reuse_the_subfamily_name() {
+        let mut static_metadata = test_static_metadata();
+        static_metadata.names.insert(
+            NameKey::new(NameId::SUBFAMILY_NAME, "Regular"),
+            "Regular".to_string(),
+        );
+        let before = static_metadata.names.len();
+        let stat_axes = vec![StatAxis {
+            labels: vec![AxisValueLabel {
+                elidable: true,
+                ..label("Regular", 400.0)
+            }],
+            ..StatAxis::from_axis(static_metadata.axes.iter().next().unwrap())
+        }];
+
+        static_metadata.set_stat(stat_axes, Some("Regular".to_string()));
+
+        assert_eq!(before, static_metadata.names.len());
+        assert_eq!(
+            BTreeSet::from([NameId::SUBFAMILY_NAME]),
+            static_metadata.reverse_names()["Regular"]
+        );
+    }
+
+    fn label(name: &str, value: f64) -> AxisValueLabel {
+        AxisValueLabel {
+            name: name.to_string(),
+            value: value.into(),
+            min_value: None,
+            max_value: None,
+            linked_value: None,
+            elidable: false,
+            older_sibling: false,
+        }
+    }
+
+    #[test]
+    fn new_seeds_stat_axes_from_fvar_axes() {
+        let static_metadata = StaticMetadata::new(
+            1000,
+            Default::default(),
+            vec![Axis::for_test("wght"), Axis::for_test("wdth")],
+            Default::default(),
+            Default::default(),
+            Default::default(),
+            Default::default(),
+            None,
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            vec![(WGHT, "Weight", 0), (Tag::new(b"wdth"), "Width", 0)],
+            static_metadata
+                .misc
+                .stat_axes
+                .iter()
+                .map(|axis| (axis.tag, axis.name.as_str(), axis.labels.len()))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn stat_axes_register_names_in_fonttools_order() {
+        let mut static_metadata = test_static_metadata();
+        static_metadata.names.insert(
+            NameKey::new(NameId::SUBFAMILY_NAME, "Italic"),
+            "Italic".to_string(),
+        );
+        let stat_axes = vec![
+            StatAxis {
+                tag: WGHT,
+                name: "Weight".to_string(),
+                labels: vec![label("Regular", 400.0)],
+            },
+            StatAxis {
+                tag: Tag::new(b"ital"),
+                name: "Italic".to_string(),
+                labels: vec![label("Italic", 1.0)],
+            },
+        ];
+
+        static_metadata.set_stat(stat_axes.clone(), Some("Regular".to_string()));
+
+        let reverse_names = static_metadata.reverse_names();
+        // The fallback comes first and is new; the wght label reuses it
+        assert_eq!(BTreeSet::from([NameId::new(258)]), reverse_names["Regular"]);
+        // The fvar axis name was already registered
+        assert_eq!(BTreeSet::from([NameId::new(256)]), reverse_names["Weight"]);
+        // The STAT-only axis name must not reuse the subfamily name (ID < 256),
+        // but its value label does
+        assert_eq!(
+            BTreeSet::from([NameId::SUBFAMILY_NAME, NameId::new(259)]),
+            reverse_names["Italic"]
+        );
+        assert_eq!(stat_axes, static_metadata.misc.stat_axes);
+
+        // Setting the same STAT again registers nothing new
+        let before = static_metadata.names.len();
+        static_metadata.set_stat(stat_axes, Some("Regular".to_string()));
+        assert_eq!(before, static_metadata.names.len());
+    }
+
+    #[test]
+    fn stat_axes_register_names_without_fvar_axes() {
+        let mut static_metadata = test_static_metadata();
+        static_metadata.axes = Axes::new(Vec::new());
+        let before = static_metadata.names.len();
+        let stat_axes = vec![StatAxis {
+            tag: WGHT,
+            name: "Weight".to_string(),
+            labels: vec![label("Wide", 200.0)],
+        }];
+
+        static_metadata.set_stat(stat_axes, Some("Regular".to_string()));
+
+        assert_eq!(before + 2, static_metadata.names.len());
+        let reverse_names = static_metadata.reverse_names();
+        assert!(reverse_names.contains_key("Regular"));
+        assert!(reverse_names.contains_key("Wide"));
     }
 
     #[test]

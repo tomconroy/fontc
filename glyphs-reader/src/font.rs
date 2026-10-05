@@ -112,6 +112,9 @@ pub struct Font {
 pub struct CustomParameters {
     pub propagate_anchors: Option<bool>,
     pub use_typo_metrics: Option<bool>,
+    pub export_stat_table: Option<bool>,
+    pub elidable_stat_axis_value_names: Vec<SmolStr>,
+    pub style_names_as_stat_entries: Vec<SmolStr>,
     pub is_fixed_pitch: Option<bool>,
     pub fs_type: Option<u16>,
     pub has_wws_names: Option<bool>,
@@ -337,7 +340,8 @@ pub struct Glyph {
     pub export: bool,
     pub layers: Vec<Layer>,
     pub bracket_layers: Vec<Layer>,
-    pub unicode: BTreeSet<u32>,
+    /// The codepoints, in the order listed in the source
+    pub unicode: Vec<u32>,
     /// The left kerning group
     pub left_kern: Option<SmolStr>,
     /// The right kerning group
@@ -623,22 +627,27 @@ impl Layer {
     }
 
     /// NOTE: panics if called on a non-bracket layer
-    fn bracket_info(&self, axes: &[Axis]) -> BTreeMap<String, (Option<i64>, Option<i64>)> {
+    fn bracket_info(&self, axes: &[Axis]) -> BTreeMap<String, AxisRule> {
         assert!(
             !self.attributes.axis_rules.is_empty(),
             "all bracket layers have axis rules"
         );
         axes.iter()
             .zip(&self.attributes.axis_rules)
-            .map(|(axis, rule)| (axis.tag.clone(), (rule.min, rule.max)))
+            .map(|(axis, rule)| (axis.tag.clone(), rule.clone()))
             .collect()
     }
 
-    fn axis_rules_sort_key(&self) -> Vec<(i64, i64)> {
+    fn axis_rules_sort_key(&self) -> Vec<(OrderedFloat<f64>, OrderedFloat<f64>)> {
         self.attributes
             .axis_rules
             .iter()
-            .map(|ax| (ax.min.unwrap_or(i64::MIN), ax.max.unwrap_or(i64::MAX)))
+            .map(|ax| {
+                (
+                    ax.min.unwrap_or(f64::NEG_INFINITY.into()),
+                    ax.max.unwrap_or(f64::INFINITY.into()),
+                )
+            })
             .collect()
     }
 
@@ -660,11 +669,11 @@ pub struct LayerAttributes {
     pub color_palette: Option<i64>,
 }
 
-#[derive(Clone, Default, FromPlist, Debug, PartialEq, Hash)]
+#[derive(Clone, Default, FromPlist, Debug, PartialEq, Eq, Hash)]
 pub struct AxisRule {
     // if missing, assume default min/max for font
-    pub min: Option<i64>,
-    pub max: Option<i64>,
+    pub min: Option<OrderedFloat<f64>>,
+    pub max: Option<OrderedFloat<f64>>,
 }
 
 impl AxisRule {
@@ -681,10 +690,11 @@ impl AxisRule {
         let tail = name.get(idx + 1..)?;
         let (value, _) = tail.split_once(']')?;
         let value = str::parse::<u32>(value.trim()).ok()?;
+        let value = OrderedFloat(value as f64);
         let (min, max) = if reversed {
-            (None, Some(value as _))
+            (None, Some(value))
         } else {
-            (Some(value as _), None)
+            (Some(value), None)
         };
         Some(AxisRule { min, max })
     }
@@ -1070,7 +1080,10 @@ impl PlistParamsExt for Plist {
         let plist = self.as_dict()?;
         let name = plist.get("Name").and_then(Plist::as_str)?;
         let tag = plist.get("Tag").and_then(Plist::as_str)?;
-        let hidden = plist.get("hidden").and_then(Plist::as_bool);
+        let hidden = plist
+            .get("Hidden")
+            .or_else(|| plist.get("hidden"))
+            .and_then(Plist::as_bool);
         Some(Axis {
             name: name.into(),
             tag: tag.into(),
@@ -1282,26 +1295,63 @@ impl RawCustomParameters {
             match name.as_str() {
                 "Propagate Anchors" => add_and_report_issues!(propagate_anchors, Plist::as_bool),
                 "Use Typo Metrics" => add_and_report_issues!(use_typo_metrics, Plist::as_bool),
-                // <https://github.com/googlefonts/glyphsLib/blob/52c982399ba20dc96a2c2195df6fc6cea1f9a906/Lib/glyphsLib/builder/custom_params.py#L356>
+                "Has WWS Names" => add_and_report_issues!(has_wws_names, Plist::as_bool),
+                "Export STAT Table" => {
+                    add_and_report_issues!(export_stat_table, Plist::as_bool)
+                }
+                "Elidable STAT Axis Value Name" => match value.as_str() {
+                    Some(value) => params.elidable_stat_axis_value_names.push(value.into()),
+                    None => {
+                        log::warn!("failed to parse param for 'elidable_stat_axis_value_names'")
+                    }
+                },
+                "Style Name as STAT entry" => match value.as_str() {
+                    Some(value) => params.style_names_as_stat_entries.push(value.into()),
+                    None => log::warn!("failed to parse param for 'style_names_as_stat_entries'"),
+                },
+                // Glyphs uses short names (e.g. "subscriptXSize") but some fonts use the
+                // long UFO names (e.g. "openTypeOS2SubscriptXSize"). Both are accepted.
+                // https://github.com/googlefonts/glyphsLib/blob/d42d3b15/Lib/glyphsLib/builder/custom_params.py#L329-L340
                 "postscriptIsFixedPitch" | "isFixedPitch" => {
                     add_and_report_issues!(is_fixed_pitch, Plist::as_bool)
                 }
-                "Has WWS Names" => add_and_report_issues!(has_wws_names, Plist::as_bool),
-                "typoAscender" => add_and_report_issues!(typo_ascender, Plist::as_i64),
-                "typoDescender" => add_and_report_issues!(typo_descender, Plist::as_i64),
-                "typoLineGap" => add_and_report_issues!(typo_line_gap, Plist::as_i64),
-                "winAscent" => add_and_report_issues!(win_ascent, Plist::as_i64),
-                "winDescent" => add_and_report_issues!(win_descent, Plist::as_i64),
-                "hheaAscender" => add_and_report_issues!(hhea_ascender, Plist::as_i64),
-                "hheaDescender" => add_and_report_issues!(hhea_descender, Plist::as_i64),
-                "hheaLineGap" => add_and_report_issues!(hhea_line_gap, Plist::as_i64),
-                "vheaVertAscender" => add_and_report_issues!(vhea_ascender, Plist::as_i64),
-                "vheaVertDescender" => add_and_report_issues!(vhea_descender, Plist::as_i64),
-                "vheaVertLineGap" => add_and_report_issues!(vhea_line_gap, Plist::as_i64),
-                "underlineThickness" => {
+                "typoAscender" | "openTypeOS2TypoAscender" => {
+                    add_and_report_issues!(typo_ascender, Plist::as_i64)
+                }
+                "typoDescender" | "openTypeOS2TypoDescender" => {
+                    add_and_report_issues!(typo_descender, Plist::as_i64)
+                }
+                "typoLineGap" | "openTypeOS2TypoLineGap" => {
+                    add_and_report_issues!(typo_line_gap, Plist::as_i64)
+                }
+                "winAscent" | "openTypeOS2WinAscent" => {
+                    add_and_report_issues!(win_ascent, Plist::as_i64)
+                }
+                "winDescent" | "openTypeOS2WinDescent" => {
+                    add_and_report_issues!(win_descent, Plist::as_i64)
+                }
+                "hheaAscender" | "openTypeHheaAscender" => {
+                    add_and_report_issues!(hhea_ascender, Plist::as_i64)
+                }
+                "hheaDescender" | "openTypeHheaDescender" => {
+                    add_and_report_issues!(hhea_descender, Plist::as_i64)
+                }
+                "hheaLineGap" | "openTypeHheaLineGap" => {
+                    add_and_report_issues!(hhea_line_gap, Plist::as_i64)
+                }
+                "vheaVertAscender" | "vheaVertTypoAscender" | "openTypeVheaVertTypoAscender" => {
+                    add_and_report_issues!(vhea_ascender, Plist::as_i64)
+                }
+                "vheaVertDescender" | "vheaVertTypoDescender" | "openTypeVheaVertTypoDescender" => {
+                    add_and_report_issues!(vhea_descender, Plist::as_i64)
+                }
+                "vheaVertLineGap" | "vheaVertTypoLineGap" | "openTypeVheaVertTypoLineGap" => {
+                    add_and_report_issues!(vhea_line_gap, Plist::as_i64)
+                }
+                "underlineThickness" | "postscriptUnderlineThickness" => {
                     add_and_report_issues!(underline_thickness, Plist::as_ordered_f64)
                 }
-                "underlinePosition" => {
+                "underlinePosition" | "postscriptUnderlinePosition" => {
                     add_and_report_issues!(underline_position, Plist::as_ordered_f64)
                 }
                 // PostScript hinting: like PANOSE, blueScale/blueShift have a
@@ -1331,9 +1381,6 @@ impl RawCustomParameters {
                 "postscriptNominalWidthX" => {
                     add_and_report_issues!(postscript_nominal_width_x, Plist::as_ordered_f64)
                 }
-                // Glyphs uses short names (e.g. "subscriptXSize") but some fonts use the
-                // long UFO names (e.g. "openTypeOS2SubscriptXSize"). Both are accepted.
-                // https://github.com/googlefonts/glyphsLib/blob/d42d3b15/Lib/glyphsLib/builder/custom_params.py#L329-L340
                 "strikeoutPosition" | "openTypeOS2StrikeoutPosition" => {
                     add_and_report_issues!(strikeout_position, Plist::as_i64)
                 }
@@ -1454,7 +1501,12 @@ impl RawCustomParameters {
                 "panose" => panose = value.as_vec_of_ints(),
                 "openTypeOS2Panose" => panose_old = value.as_vec_of_ints(),
                 "glyphOrder" => add_and_report_issues!(glyph_order, Plist::as_vec_of_string),
-                "gasp Table" => add_and_report_issues!(gasp_table, Plist::as_gasp_table),
+                // Glyphs writes this name with either case, and glyphsLib
+                // registers a handler for both:
+                //     https://github.com/googlefonts/glyphsLib/blob/7819ab5e/Lib/glyphsLib/builder/custom_params.py#L574-L590
+                "gasp Table" | "GASP Table" => {
+                    add_and_report_issues!(gasp_table, Plist::as_gasp_table)
+                }
                 "Feature for Feature Variations" => {
                     add_and_report_issues!(feature_for_feature_variations, Plist::as_str, into)
                 }
@@ -1838,6 +1890,30 @@ impl RawLayer {
             }
     }
 
+    /// Return true if any of the layer's axis rules has a min or max bound.
+    fn has_bounded_axis_rules(&self) -> bool {
+        self.attributes
+            .axis_rules
+            .iter()
+            .any(|rule| rule.min.is_some() || rule.max.is_some())
+    }
+
+    /// Return true if this is a v3 alternate layer whose axis rules are all
+    /// blank, i.e. no bounds on any axis (`[]` in the Glyphs UI).
+    ///
+    /// Only plain alternates count: not ones that are also brace, color or
+    /// smart component layers.
+    fn is_blank_alternate(&self) -> bool {
+        self.is_bracket_layer(FormatVersion::V3)
+            && !self.has_bounded_axis_rules()
+            && self.attributes
+                == LayerAttributes {
+                    axis_rules: self.attributes.axis_rules.clone(),
+                    ..Default::default()
+                }
+            && self.part_selection.is_empty()
+    }
+
     fn v2_to_v3_attributes(&mut self) {
         // In Glyphs v2, 'brace' or intermediate layer coordinates are stored in the
         // layer name as comma-separated values inside braces
@@ -1885,6 +1961,8 @@ struct RawShape {
     pos: Vec<f64>,             // v3
     angle: Option<f64>,        // v3
     scale: Vec<f64>,           // v3
+    /// Horizontal and vertical slant, in degrees (v3)
+    slant: Vec<f64>,
 
     #[fromplist(alt_name = "attr")]
     attributes: ShapeAttributes,
@@ -2164,12 +2242,6 @@ impl From<RawMetricValue> for MetricValue {
 pub struct Instance {
     pub name: String,
     pub active: bool,
-    // So named to let FromPlist populate it from a field called "type"
-    pub type_: InstanceType,
-    pub axis_mappings: BTreeMap<String, AxisUserToDesignMap>,
-    pub axes_values: Vec<OrderedFloat<f64>>,
-    pub custom_parameters: CustomParameters,
-    properties: Vec<RawName>, // used for name resolution
     /// The "Style Linking" checkboxes of the Instances tab.
     ///
     /// glyphsLib derives `styleMapStyleName` from these two flags and nothing
@@ -2178,6 +2250,12 @@ pub struct Instance {
     /// <https://github.com/googlefonts/glyphsLib/blob/main/Lib/glyphsLib/builder/names.py#L77-L82>
     pub is_bold: bool,
     pub is_italic: bool,
+    // So named to let FromPlist populate it from a field called "type"
+    pub type_: InstanceType,
+    pub axis_mappings: BTreeMap<String, AxisUserToDesignMap>,
+    pub axes_values: Vec<OrderedFloat<f64>>,
+    pub custom_parameters: CustomParameters,
+    properties: Vec<RawName>, // used for name resolution
     /// "Style Linking > this instance is the X of", i.e. the family to link into.
     ///
     /// Empty or `Regular` means "work it out from the style name"; see
@@ -2207,6 +2285,8 @@ struct RawInstance {
     name: String,
     exports: Option<i64>,
     active: Option<i64>,
+    is_bold: Option<bool>,
+    is_italic: Option<bool>,
     type_: Option<String>,
     axes_values: Vec<OrderedFloat<f64>>,
 
@@ -2221,10 +2301,6 @@ struct RawInstance {
 
     weight_class: Option<String>,
     width_class: Option<String>,
-    // Style Linking; both default to off
-    // <https://github.com/googlefonts/glyphsLib/blob/main/Lib/glyphsLib/classes.py#L3269-L3270>
-    is_bold: Option<i64>,
-    is_italic: Option<i64>,
     link_style: Option<String>,
     properties: Vec<RawName>,
     custom_parameters: RawCustomParameters,
@@ -2811,14 +2887,17 @@ impl RawFont {
         Ok(())
     }
 
-    fn v2_to_v3_master_names(&mut self) -> Result<(), Error> {
+    /// Name masters that have no name, matching glyphsLib's `GSFontMaster.name`.
+    fn default_master_names(&mut self) {
         // in Glyphs 2, masters don't have a single 'name' attribute, but rather
         // a concatenation of three other optional attributes weirdly called
         // 'width', 'weight' and 'custom' (in exactly this order).
         // The first two can only contain few predefined values, the last one is
         // residual and free-form. 'width' and 'weight' default to 'Regular'
-        // when omitted in the source, 'custom' to the empty string. See:
+        // when omitted in the source, 'custom' to the empty string; a Glyphs 3
+        // master with no 'name' attribute is 'Regular' too. See:
         // https://github.com/schriftgestalt/GlyphsSDK/blob/Glyphs3/GlyphsFileFormat/GlyphsFileFormatv2.md
+        // https://github.com/schriftgestalt/GlyphsSDK/blob/Glyphs3/GlyphsFileFormat/GlyphsFileFormatv3.md
         // https://github.com/googlefonts/glyphsLib/blob/6.13.1/Lib/glyphsLib/classes.py#L1605-L1610
         //
         // Each is one whole component of the name, never a bag of words:
@@ -2827,11 +2906,11 @@ impl RawFont {
         // and even then only while another component is left to name the
         // master. glyphsLib's GSFontMaster._joinName:
         // https://github.com/googlefonts/glyphsLib/blob/6.13.1/Lib/glyphsLib/classes.py#L1714-L1725
+        //
+        // This runs after v2_to_v3, so the italic angle is read from the
+        // metrics, where both versions keep it by then.
+        let italic_angle_idx = self.metrics.iter().position(|m| m.type_ == "italic angle");
         for master in self.font_master.iter_mut() {
-            // Even though glyphs2 masters don't officially have a 'name' attribute,
-            // some glyphs2 sources produced by more recent versions of Glyphs
-            // sometimes have it (unclear exactly when or from which version on).
-            // We keep the 'name' attribute as is, instead of generating a one.
             if master.name.is_some() {
                 continue;
             }
@@ -2853,7 +2932,10 @@ impl RawFont {
                 names.remove(idx);
             }
 
-            let is_italic = master.italic_angle.is_some_and(|angle| angle != 0.0);
+            let is_italic = italic_angle_idx
+                .and_then(|idx| master.metric_values.get(idx))
+                .and_then(|value| value.pos)
+                .is_some_and(|angle| angle != 0.0);
             let name = if is_italic && names == ["Regular"] {
                 // A master with nothing but an italic angle is the Italic
                 "Italic".to_string()
@@ -2873,7 +2955,6 @@ impl RawFont {
             };
             master.name = Some(name);
         }
-        Ok(())
     }
 
     fn v2_to_v3_names(&mut self) -> Result<(), Error> {
@@ -2934,22 +3015,6 @@ impl RawFont {
             if let Some(custom_weight_class) = instance.custom_parameters.take("weightClass") {
                 instance.weight_class = custom_weight_class.to_string().into();
             }
-            // named clases become #s in v3
-            for (tag, opt) in [
-                ("wght", &mut instance.weight_class),
-                ("wdth", &mut instance.width_class),
-            ] {
-                let Some(value) = opt.as_ref() else {
-                    continue;
-                };
-                if f64::from_str(value).is_ok() {
-                    continue;
-                };
-                let Some(value) = lookup_class_value(tag, value) else {
-                    return Err(Error::UnknownValueName(value.clone()));
-                };
-                let _ = opt.insert(value.to_string());
-            }
 
             instance.properties.extend(v2_to_v3_name(
                 instance
@@ -2971,9 +3036,34 @@ impl RawFont {
         }
     }
 
+    /// Replace named instance weight and width classes with their numbers.
+    ///
+    /// Names are the Glyphs 2 spelling and the Glyphs 3 format defines both
+    /// fields as integers, but glyphsLib writes the names in v3 files too and
+    /// Glyphs.app reads either, so do the same for both versions.
+    fn normalize_instance_classes(&mut self) -> Result<(), Error> {
+        for instance in self.instances.iter_mut() {
+            for (tag, opt) in [
+                ("wght", &mut instance.weight_class),
+                ("wdth", &mut instance.width_class),
+            ] {
+                let Some(value) = opt.as_ref() else {
+                    continue;
+                };
+                if f64::from_str(value).is_ok() {
+                    continue;
+                };
+                let Some(value) = lookup_class_value(tag, value) else {
+                    return Err(Error::UnknownValueName(value.clone()));
+                };
+                let _ = opt.insert(value.to_string());
+            }
+        }
+        Ok(())
+    }
+
     /// `<See https://github.com/schriftgestalt/GlyphsSDK/blob/Glyphs3/GlyphsFileFormat/GlyphsFileFormatv3.md#differences-between-version-2>`
     fn v2_to_v3(&mut self) -> Result<(), Error> {
-        self.v2_to_v3_master_names()?;
         self.v2_to_v3_axes()?;
         self.v2_to_v3_metrics()?;
         self.v2_to_v3_instances()?;
@@ -3015,7 +3105,7 @@ fn make_glyph_order(glyphs: &[RawGlyph], custom_order: Option<Vec<SmolStr>>) -> 
 }
 
 // glyphs2 uses hex, glyphs3 uses base10
-fn parse_codepoint_str(s: &str, radix: u32) -> BTreeSet<u32> {
+fn parse_codepoint_str(s: &str, radix: u32) -> Vec<u32> {
     s.split(',')
         .map(|cp| u32::from_str_radix(cp, radix).unwrap())
         .collect()
@@ -3349,22 +3439,36 @@ impl TryFrom<RawShape> for Shape {
         let shape = if let Some(glyph_name) = from.glyph_name {
             assert!(!glyph_name.is_empty(), "A pointless component");
 
-            // V3 vs v2: The transform entry has been replaced by angle, pos and scale entries.
+            // V3 vs v2: The transform entry has been replaced by angle, pos, scale and slant.
             let mut transform = if let Some(transform) = from.transform {
                 Affine::parse_plist(&transform)?
             } else {
                 Affine::IDENTITY
             };
 
-            // Glyphs 3 gives us {angle, pos, scale}. Glyphs 2 gives us the standard 2x3 matrix.
-            // The matrix is more general and less ambiguous (what order do you apply the angle, pos, scale?)
-            // so convert Glyphs 3 to that. Order based on saving the same transformed comonent as
+            // Glyphs 3 gives us {angle, pos, scale, slant}. Glyphs 2 gives us the standard 2x3 matrix.
+            // The matrix is more general and less ambiguous (what order do you apply the angle, pos, scale, slant?)
+            // so convert Glyphs 3 to that. Order based on saving the same transformed component as
             // Glyphs 2 and Glyphs 3 then trying to convert one to the other.
             if !from.pos.is_empty() {
                 if from.pos.len() != 2 {
                     return Err(Error::StructuralError(format!("Bad pos: {:?}", from.pos)));
                 }
                 transform *= Affine::translate((from.pos[0], from.pos[1]));
+            }
+            if !from.slant.is_empty() {
+                if from.slant.len() != 2 {
+                    return Err(Error::StructuralError(format!(
+                        "Bad slant: {:?}",
+                        from.slant
+                    )));
+                }
+                // Glyphs stores slant as angles in degrees; Affine::skew wants the
+                // shear factors, i.e. the tangent of those angles.
+                transform *= Affine::skew(
+                    from.slant[0].to_radians().tan(),
+                    from.slant[1].to_radians().tan(),
+                );
             }
             if let Some(angle) = from.angle {
                 transform *= normalized_rotation(angle);
@@ -3537,9 +3641,74 @@ impl RawLayer {
     }
 }
 
+/// Turn "reverse" bracket layers into ordinary ones, like Glyphs.app does.
+///
+/// In a reverse bracket setup, a master layer has axis rules itself, and one
+/// of its alternate layers has blank axis rules, i.e. no bounds on any axis
+/// (`[]` in the Glyphs UI):
+/// <https://glyphsapp.com/learn/switching-shapes#reverse-bracket-layers>
+///
+/// Glyphs.app exports the blank alternate as the glyph's design at that
+/// master, and the master layer as the alternate for its rules, so we swap
+/// the two. Outside that setup, a blank alternate is not exported as a
+/// substitution at all: it loses its axis rules, which leaves it an ordinary
+/// non-master layer that we don't compile.
+fn resolve_reverse_bracket_layers(layers: &mut [RawLayer]) {
+    let is_master = |layer: &RawLayer| {
+        layer.associated_master_id.is_none()
+            || layer.associated_master_id.as_ref() == Some(&layer.layer_id)
+    };
+    let mut pairs = Vec::new();
+    let mut ignored = Vec::new();
+    for (i, master) in layers.iter().enumerate() {
+        if !is_master(master) {
+            continue;
+        }
+        let blank = layers
+            .iter()
+            .enumerate()
+            .filter(|(_, layer)| {
+                layer.is_blank_alternate()
+                    && layer.associated_master_id.as_ref() == Some(&master.layer_id)
+            })
+            .map(|(j, _)| j)
+            .collect::<Vec<_>>();
+        match blank.as_slice() {
+            [j] if master.has_bounded_axis_rules() => pairs.push((i, *j)),
+            _ => ignored.extend(blank),
+        }
+    }
+    for (i, j) in pairs {
+        log::debug!(
+            "using blank alternate layer '{}' as master '{}'",
+            layers[j].layer_id,
+            layers[i].layer_id
+        );
+        let master_id = layers[i].layer_id.clone();
+        let blank_id = std::mem::replace(&mut layers[j].layer_id, master_id.clone());
+        layers[j].associated_master_id = None;
+        layers[j].attributes.axis_rules.clear();
+        // the old master keeps its axis rules and becomes the alternate
+        layers[i].layer_id = blank_id;
+        layers[i].associated_master_id = Some(master_id);
+        layers.swap(i, j);
+    }
+    for j in ignored {
+        log::debug!("ignoring blank alternate layer '{}'", layers[j].layer_id);
+        layers[j].attributes.axis_rules.clear();
+    }
+}
+
 impl RawGlyph {
     // we pass in the radix because it depends on the version, stored in the font struct
-    fn build(self, format_version: FormatVersion, glyph_data: &GlyphData) -> Result<Glyph, Error> {
+    fn build(
+        mut self,
+        format_version: FormatVersion,
+        glyph_data: &GlyphData,
+    ) -> Result<Glyph, Error> {
+        if format_version == FormatVersion::V3 {
+            resolve_reverse_bracket_layers(&mut self.layers);
+        }
         let mut instances = Vec::new();
         let mut bracket_layers = Vec::new();
         for mut layer in self.layers {
@@ -3991,7 +4160,7 @@ fn lookup_class_value(axis_tag: &str, user_class: &str) -> Option<u16> {
         ("wdth", "extracondensed") => Some(2),
         ("wdth", "condensed") => Some(3),
         ("wdth", "semicondensed") => Some(4),
-        ("wdth", "" | "Medium (normal)") => Some(5),
+        ("wdth", "" | "medium(normal)") => Some(5),
         ("wdth", "semiexpanded") => Some(6),
         ("wdth", "expanded") => Some(7),
         ("wdth", "extraexpanded") => Some(8),
@@ -4124,6 +4293,8 @@ impl Instance {
         Ok(Instance {
             name: value.name.clone(),
             active,
+            is_bold: value.is_bold.unwrap_or_default(),
+            is_italic: value.is_italic.unwrap_or_default(),
             type_: value
                 .type_
                 .as_ref()
@@ -4135,8 +4306,6 @@ impl Instance {
             custom_parameters: value
                 .custom_parameters
                 .to_custom_params(ParamOwner::Instance(&value.name))?,
-            is_bold: value.is_bold.unwrap_or_default() != 0,
-            is_italic: value.is_italic.unwrap_or_default() != 0,
             link_style: value.link_style.clone(),
         })
     }
@@ -4336,6 +4505,8 @@ impl TryFrom<RawFont> for Font {
             // <https://github.com/googlefonts/fontc/issues/1029>
             from.v2_to_v3_names()?;
         }
+        from.default_master_names();
+        from.normalize_instance_classes()?;
 
         // TODO: this should be provided in a manner that allows for overrides
         let glyph_data = GlyphData::default();
@@ -4925,6 +5096,31 @@ impl Font {
         &self.masters[self.default_master_idx]
     }
 
+    /// Whether any glyph in the font uses `glyph_name` as a component.
+    pub fn is_used_as_component(&self, glyph_name: &str) -> bool {
+        self.glyphs.values().any(|g| {
+            g.layers
+                .iter()
+                .chain(g.bracket_layers.iter())
+                .flat_map(|l| l.shapes.iter())
+                .any(|shape| matches!(shape, Shape::Component(c) if c.name == glyph_name))
+        })
+    }
+
+    /// The id of the master that supplies the given master's kerning.
+    ///
+    /// "Link Metrics With Master"/"Link Metrics With First Master" replaces a
+    /// master's own kerning with the linked master's.
+    ///
+    /// <https://github.com/googlefonts/glyphsLib/blob/682ff4b17711/Lib/glyphsLib/builder/kerning.py#L33-L35>
+    pub fn kerning_source_id<'a>(&'a self, master_id: &'a str) -> &'a str {
+        self.masters
+            .iter()
+            .find(|m| m.id == master_id)
+            .and_then(|m| m.metrics_source_id.as_deref())
+            .unwrap_or(master_id)
+    }
+
     /// Whether the given master declares any kerning, LTR or RTL.
     pub fn has_kerns_for_master(&self, master_id: &str) -> bool {
         self.kerning_ltr
@@ -5006,23 +5202,14 @@ impl Font {
 //https://github.com/googlefonts/glyphsLib/blob/c4db6b981d/Lib/glyphsLib/builder/bracket_layers.py#L258
 fn synthesize_bracket_layer(
     old_layer: &Layer,
-    box_: BTreeMap<String, (Option<i64>, Option<i64>)>,
+    box_: BTreeMap<String, AxisRule>,
     axes: &[Axis],
 ) -> Layer {
     let mut new_layer = old_layer.clone();
     new_layer.associated_master_id = Some(std::mem::take(&mut new_layer.layer_id));
     new_layer.attributes.axis_rules = axes
         .iter()
-        .map(|axis| {
-            if let Some((min, max)) = box_.get(&axis.tag) {
-                AxisRule {
-                    min: min.map(|x| x as _),
-                    max: max.map(|x| x as _),
-                }
-            } else {
-                Default::default()
-            }
-        })
+        .map(|axis| box_.get(&axis.tag).cloned().unwrap_or_default())
         .collect();
 
     new_layer
@@ -5123,6 +5310,48 @@ mod tests {
         let font = RawFont::load(&v3_font).unwrap();
         // falls back to default
         assert_eq!(font.format_version, FormatVersion::V3);
+    }
+
+    #[test]
+    fn glyphs3_named_and_numeric_instance_classes() {
+        let font = Font::load(&glyphs3_dir().join("InstanceClasses.glyphs")).unwrap();
+
+        assert_eq!(
+            font.axis_mappings.get("Weight"),
+            Some(&AxisUserToDesignMap(vec![
+                (OrderedFloat(600.0), OrderedFloat(60.0)),
+                (OrderedFloat(650.0), OrderedFloat(70.0)),
+            ]))
+        );
+        assert_eq!(
+            font.axis_mappings.get("Width"),
+            Some(&AxisUserToDesignMap(vec![
+                (OrderedFloat(75.0), OrderedFloat(80.0)),
+                (OrderedFloat(100.0), OrderedFloat(90.0)),
+            ]))
+        );
+    }
+
+    #[test]
+    fn loads_stat_instance_metadata() {
+        let font = Font::load(&glyphs3_dir().join("StatInstanceMetadata.glyphs")).unwrap();
+
+        let bold_italic = &font.instances[0];
+        assert!(bold_italic.is_bold);
+        assert!(bold_italic.is_italic);
+        assert_eq!(bold_italic.custom_parameters.export_stat_table, Some(false));
+        assert_eq!(
+            bold_italic.custom_parameters.elidable_stat_axis_value_names,
+            ["Regular", "Regular"]
+        );
+        assert_eq!(
+            bold_italic.custom_parameters.style_names_as_stat_entries,
+            ["Bold", "Bold Italic"]
+        );
+
+        let upright = &font.instances[1];
+        assert!(!upright.is_bold);
+        assert!(!upright.is_italic);
     }
 
     #[test]
@@ -5254,7 +5483,7 @@ mod tests {
 
     fn assert_load_v2_matches_load_v3(name: &str, compare: LoadCompare) {
         let has_package = matches!(compare, LoadCompare::GlyphsAndPackage);
-        let _ = env_logger::builder().is_test(true).try_init();
+        let _ = tracing_subscriber::fmt().with_test_writer().try_init();
         let filename = format!("{name}.glyphs");
         let pkgname = format!("{name}.glyphspackage");
         let g2_file = glyphs2_dir().join(filename.clone());
@@ -5367,6 +5596,144 @@ mod tests {
         check_v2_to_v3_transform("Component.glyphs", "non_uniform_scale", expected);
     }
 
+    /// A slanted component must load the same from a Glyphs 2 matrix and Glyphs 3 fields.
+    ///
+    /// Both fixture files were written by Glyphs 3.4.1 (3436) from the same in-memory
+    /// font: v3 stores angle=20, scale=(0.8,0.8), slant=(10,0), while v2 stores the
+    /// equivalent raw `transform` matrix.
+    ///
+    /// The rotation makes the case discriminate slant-then-rotate from rotate-then-slant.
+    #[test]
+    fn read_component_slant_2_and_3() {
+        let expected = Affine::new([0.8, 0.2736, -0.1411, 0.7518, 0.0, 0.0]);
+        check_v2_to_v3_transform("ComponentSlant.glyphs", "slanted_square", expected);
+    }
+
+    /// Parse a Glyphs 3 component plist fragment and return its transform.
+    fn component_transform(shape_plist: &str) -> Affine {
+        let shape: Shape = RawShape::parse_plist(shape_plist)
+            .unwrap()
+            .try_into()
+            .unwrap();
+        let Shape::Component(component) = shape else {
+            panic!("{shape:?} should be a component");
+        };
+        component.transform
+    }
+
+    #[test]
+    fn parse_component_slant_key() {
+        let raw = RawShape::parse_plist(
+            r#"
+{
+ref = A;
+pos = (5,21);
+scale = (1,0.94);
+slant = (-0.7,0);
+}
+        "#,
+        )
+        .unwrap();
+        assert_eq!(raw.slant, vec![-0.7, 0.0]);
+    }
+
+    // Slant is in degrees; the shear factor is its tangent. The component transform is
+    // translate * slant * rotate * scale, i.e. a point is scaled, then rotated, then
+    // slanted, then translated.
+    //
+    // Provenance of the expected coefficients: the first tuple comes from the linked
+    // glyphsLib#1047 issue thread; the rotated tuple is backed by a Glyphs 3.4.1 round-trip
+    // (see the ComponentSlant fixture pair exercised by read_component_slant_2_and_3).
+    #[test]
+    fn read_component_slant_x_with_scale() {
+        let transform = component_transform(
+            r#"
+{
+ref = A;
+pos = (5,21);
+scale = (1,0.94);
+slant = (-0.7,0);
+}
+        "#,
+        );
+        assert_eq!(
+            round(transform, 9),
+            round(
+                Affine::new([1.0, 0.0, -0.011484837902484654, 0.94, 5.0, 21.0]),
+                9
+            )
+        );
+    }
+
+    #[test]
+    fn read_component_slant_with_rotation_and_scale() {
+        let transform = component_transform(
+            r#"
+{
+ref = A;
+angle = 20;
+scale = (0.8,0.8);
+slant = (10,0);
+}
+        "#,
+        );
+        assert_eq!(
+            round(transform, 9),
+            round(
+                Affine::new([
+                    0.8,
+                    0.273616114660535,
+                    -0.14106158456677195,
+                    0.7517540966287268,
+                    0.0,
+                    0.0
+                ]),
+                9
+            )
+        );
+    }
+
+    /// Vertical slant lands in the 'b' coefficient as tan(degrees).
+    ///
+    /// Unlike the two cases above this expectation is derived from the documented
+    /// conversion rather than from a Glyphs.app-produced reference file.
+    #[test]
+    fn read_component_slant_y() {
+        let transform = component_transform(
+            r#"
+{
+ref = A;
+slant = (0,5);
+}
+        "#,
+        );
+        assert_eq!(
+            round(transform, 9),
+            round(
+                Affine::new([1.0, 5f64.to_radians().tan(), 0.0, 1.0, 0.0, 0.0]),
+                9
+            )
+        );
+    }
+
+    #[test]
+    fn reject_malformed_component_slant() {
+        let raw = RawShape::parse_plist(
+            r#"
+{
+ref = A;
+slant = (10);
+}
+        "#,
+        )
+        .unwrap();
+        let result = Shape::try_from(raw);
+        assert!(
+            matches!(&result, Err(Error::StructuralError(msg)) if msg.starts_with("Bad slant")),
+            "{result:?}"
+        );
+    }
+
     #[test]
     fn upgrade_2_to_3_with_implicit_axes() {
         let font = Font::load(&glyphs2_dir().join("WghtVar_ImplicitAxes.glyphs")).unwrap();
@@ -5382,10 +5749,7 @@ mod tests {
     #[test]
     fn understand_v2_style_unquoted_hex_unicode() {
         let font = Font::load(&glyphs2_dir().join("Unicode-UnquotedHex.glyphs")).unwrap();
-        assert_eq!(
-            BTreeSet::from([0x1234]),
-            font.glyphs.get("name").unwrap().unicode,
-        );
+        assert_eq!(vec![0x1234], font.glyphs.get("name").unwrap().unicode);
         assert_eq!(1, font.glyphs.len());
     }
 
@@ -5393,7 +5757,7 @@ mod tests {
     fn understand_v2_style_quoted_hex_unicode_sequence() {
         let font = Font::load(&glyphs2_dir().join("Unicode-QuotedHexSequence.glyphs")).unwrap();
         assert_eq!(
-            BTreeSet::from([0x2044, 0x200D, 0x2215]),
+            vec![0x2044, 0x200D, 0x2215],
             font.glyphs.get("name").unwrap().unicode,
         );
         assert_eq!(1, font.glyphs.len());
@@ -5402,20 +5766,14 @@ mod tests {
     #[test]
     fn understand_v3_style_unquoted_decimal_unicode() {
         let font = Font::load(&glyphs3_dir().join("Unicode-UnquotedDec.glyphs")).unwrap();
-        assert_eq!(
-            BTreeSet::from([182]),
-            font.glyphs.get("name").unwrap().unicode
-        );
+        assert_eq!(vec![182], font.glyphs.get("name").unwrap().unicode);
         assert_eq!(1, font.glyphs.len());
     }
 
     #[test]
     fn understand_v3_style_unquoted_decimal_unicode_sequence() {
         let font = Font::load(&glyphs3_dir().join("Unicode-UnquotedDecSequence.glyphs")).unwrap();
-        assert_eq!(
-            BTreeSet::from([1619, 1764]),
-            font.glyphs.get("name").unwrap().unicode,
-        );
+        assert_eq!(vec![1619, 1764], font.glyphs.get("name").unwrap().unicode);
         assert_eq!(1, font.glyphs.len());
     }
 
@@ -5431,6 +5789,15 @@ mod tests {
     #[test]
     fn axis_hidden() {
         let font = Font::load(&glyphs3_dir().join("WghtVar_3master_CustomOrigin.glyphs")).unwrap();
+        assert_eq!(
+            font.axes.iter().map(|a| a.hidden).collect::<Vec<_>>(),
+            vec![Some(true)]
+        );
+    }
+
+    #[test]
+    fn axis_hidden_v2() {
+        let font = Font::load(&glyphs2_dir().join("WghtVar_HiddenAxis.glyphs")).unwrap();
         assert_eq!(
             font.axes.iter().map(|a| a.hidden).collect::<Vec<_>>(),
             vec![Some(true)]
@@ -5465,6 +5832,15 @@ mod tests {
         // string as an integer.
         let font = Font::load(&glyphs3_dir().join("CustomOrigin.glyphs")).unwrap();
         assert_eq!(1, font.default_master_idx);
+    }
+
+    #[rstest]
+    #[case::upright("UnnamedMaster.glyphs", "Regular")]
+    #[case::italic("UnnamedMaster-Italic.glyphs", "Italic")]
+    fn unnamed_v3_master_is_default(#[case] file: &str, #[case] expected: &str) {
+        let font = Font::load(&glyphs3_dir().join(file)).unwrap();
+        assert_eq!(1, font.default_master_idx);
+        assert_eq!(expected, font.masters[1].name);
     }
 
     #[rstest]
@@ -5533,7 +5909,7 @@ mod tests {
 
     #[test]
     fn glyph_order_override_obeyed() {
-        let _ = env_logger::builder().is_test(true).try_init();
+        let _ = tracing_subscriber::fmt().with_test_writer().try_init();
         let font = Font::load(&glyphs3_dir().join("WghtVar_GlyphOrder.glyphs")).unwrap();
         assert_eq!(vec!["hyphen", "space", "exclam"], font.glyph_order);
     }
@@ -6436,6 +6812,22 @@ etc;
     }
 
     #[test]
+    fn gasp_table_either_case() {
+        // Glyphs writes this parameter with either case and the uppercase
+        // spelling is the more common one in the wild, but we only matched
+        // the lowercase one, so the table was silently dropped.
+        let expected = BTreeMap::from([(8, 10), (20, 7), (65535, 15), (65536, 1)]);
+        for file in ["WghtVarGasp.glyphs", "WghtVarGaspUppercase.glyphs"] {
+            let font = Font::load(&glyphs3_dir().join(file)).unwrap();
+            assert_eq!(
+                Some(&expected),
+                font.custom_parameters.gasp_table.as_ref(),
+                "{file}"
+            );
+        }
+    }
+
+    #[test]
     fn custom_params_disable() {
         let font = Font::load(&glyphs3_dir().join("custom_param_disable.glyphs")).unwrap();
 
@@ -6475,6 +6867,64 @@ etc;
             Some(OrderedFloat(-300_f64)),
             font.custom_parameters.underline_position
         );
+    }
+
+    #[test]
+    fn read_longform_metric_param_names() {
+        let font = Font::load_from_string(
+            r#"{
+.formatVersion = 3;
+fontMaster = (
+{
+customParameters = (
+{name = postscriptUnderlineThickness; value = 70;},
+{name = postscriptUnderlinePosition; value = -120;},
+{name = openTypeOS2TypoAscender; value = 800;},
+{name = openTypeOS2TypoDescender; value = -200;},
+{name = openTypeOS2TypoLineGap; value = 10;},
+{name = openTypeOS2WinAscent; value = 1000;},
+{name = openTypeOS2WinDescent; value = 300;},
+{name = openTypeHheaAscender; value = 900;},
+{name = openTypeHheaDescender; value = -250;},
+{name = openTypeHheaLineGap; value = 20;},
+{name = openTypeVheaVertTypoAscender; value = 500;},
+{name = openTypeVheaVertTypoDescender; value = -500;},
+{name = openTypeVheaVertTypoLineGap; value = 30;}
+);
+id = "m01";
+},
+{
+customParameters = (
+{name = vheaVertTypoAscender; value = 510;},
+{name = vheaVertTypoDescender; value = -510;},
+{name = vheaVertTypoLineGap; value = 40;}
+);
+id = "m02";
+}
+);
+unitsPerEm = 1000;
+}"#,
+        )
+        .unwrap();
+        let params = &font.masters[0].custom_parameters;
+        assert_eq!(params.underline_thickness, Some(OrderedFloat(70.0)));
+        assert_eq!(params.underline_position, Some(OrderedFloat(-120.0)));
+        assert_eq!(params.typo_ascender, Some(800));
+        assert_eq!(params.typo_descender, Some(-200));
+        assert_eq!(params.typo_line_gap, Some(10));
+        assert_eq!(params.win_ascent, Some(1000));
+        assert_eq!(params.win_descent, Some(300));
+        assert_eq!(params.hhea_ascender, Some(900));
+        assert_eq!(params.hhea_descender, Some(-250));
+        assert_eq!(params.hhea_line_gap, Some(20));
+        assert_eq!(params.vhea_ascender, Some(500));
+        assert_eq!(params.vhea_descender, Some(-500));
+        assert_eq!(params.vhea_line_gap, Some(30));
+
+        let params = &font.masters[1].custom_parameters;
+        assert_eq!(params.vhea_ascender, Some(510));
+        assert_eq!(params.vhea_descender, Some(-510));
+        assert_eq!(params.vhea_line_gap, Some(40));
     }
 
     #[test]
@@ -6586,19 +7036,28 @@ etc;
         #[case] italic_angle: Option<f64>,
         #[case] expected: &str,
     ) {
+        // by the time masters are named, v2_to_v3 has moved the italic angle
+        // into the metrics
         let mut font = RawFont {
+            metrics: vec![RawMetric {
+                type_: "italic angle".into(),
+                ..Default::default()
+            }],
             font_master: vec![RawFontMaster {
                 id: "m01".into(),
                 width: width.map(String::from),
                 weight: weight.map(String::from),
                 custom: custom.map(String::from),
-                italic_angle: italic_angle.map(OrderedFloat),
+                metric_values: vec![RawMetricValue {
+                    pos: italic_angle.map(OrderedFloat),
+                    over: None,
+                }],
                 ..Default::default()
             }],
             ..Default::default()
         };
 
-        font.v2_to_v3_master_names().unwrap();
+        font.default_master_names();
 
         assert_eq!(font.font_master[0].name.as_deref(), Some(expected));
     }
@@ -6675,7 +7134,7 @@ etc;
             ..Default::default()
         };
 
-        font.v2_to_v3_master_names().unwrap();
+        font.default_master_names();
 
         assert_eq!(
             font.font_master[0].name.as_deref(),
@@ -6915,15 +7374,35 @@ etc;
             &[
                 AxisRule {
                     min: None,
-                    max: Some(400)
+                    max: Some(OrderedFloat(400.0))
                 },
                 AxisRule {
-                    min: Some(100),
+                    min: Some(OrderedFloat(100.0)),
                     max: None,
                 },
                 AxisRule {
                     min: None,
                     max: None,
+                },
+            ]
+        )
+    }
+
+    #[test]
+    fn parse_fractional_axis_rules() {
+        let plist =
+            r#"{ axisRules = ({ min = 39.6; max = 39.99; }, { min = 20; max = "60.5"; }); }"#;
+        let attrs = LayerAttributes::parse_plist(plist).unwrap();
+        assert_eq!(
+            attrs.axis_rules,
+            [
+                AxisRule {
+                    min: Some(OrderedFloat(39.6)),
+                    max: Some(OrderedFloat(39.99)),
+                },
+                AxisRule {
+                    min: Some(OrderedFloat(20.0)),
+                    max: Some(OrderedFloat(60.5)),
                 },
             ]
         )
@@ -6946,7 +7425,7 @@ etc;
             [
                 AxisRule {
                     min: None,
-                    max: Some(141)
+                    max: Some(OrderedFloat(141.0))
                 },
                 AxisRule::default()
             ]
@@ -6960,7 +7439,7 @@ etc;
             assert_eq!(
                 rule,
                 Some(AxisRule {
-                    min: Some(60),
+                    min: Some(OrderedFloat(60.0)),
                     max: None
                 }),
                 "{name}"
@@ -6976,7 +7455,7 @@ etc;
                 rule,
                 Some(AxisRule {
                     min: None,
-                    max: Some(60)
+                    max: Some(OrderedFloat(60.0))
                 })
             )
         }
@@ -6984,7 +7463,7 @@ etc;
 
     #[test]
     fn parse_layer_fails() {
-        for name in &["[hi]", "[45opsz]", "Medium [499‹wg]"] {
+        for name in &["[hi]", "[45opsz]", "Medium [499‹wg]", "[39.6]"] {
             assert!(AxisRule::from_layer_name(name).is_none(), "{name}")
         }
     }
@@ -7008,6 +7487,187 @@ etc;
                 .iter()
                 .all(|l| !l.attributes.axis_rules.is_empty())
         );
+    }
+
+    fn raw_layer(
+        layer_id: &str,
+        master_id: Option<&str>,
+        rules: &[(Option<f64>, Option<f64>)],
+    ) -> RawLayer {
+        RawLayer {
+            name: format!("name-{layer_id}"),
+            layer_id: layer_id.into(),
+            associated_master_id: master_id.map(Into::into),
+            attributes: LayerAttributes {
+                axis_rules: rules
+                    .iter()
+                    .map(|(min, max)| AxisRule {
+                        min: min.map(OrderedFloat),
+                        max: max.map(OrderedFloat),
+                    })
+                    .collect(),
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    fn layer_summary(layers: &[RawLayer]) -> Vec<(&str, Option<&str>, &str, usize)> {
+        layers
+            .iter()
+            .map(|l| {
+                (
+                    l.layer_id.as_str(),
+                    l.associated_master_id.as_deref(),
+                    l.name.as_str(),
+                    l.attributes.axis_rules.len(),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn resolve_reverse_bracket_layers_swap_in_every_master() {
+        let min_100 = [(Some(100.0), None)];
+        let blank = [(None, None)];
+        let mut layers = vec![
+            raw_layer("M1", None, &min_100),
+            raw_layer("B1", Some("M1"), &blank),
+            raw_layer("X1", Some("M1"), &[(None, Some(50.0))]),
+            raw_layer("M2", None, &min_100),
+            raw_layer("B2", Some("M2"), &blank),
+        ];
+        resolve_reverse_bracket_layers(&mut layers);
+        assert_eq!(
+            layer_summary(&layers),
+            [
+                ("M1", None, "name-B1", 0),
+                ("B1", Some("M1"), "name-M1", 1),
+                ("X1", Some("M1"), "name-X1", 1),
+                ("M2", None, "name-B2", 0),
+                ("B2", Some("M2"), "name-M2", 1),
+            ]
+        );
+        assert_eq!(
+            layers[1].attributes.axis_rules[0].min,
+            Some(OrderedFloat(100.0))
+        );
+    }
+
+    #[test]
+    fn resolve_reverse_bracket_layers_swap_multiple_axes() {
+        let mut layers = vec![
+            raw_layer("M1", None, &[(Some(100.0), None), (None, None)]),
+            raw_layer("B1", Some("M1"), &[(None, None), (None, None)]),
+        ];
+        resolve_reverse_bracket_layers(&mut layers);
+        assert_eq!(
+            layer_summary(&layers),
+            [("M1", None, "name-B1", 0), ("B1", Some("M1"), "name-M1", 2)]
+        );
+    }
+
+    #[test]
+    fn resolve_reverse_bracket_layers_ignore() {
+        let min_100 = [(Some(100.0), None)];
+        let blank = [(None, None)];
+        for (mut layers, ignored) in [
+            // master without axis rules
+            (
+                vec![
+                    raw_layer("M1", None, &[]),
+                    raw_layer("B1", Some("M1"), &blank),
+                ],
+                vec!["B1"],
+            ),
+            // master with blank axis rules, blank alternate stored first
+            (
+                vec![
+                    raw_layer("B1", Some("M1"), &blank),
+                    raw_layer("M1", None, &blank),
+                ],
+                vec!["B1"],
+            ),
+            // bounded master with more than one blank alternate
+            (
+                vec![
+                    raw_layer("M1", None, &min_100),
+                    raw_layer("B1", Some("M1"), &blank),
+                    raw_layer("B2", Some("M1"), &blank),
+                    raw_layer("X1", Some("M1"), &[(None, Some(50.0))]),
+                ],
+                vec!["B1", "B2"],
+            ),
+        ] {
+            let before = layers.clone();
+            resolve_reverse_bracket_layers(&mut layers);
+            // the ignored layers lose their axis rules, and are then skipped
+            // as drafts; nothing else changes
+            for (layer, old) in layers.iter().zip(&before) {
+                assert_eq!(layer.layer_id, old.layer_id);
+                if ignored.contains(&layer.layer_id.as_str()) {
+                    assert!(layer.attributes.axis_rules.is_empty());
+                    assert!(layer.is_draft());
+                } else {
+                    assert_eq!(layer, old);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn is_blank_alternate() {
+        let blank = [(None, None)];
+        assert!(raw_layer("B1", Some("M1"), &blank).is_blank_alternate());
+        assert!(raw_layer("B1", Some("M1"), &[(None, None), (None, None)]).is_blank_alternate());
+
+        let mut brace = raw_layer("B1", Some("M1"), &blank);
+        brace.attributes.coordinates = vec![OrderedFloat(75.0)];
+        let mut color = raw_layer("B1", Some("M1"), &blank);
+        color.attributes.color = true;
+        let mut smart = raw_layer("B1", Some("M1"), &blank);
+        smart.part_selection.insert("Width".into(), 2);
+        for (layer, why) in [
+            (raw_layer("M1", None, &blank), "master"),
+            (raw_layer("M1", Some("M1"), &blank), "master with own id"),
+            (raw_layer("B1", Some("M1"), &[]), "no axis rules"),
+            (raw_layer("B1", Some("M1"), &[(Some(100.0), None)]), "min"),
+            (raw_layer("B1", Some("M1"), &[(None, Some(50.0))]), "max"),
+            (
+                raw_layer("B1", Some("M1"), &[(None, None), (Some(1.0), None)]),
+                "bounded second axis",
+            ),
+            (brace, "brace"),
+            (color, "color"),
+            (smart, "smart component"),
+        ] {
+            assert!(!layer.is_blank_alternate(), "{why}");
+        }
+    }
+
+    #[test]
+    fn resolve_reverse_bracket_layers_not_applicable() {
+        let min_100 = [(Some(100.0), None)];
+        let mut brace = raw_layer("B1", Some("M1"), &[(None, None)]);
+        brace.attributes.coordinates = vec![OrderedFloat(75.0)];
+        for mut layers in [
+            // bounded master without a blank alternate
+            vec![
+                raw_layer("M1", None, &min_100),
+                raw_layer("X1", Some("M1"), &[(None, Some(50.0))]),
+            ],
+            // bounded master with a plain backup layer (no axis rules)
+            vec![
+                raw_layer("M1", None, &min_100),
+                raw_layer("X1", Some("M1"), &[]),
+            ],
+            // the blank alternate is also a brace layer
+            vec![raw_layer("M1", None, &min_100), brace.clone()],
+        ] {
+            let before = layers.clone();
+            resolve_reverse_bracket_layers(&mut layers);
+            assert_eq!(layers, before);
+        }
     }
 
     #[test]
@@ -7161,7 +7821,7 @@ etc;
 
     #[test]
     fn user_to_design_with_no_axes() {
-        let _ = env_logger::builder().is_test(true).try_init();
+        let _ = tracing_subscriber::fmt().with_test_writer().try_init();
         let mut myfont = RawFont {
             font_master: vec![RawFontMaster {
                 custom_parameters: RawCustomParameters(vec![make_axis_location_params(&[(
@@ -7177,7 +7837,7 @@ etc;
 
     #[test]
     fn user_to_design_with_unknown_axis_location() {
-        let _ = env_logger::builder().is_test(true).try_init();
+        let _ = tracing_subscriber::fmt().with_test_writer().try_init();
         let mut myfont = RawFont {
             axes: vec![Axis {
                 name: "Weight".into(),

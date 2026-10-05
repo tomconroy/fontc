@@ -55,14 +55,15 @@ $ cargo run -p fontc -- resources/testdata/glyphs3/WghtVar.glyphs
 $ cargo run -p fontc -- resources/testdata/fontra/minimal.fontra
 ```
 
-### Emit IR
+### Emit debug output
 
-If you pass the `--emit-ir` option, the IR will be written to disk inside
-the build working directory. This can be helpful when troubleshooting.
+If you pass the `--emit-debug` option, additional files that can be helpful
+when troubleshooting are written to a `debug` directory inside the build
+working directory.
 
 ```shell
-$ cargo run -p fontc -- --emit-ir resources/testdata/wght_var.designspace
-$ ls build/
+$ cargo run -p fontc -- --emit-debug resources/testdata/wght_var.designspace
+$ ls build/debug/
 ```
 
 ### Sources to play with
@@ -186,6 +187,26 @@ changes, you can set this as your git hooksPath:
 
 ```sh
 $ git config core.hooksPath "resources/githooks"
+```
+
+### Cargo.lock
+
+`Cargo.lock` is committed, so a given revision builds the same dependency
+graph everywhere, and CI builds with `--locked`. Dependency updates are
+deliberate: run `cargo update` and open a PR, most naturally at the start of
+a release cycle so crater validates the refreshed graph. A weekly CI job
+builds with the newest compatible dependencies to surface upstream breakage
+early, and audits the pinned graph against RustSec advisories and crates.io
+yank status (triaged findings: `.cargo/audit.toml`).
+
+If `Cargo.lock` conflicts when merging or rebasing, don't resolve it by hand:
+take either side whole and let cargo re-sync it against the merged manifests
+(it only changes the entries it has to):
+
+```sh
+$ git checkout --theirs -- Cargo.lock  # either side works
+$ cargo check
+$ git add Cargo.lock
 ```
 
 ## Releasing

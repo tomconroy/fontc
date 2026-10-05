@@ -50,6 +50,7 @@ use fontir::{
     source::Source,
 };
 use log::{debug, trace, warn};
+use tracing::info_span;
 
 #[cfg(not(feature = "rayon"))]
 use crate::norayon::SequentialScope as Scope;
@@ -59,7 +60,6 @@ use rayon::Scope;
 use crate::{
     Error,
     instance::{self, Pin},
-    timing::{JobTime, JobTimer},
     work::{AnyAccess, AnyContext, AnyWork},
 };
 
@@ -96,8 +96,6 @@ pub struct Workload {
     also_completes: HashMap<AnyWorkId, Vec<AnyWorkId>>,
     pub(crate) jobs_pending: HashMap<AnyWorkId, Job>,
     pub(crate) count_pending: HashMap<IdentifierDiscriminant, Arc<AtomicUsize>>,
-
-    pub(crate) timer: JobTimer,
 }
 
 /// A unit of executable work plus the identifiers of work that it depends on
@@ -134,6 +132,8 @@ fn priority(id: &AnyWorkId) -> u32 {
         AnyWorkId::Fe(FeWorkIdentifier::StaticMetadata) => 99,
         AnyWorkId::Fe(FeWorkIdentifier::GlobalMetrics) => 99,
         AnyWorkId::Be(BeWorkIdentifier::GatherIrKerning) => 99,
+        // the default master's fea gates marks and kerning; other masters don't
+        AnyWorkId::Be(BeWorkIdentifier::DEFAULT_FEATURES_AST) => 99,
         AnyWorkId::Be(BeWorkIdentifier::Features) => 99,
         AnyWorkId::Be(BeWorkIdentifier::GlyfFragment(..)) => 0,
         AnyWorkId::Be(BeWorkIdentifier::GvarFragment(..)) => 0,
@@ -143,18 +143,12 @@ fn priority(id: &AnyWorkId) -> u32 {
 }
 
 impl Workload {
-    // Pass in timer to enable t0 to be as early as possible
     pub fn new(
         source: Box<dyn Source>,
-        timer: JobTimer,
         skip_features: bool,
         flags: Flags,
         instance: Option<InstanceSpec>,
     ) -> Result<Self, Error> {
-        let time = timer
-            .create_timer(AnyWorkId::InternalTiming("Create workload"), 0)
-            .run();
-
         let mut workload = Self {
             source,
             job_count: 0,
@@ -170,7 +164,6 @@ impl Workload {
                 Some(instance) => PinState::Requested(instance),
                 None => PinState::NotRequested,
             },
-            timer,
         };
 
         // Create work roughly in the order it would typically occur
@@ -192,7 +185,8 @@ impl Workload {
         workload.add(workload.source.create_color_glyphs_work()?);
 
         // BE: f(IR, maybe other BE work) => binary
-        workload.add_skippable_feature_work(FeatureFirstPassWork::create());
+        // the default master's fea; any others are added when IR features complete
+        workload.add_skippable_feature_work(FeatureFirstPassWork::create(0));
         workload.add_skippable_feature_work(FeatureCompilationWork::create());
         workload.add(create_gasp_work());
         if workload.cff_outlines {
@@ -236,8 +230,6 @@ impl Workload {
 
         // Make a damn font
         workload.add(create_font_work());
-
-        workload.timer.add(time.complete());
 
         Ok(workload)
     }
@@ -409,11 +401,8 @@ impl Workload {
         fe_root: &FeContext,
         be_root: &BeContext,
         success: AnyWorkId,
-        timing: JobTime,
     ) -> Result<(), Error> {
         log::debug!("{success:?} successful");
-
-        self.timer.add(timing);
 
         self.complete_one(success.clone());
         self.mark_also_completed(&success);
@@ -479,6 +468,23 @@ impl Workload {
             }
         }
 
+        // A designspace can have a features.fea per master; we only know how
+        // many there are once the IR for features exists. The default master's
+        // job is added when we build the graph, so the FeaturesAst variant is
+        // never empty before we get here: anything that depends on it cannot
+        // have run yet.
+        // An instance compiles only the default source's features (see
+        // `instance::pin_frontend`), so it has no other masters' fea to parse.
+        if let AnyWorkId::Fe(FeWorkIdentifier::Features) = success
+            && matches!(self.pin, PinState::NotRequested)
+            && let Some(features) = fe_root.features.try_get()
+        {
+            for idx in 1..features.n_sources() {
+                debug!("Generating a BE job for fea source {idx}");
+                self.add_skippable_feature_work(FeatureFirstPassWork::create(idx));
+            }
+        }
+
         if let AnyWorkId::Fe(FeWorkIdentifier::KerningLocations) = success {
             if let Some(groups) = fe_root.kerning_locations.try_get() {
                 for location in groups.locations.iter() {
@@ -514,7 +520,7 @@ impl Workload {
                 .expect("Gather BE Kerning has to be pending")
                 .read_access = AccessBuilder::<AnyWorkId>::new()
                 .variant(BeWorkIdentifier::KernFragment(0))
-                .variant(BeWorkIdentifier::FeaturesAst)
+                .specific_instance(BeWorkIdentifier::DEFAULT_FEATURES_AST)
                 .variant(FeWorkIdentifier::Glyph(GlyphName::NOTDEF))
                 .variant(FeWorkIdentifier::StaticMetadata)
                 .build()
@@ -582,23 +588,13 @@ impl Workload {
     fn advance_pin(&mut self, fe_root: &FeContext) -> Result<bool, Error> {
         match std::mem::replace(&mut self.pin, PinState::Done) {
             PinState::Requested(spec) => {
-                let time = self
-                    .timer
-                    .create_timer(AnyWorkId::InternalTiming("pin"), 0)
-                    .run();
-                let pin = instance::pin_frontend(fe_root, &spec)?;
+                let pin = info_span!("pin").in_scope(|| instance::pin_frontend(fe_root, &spec))?;
                 self.pin = PinState::Glyphs(pin);
-                self.timer.add(time.complete());
                 Ok(true)
             }
             PinState::Glyphs(pin) => {
-                let time = self
-                    .timer
-                    .create_timer(AnyWorkId::InternalTiming("pin kerning"), 0)
-                    .run();
-                instance::pin_kerning(fe_root, &pin)?;
+                info_span!("pin kerning").in_scope(|| instance::pin_kerning(fe_root, &pin))?;
                 self.pin = PinState::Done;
-                self.timer.add(time.complete());
                 Ok(true)
             }
             done => {
@@ -647,11 +643,6 @@ impl Workload {
 
     /// Populate launchable with jobs ready to run from highest to lowest priority
     pub fn update_launchable(&mut self, launchable: &mut Vec<AnyWorkId>) {
-        let timing = self
-            .timer
-            .create_timer(AnyWorkId::InternalTiming("Launchable"), 0)
-            .run();
-
         launchable.clear();
         for id in self.jobs_pending.iter().filter_map(|(id, job)| {
             (!matches!(job.work, AnyWork::AlsoComplete(..)) && !job.running && self.can_run(job))
@@ -659,8 +650,6 @@ impl Workload {
         }) {
             launchable.push(id.clone());
         }
-
-        self.timer.add(timing.complete());
     }
 
     fn counters(&self, id: &AnyWorkId) -> Vec<Arc<AtomicUsize>> {
@@ -686,17 +675,16 @@ impl Workload {
         counters
     }
 
-    pub fn exec(mut self, fe_root: &FeContext, be_root: &BeContext) -> Result<JobTimer, Error> {
+    #[tracing::instrument(name = "fontc::Workload::exec", skip_all)]
+    pub fn exec(mut self, fe_root: &FeContext, be_root: &BeContext) -> Result<(), Error> {
         // Async work will send us it's ID on completion
-        let (send, recv) =
-            crossbeam_channel::unbounded::<(AnyWorkId, Result<(), Error>, JobTime)>();
+        let (send, recv) = crossbeam_channel::unbounded::<(AnyWorkId, Result<(), Error>)>();
 
         // a flag we set if we panic
         let abort_queued_jobs = Arc::new(AtomicBool::new(false));
 
         let run_queue = Arc::new(Mutex::new(Vec::<(
             AnyWork,
-            JobTime,
             AnyContext,
             Vec<Arc<AtomicUsize>>,
         )>::with_capacity(512)));
@@ -710,7 +698,7 @@ impl Workload {
 
             // To avoid allocation every poll for work
             let mut launchable = Vec::with_capacity(512.min(self.job_count));
-            let mut successes: Vec<(AnyWorkId, JobTime)> = Vec::with_capacity(64);
+            let mut successes: Vec<AnyWorkId> = Vec::with_capacity(64);
             let mut nth_wave = 0;
 
             while self.success.len() < self.job_count {
@@ -739,17 +727,11 @@ impl Workload {
                 // Get launchables ready to run
                 if !launchable.is_empty() {
                     nth_wave += 1;
-                    let timing = self
-                        .timer
-                        .create_timer(AnyWorkId::InternalTiming("run_q"), nth_wave)
-                        .run();
 
                     {
                         let mut run_queue = run_queue.lock().unwrap();
 
                         for id in launchable.iter() {
-                            let timing = self.timer.create_timer(id.clone(), nth_wave);
-
                             let job = self.jobs_pending.get_mut(id).unwrap();
                             log::trace!("Start {id:?}");
                             job.running = true;
@@ -766,21 +748,15 @@ impl Workload {
                             );
 
                             let counters = self.counters(id);
-                            let timing = timing.queued();
-                            run_queue.push((work, timing, work_context, counters));
+                            run_queue.push((work, work_context, counters));
                         }
 
                         // Try to prioritize the critical path based on --emit-timing observation
                         // <https://github.com/googlefonts/fontc/issues/456>, <https://github.com/googlefonts/fontc/pull/565>
                         run_queue.sort_by_cached_key(|(work, ..)| priority(&work.id()));
                     }
-                    self.timer.add(timing.complete());
 
                     // Spawn for every job that's executable. Each spawn will pull one item from the run queue.
-                    let timing = self
-                        .timer
-                        .create_timer(AnyWorkId::InternalTiming("spawn"), nth_wave)
-                        .run();
                     for _ in 0..launchable.len() {
                         let send = send.clone();
                         let run_queue = run_queue.clone();
@@ -788,11 +764,12 @@ impl Workload {
 
                         scope.spawn(move |_| {
                             let runnable = { run_queue.lock().unwrap().pop() };
-                            let Some((work, timing, work_context, counters)) = runnable else {
+                            let Some((work, work_context, counters)) = runnable else {
                                 panic!("Spawned more jobs than items available to run");
                             };
                             let id = work.id();
-                            let timing = timing.run();
+                            let work_span = create_work_span(&id, nth_wave);
+                            let _enter = work_span.enter();
                             if abort.load(Ordering::Relaxed) {
                                 log::trace!("Aborting {id:?}");
                                 return;
@@ -831,32 +808,20 @@ impl Workload {
                                     counter.fetch_sub(1, Ordering::AcqRel);
                                 }
                             }
-                            let timing = timing.complete();
 
-                            if let Err(e) = send.send((id.clone(), result, timing)) {
+                            if let Err(e) = send.send((id.clone(), result)) {
                                 log::error!("Unable to write {id:?} to completion channel: {e}");
                             }
                         })
                     }
-                    self.timer.add(timing.complete());
                 }
 
                 // Complete everything that has reported since our last check
                 if successes.is_empty() {
-                    let timing = self
-                        .timer
-                        .create_timer(AnyWorkId::InternalTiming("rc"), nth_wave)
-                        .run();
                     self.read_completions(&mut successes, &recv, RecvType::Blocking)?;
-                    self.timer.add(timing.complete());
-                    let timing = self
-                        .timer
-                        .create_timer(AnyWorkId::InternalTiming("hs"), nth_wave)
-                        .run();
-                    for (success, timing) in successes.iter() {
-                        self.handle_success(fe_root, be_root, success.clone(), timing.clone())?;
+                    for success in successes.iter() {
+                        self.handle_success(fe_root, be_root, success.clone())?;
                     }
-                    self.timer.add(timing.complete());
                 }
 
                 if launchable.is_empty() && successes.is_empty() {
@@ -904,13 +869,13 @@ impl Workload {
             }
         }
 
-        Ok(self.timer)
+        Ok(())
     }
 
     fn read_completions(
         &mut self,
-        successes: &mut Vec<(AnyWorkId, JobTime)>,
-        recv: &Receiver<(AnyWorkId, Result<(), Error>, JobTime)>,
+        successes: &mut Vec<AnyWorkId>,
+        recv: &Receiver<(AnyWorkId, Result<(), Error>)>,
         initial_read: RecvType,
     ) -> Result<(), Error> {
         successes.clear();
@@ -927,11 +892,11 @@ impl Workload {
                 }
             },
         };
-        while let Some((completed_id, result, timing)) = opt_complete.take() {
+        while let Some((completed_id, result)) = opt_complete.take() {
             if !match result {
                 Ok(..) => {
                     if !self.success.contains(&completed_id) {
-                        successes.push((completed_id.clone(), timing));
+                        successes.push(completed_id.clone());
                         true
                     } else {
                         false
@@ -991,7 +956,11 @@ impl Workload {
     ///
     /// Returns the set of ids for tasks that executed as a result of this run.
     #[cfg(test)]
-    pub fn run_for_test(&mut self, fe_root: &FeContext, be_root: &BeContext) -> HashSet<AnyWorkId> {
+    pub fn run_for_test(
+        &mut self,
+        fe_root: &FeContext,
+        be_root: &BeContext,
+    ) -> Result<HashSet<AnyWorkId>, Error> {
         let pre_success = self.success.clone();
         let mut sorted_pre_success = pre_success.iter().collect::<Vec<_>>();
         sorted_pre_success.sort();
@@ -1040,10 +1009,8 @@ impl Workload {
             }
 
             let id = &launchable[0];
-            let timing = self.timer.create_timer(id.clone(), 0);
             let job = self.jobs_pending.get(id).unwrap();
 
-            let timing = timing.queued();
             let context = AnyContext::for_work(
                 fe_root,
                 be_root,
@@ -1052,20 +1019,19 @@ impl Workload {
                 job.write_access.clone(),
             );
             log::debug!("Exec {id:?}");
-            let timing = timing.run();
-            job.work
-                .exec(context)
-                .unwrap_or_else(|e| panic!("{id:?} failed: {e:?}"));
+            job.work.exec(context).map_err(|e| {
+                log::error!("{id:?} failed: {e:?}");
+                e
+            })?;
 
             for counter in self.counters(id) {
                 counter.fetch_sub(1, Ordering::AcqRel);
             }
 
-            let timing = timing.complete();
-            self.handle_success(fe_root, be_root, id.clone(), timing)
+            self.handle_success(fe_root, be_root, id.clone())
                 .unwrap_or_else(|e| panic!("Failed to handle success for {id:?}: {e}"));
         }
-        self.success.difference(&pre_success).cloned().collect()
+        Ok(self.success.difference(&pre_success).cloned().collect())
     }
 }
 
@@ -1078,5 +1044,22 @@ fn get_panic_message(msg: Box<dyn std::any::Any + Send + 'static>) -> String {
             Some(s) => s.to_owned(),
             None => "Box<dyn Any>".to_owned(),
         },
+    }
+}
+
+fn create_work_span(id: &AnyWorkId, nth_wave: usize) -> tracing::Span {
+    match id {
+        AnyWorkId::Fe(fe) => info_span!(
+            "FeWork",
+            kind = fe.discriminant(),
+            id = ?id,
+            nth_wave,
+        ),
+        AnyWorkId::Be(be) => info_span!(
+            "BeWork",
+            kind = be.discriminant(),
+            id = ?id,
+            nth_wave,
+        ),
     }
 }

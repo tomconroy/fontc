@@ -3,6 +3,7 @@ use std::{io, path::PathBuf};
 use thiserror::Error;
 
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum Error {
     #[error("'{0}' exists but is not a directory")]
     ExpectedDirectory(PathBuf),
@@ -16,8 +17,6 @@ pub enum Error {
     StdioWriteFail(#[source] io::Error),
     #[error("Unrecognized source {0}")]
     UnrecognizedSource(PathBuf),
-    #[error(transparent)]
-    YamlSerError(#[from] serde_yaml::Error),
     #[error(transparent)]
     FontIrError(#[from] fontir::error::Error),
     #[error(transparent)]

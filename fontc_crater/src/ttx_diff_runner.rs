@@ -1,9 +1,23 @@
-use std::{collections::BTreeMap, path::PathBuf, process::Command};
+use std::{
+    collections::BTreeMap,
+    path::{Path, PathBuf},
+    process::Command,
+    sync::atomic::{AtomicUsize, Ordering},
+};
 
-use crate::{BuildType, Results, RunResult, Target, args::Flavor, ci::ResultsCache};
+use crate::{
+    BuildType, Results, RunResult, Target,
+    args::Flavor,
+    ci::{FontmakeOutput, ResultsCache},
+};
 
 // Run ttx-diff via python -m to ensure we use the venv's installed version
 static TTX_DIFF_MODULE: &str = "ttx_diff";
+// holds the sha256 of the font fontc produced; written by ttx_diff into the
+// build dir, keep in sync with core.py
+static FONTC_TTF_HASH_FILE: &str = "fontc.sha256";
+// ttx_diff's exit code for "the font fontc produced matched the hash we passed"
+const UNCHANGED_EXIT_CODE: i32 = 3;
 
 // ttx_diff prefixes the reason it declines a target with this; see `skip` in
 // ttx_diff/src/ttx_diff/core.py
@@ -22,6 +36,8 @@ pub(super) struct TtxContext {
     pub results_cache: ResultsCache,
     pub flavor: Flavor,
     pub instance: Option<String>,
+    pub reused_cached_results: AtomicUsize,
+    pub reused_fontmake_failures: AtomicUsize,
 }
 
 pub(super) fn run_ttx_diff(ctx: &TtxContext, target: &Target) -> RunResult<DiffOutput, DiffError> {
@@ -30,8 +46,15 @@ pub(super) fn run_ttx_diff(ctx: &TtxContext, target: &Target) -> RunResult<DiffO
     let source_path = target.source_path(&ctx.source_cache);
     let compare = target.build.name();
     let build_dir = outdir.join(compare);
-    ctx.results_cache
+    let reused_fontmake = ctx
+        .results_cache
         .copy_cached_files_to_build_dir(target, &build_dir);
+    if reused_fontmake == Some(FontmakeOutput::Failure) {
+        ctx.reused_fontmake_failures.fetch_add(1, Ordering::Relaxed);
+    }
+    // we can only trust a cached result if fontmake's half of the comparison is
+    // the same one that produced it, which is only true if it came from the cache
+    let cached = reused_fontmake.and_then(|_| ctx.results_cache.load_result(target));
     let mut cmd = Command::new("python3");
     cmd.args([
         "-m",
@@ -54,6 +77,10 @@ pub(super) fn run_ttx_diff(ctx: &TtxContext, target: &Target) -> RunResult<DiffO
     }
     if let Some(instance) = &ctx.instance {
         cmd.arg("--instance").arg(instance);
+    }
+    if let Some(cached) = cached.as_ref() {
+        cmd.arg("--expected_fontc_ttf_hash")
+            .arg(&cached.fontc_ttf_hash);
     }
     if target.build == BuildType::GfTools {
         cmd.arg("--config")
@@ -86,6 +113,18 @@ pub(super) fn run_ttx_diff(ctx: &TtxContext, target: &Target) -> RunResult<DiffO
                 }
             }
             Ok(RawDiffOutput::Error(error)) => classify_compile_failure(error),
+        },
+        // fontc produced the same font as last time, so last time's result stands
+        Some(UNCHANGED_EXIT_CODE) => match cached {
+            Some(cached) => {
+                ctx.reused_cached_results.fetch_add(1, Ordering::Relaxed);
+                log::trace!("reused cached result for {target}");
+                return cached.into_result();
+            }
+            // we only pass --expected_fontc_ttf_hash when we have a cached result
+            None => RunResult::Fail(DiffError::Other(
+                "ttx_diff reported no change without a cached result".to_string(),
+            )),
         },
         Some(124) => RunResult::Fail(DiffError::Other("ttx_diff timed out".to_string())),
         // ttx_diff declines sources it can't compare in the requested mode (a
@@ -120,9 +159,14 @@ pub(super) fn run_ttx_diff(ctx: &TtxContext, target: &Target) -> RunResult<DiffO
         log::warn!("error running {target} '{err}'");
     }
 
-    if fontmake_finished(&result) {
+    // a runtime error says nothing about fontmake; otherwise the build dir
+    // holds its font or a record of its failure, either of which we can reuse
+    if !matches!(result, RunResult::Fail(DiffError::Other(_))) {
         ctx.results_cache
             .save_built_files_to_cache(target, &build_dir);
+        if let Some(hash) = read_fontc_ttf_hash(&build_dir) {
+            ctx.results_cache.save_result(target, hash, &result);
+        }
     }
     result
 }
@@ -152,15 +196,17 @@ fn classify_compile_failure(error: CompileFailed) -> RunResult<DiffOutput, DiffE
     RunResult::Fail(DiffError::CompileFailed(error))
 }
 
-fn fontmake_finished(result: &RunResult<DiffOutput, DiffError>) -> bool {
-    match result {
-        RunResult::Success(_) => true,
-        RunResult::Fail(DiffError::CompileFailed(diff)) => diff.fontmake.is_none(),
-        RunResult::Fail(DiffError::Other(_)) => false,
-    }
+/// The hash ttx_diff recorded for the font fontc just produced.
+///
+/// Absent if fontc did not produce a font.
+fn read_fontc_ttf_hash(build_dir: &Path) -> Option<String> {
+    let path = build_dir.join(FONTC_TTF_HASH_FILE);
+    let hash = std::fs::read_to_string(path).ok()?;
+    let hash = hash.trim();
+    (!hash.is_empty()).then(|| hash.to_owned())
 }
 
-#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(super) enum DiffOutput {
     Identical,
@@ -293,8 +339,22 @@ pub(crate) enum DiffError {
     Other(String),
 }
 
+impl DiffError {
+    /// Whether `other` failed the same way, ignoring what was printed.
+    pub(crate) fn same_kind(&self, other: &DiffError) -> bool {
+        match (self, other) {
+            (DiffError::CompileFailed(a), DiffError::CompileFailed(b)) => {
+                a.fontc.is_some() == b.fontc.is_some()
+                    && a.fontmake.is_some() == b.fontmake.is_some()
+            }
+            (DiffError::Other(_), DiffError::Other(_)) => true,
+            _ => false,
+        }
+    }
+}
+
 /// One or both compilers failed to run
-#[derive(Debug, serde::Deserialize, serde::Serialize)]
+#[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) struct CompileFailed {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -304,7 +364,7 @@ pub(crate) struct CompileFailed {
 }
 
 /// Info regarding the failure of a single compiler
-#[derive(Debug, serde::Deserialize, serde::Serialize)]
+#[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) struct CompilerFailure {
     pub(crate) command: String,

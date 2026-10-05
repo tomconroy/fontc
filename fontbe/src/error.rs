@@ -22,11 +22,26 @@ use write_fonts::{
 };
 
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum Error {
     #[error("IO failure")]
     IoError(#[from] io::Error),
     #[error(transparent)]
     FeaCompileError(#[from] CompilerError),
+    #[error("failed to merge the masters' features: {0}")]
+    FeaMergeError(#[from] fea_rs::compile::MergeError),
+    #[error(
+        "the masters have {0} distinct feature files but none belongs to the default master; \
+         merging needs the default master's features"
+    )]
+    VariableFeaNoDefaultMaster(usize),
+    #[error("feature source '{0}' is not associated with any master")]
+    VariableFeaSourceWithoutMaster(String),
+    #[error("could not normalize the location of feature source '{fea}': {error}")]
+    VariableFeaBadLocation {
+        fea: String,
+        error: fontdrasil::error::Error,
+    },
     #[error(transparent)]
     GlyphOrderError(#[from] GlyphOrderError),
     #[error("'{0}' {1}")]
@@ -106,6 +121,8 @@ pub enum Error {
     NoVariationModel(NormalizedLocation),
     #[error("Delta error '{0:?}'")]
     DeltaError(DeltaError),
+    #[error("Duplicate axis mapping input {0:?}")]
+    DuplicateAxisMapping(NormalizedLocation),
     #[error("No glyph id for '{0}'")]
     MissingGlyphId(GlyphName),
     #[error("Error making CMap: {0}")]
@@ -121,6 +138,7 @@ pub enum Error {
 }
 
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum GlyphProblem {
     InconsistentComponents,
     InconsistentPathElements,

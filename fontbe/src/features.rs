@@ -18,6 +18,7 @@ use fea_rs::{
     DiagnosticSet, GlyphMap, Opts, ParseTree,
     compile::{
         Compilation, FeatureBuilder, FeatureProvider, GlyphPredicateAttr, NopFeatureProvider,
+        PendingCompilation,
         PendingLookup, VariationInfo, error::CompilerError,
     },
     parse::{FileSystemResolver, SourceLoadError, SourceResolver},
@@ -26,8 +27,8 @@ use fea_rs::{
 
 use fontir::{
     ir::{
-        self, FeatureGenerationPlan, FeatureGenerationSettings, FeatureWriterMode, FeaturesSource,
-        GdefCategories, GlyphOrder, StaticMetadata,
+        self, FeatureGenerationPlan, FeatureGenerationSettings, FeatureSources, FeatureWriterMode,
+        FeaturesSource, GdefCategories, GlyphOrder, StaticMetadata,
     },
     orchestration::WorkId as FeWorkId,
 };
@@ -49,9 +50,8 @@ use crate::{
     error::Error,
     orchestration::{
         AnyWorkId, BeWork, Context, ExtraFeaTables, FeaFirstPassOutput, FeaRsKerns, FeaRsMarks,
-        WorkId,
+        FeaSourceIdx, WorkId,
     },
-    paths::Paths,
 };
 
 mod feature_variations;
@@ -76,8 +76,15 @@ const MKMK: Tag = Tag::new(b"mkmk");
 const ABVM: Tag = Tag::new(b"abvm");
 const BLWM: Tag = Tag::new(b"blwm");
 
+/// Parse, validate, and first-pass compile one of the font's FEA sources.
+///
+/// A designspace can have a features.fea per master; each distinct source is
+/// compiled by its own instance of this work, and [`FeatureCompilationWork`]
+/// merges the results when they differ.
 #[derive(Debug)]
-pub struct FeatureFirstPassWork {}
+pub struct FeatureFirstPassWork {
+    idx: FeaSourceIdx,
+}
 
 #[derive(Debug)]
 pub struct FeatureCompilationWork {}
@@ -333,58 +340,12 @@ impl VariationInfo for FeaVariationInfo<'_> {
         &self,
         values: &HashMap<NormalizedLocation, i16>,
     ) -> Result<(i16, Vec<(VariationRegion, i16)>), Error> {
-        // Compute deltas using f64 as 1d point and delta, then ship them home as i16
-        let point_seqs: HashMap<_, _> = values
-            .iter()
-            .map(|(pos, value)| (pos.clone(), vec![*value as f64]))
-            .collect();
-
-        let locations: HashSet<_> = point_seqs.keys().collect();
-        let global_locations: HashSet<_> =
-            self.static_metadata.variation_model.locations().collect();
-
-        // Try to reuse the global model, or make a new sub-model only with the locations we
-        // are asked for so we can support sparseness
-        let var_model: Cow<'_, VariationModel> = if locations == global_locations {
-            Cow::Borrowed(&self.static_metadata.variation_model)
-        } else {
-            Cow::Owned(VariationModel::new(
-                locations.into_iter().cloned().collect(),
-                self.static_metadata.axes.axis_order(),
-            ))
-        };
-
-        // Only 1 value per region for our input
-        let deltas: Vec<_> = var_model
-            .deltas(&point_seqs)
-            .map_err(Error::DeltaError)?
-            .into_iter()
-            .map(|(region, values)| {
-                assert!(values.len() == 1, "{} values?!", values.len());
-                (region, values[0])
-            })
-            .collect();
-
-        // Compute the default on the unrounded deltas
-        let default_value = deltas
-            .iter()
-            .filter_map(|(region, value)| {
-                let scaler = region.scalar_at(&var_model.default).into_inner();
-                (scaler != 0.0).then_some(*value * scaler)
-            })
-            .sum::<f64>()
-            .ot_round();
-
-        // Produce the desired delta type
-        let mut fears_deltas = Vec::with_capacity(deltas.len());
-        for (region, value) in deltas.iter().filter(|(r, _)| !r.is_default()) {
-            fears_deltas.push((
-                region.to_write_fonts_variation_region(&self.static_metadata.axes),
-                value.ot_round(),
-            ));
-        }
-
-        Ok((default_value, fears_deltas))
+        fontdrasil::variations::resolve_variable_metric(
+            &self.static_metadata.variation_model,
+            &self.static_metadata.axes,
+            values,
+        )
+        .map_err(Error::DeltaError)
     }
 
     fn axis_count(&self) -> u16 {
@@ -439,20 +400,9 @@ impl FeatureCompilationWork {
         plan: &FeatureGenerationPlan,
         compile_debg: bool,
     ) -> Result<Compilation, Error> {
-        let feature_variations = static_metadata
-            .variations
-            .as_ref()
-            .map(|ir_variations| {
-                feature_variations::FeatureVariationsProvider::new(
-                    ir_variations,
-                    static_metadata,
-                    glyph_order,
-                )
-            })
-            .transpose()?;
         let var_info = FeaVariationInfo::new(static_metadata);
         let feature_writer =
-            FeatureWriter::new(kerns, marks, feature_variations, append_forced_tags(plan));
+            self.feature_writer(static_metadata, glyph_order, kerns, marks, plan)?;
         // we've already validated the AST, so we only need to compile
         match fea_rs::compile::compile(
             &ast.ast,
@@ -470,6 +420,128 @@ impl FeatureCompilationWork {
             ))),
         }
     }
+
+    /// Compile each master's FEA on its own and merge the results.
+    ///
+    /// Used when the masters of a designspace do not all share a features.fea.
+    /// Every master is compiled to pre-build state, those are merged into one
+    /// variable compilation, and only then does the feature writer run: the
+    /// generated kerning and marks, the `ItemVariationStore`, and everything
+    /// else that exists once per font are produced a single time.
+    #[allow(clippy::too_many_arguments)]
+    fn compile_merged(
+        &self,
+        static_metadata: &StaticMetadata,
+        glyph_order: &GlyphOrder,
+        features: &FeatureSources,
+        asts: &HashMap<FeaSourceIdx, Arc<FeaFirstPassOutput>>,
+        kerns: &FeaRsKerns,
+        marks: &FeaRsMarks,
+        plan: &FeatureGenerationPlan,
+        compile_debg: bool,
+    ) -> Result<Compilation, Error> {
+        let opts = Opts::new().compile_debg(compile_debg);
+        let masters = master_compilations(features, asts, static_metadata, &marks.glyphmap, &opts)?;
+        let var_info = FeaVariationInfo::new(static_metadata);
+        let merged = fea_rs::compile::merge(masters, &var_info)?;
+
+        let feature_writer =
+            self.feature_writer(static_metadata, glyph_order, kerns, marks, plan)?;
+        match merged.finish(Some(&feature_writer)) {
+            Ok((result, warnings)) => {
+                log_fea_warnings("compilation", &warnings);
+                Ok(result)
+            }
+            Err(errors) => Err(Error::FeaCompileError(CompilerError::CompilationFail(
+                errors,
+            ))),
+        }
+    }
+
+    fn feature_writer<'a>(
+        &self,
+        static_metadata: &StaticMetadata,
+        glyph_order: &GlyphOrder,
+        kerns: &'a FeaRsKerns,
+        marks: &'a FeaRsMarks,
+        plan: &FeatureGenerationPlan,
+    ) -> Result<FeatureWriter<'a>, Error> {
+        let feature_variations = static_metadata
+            .variations
+            .as_ref()
+            .map(|ir_variations| {
+                feature_variations::FeatureVariationsProvider::new(
+                    ir_variations,
+                    static_metadata,
+                    glyph_order,
+                )
+            })
+            .transpose()?;
+        Ok(FeatureWriter::new(
+            kerns,
+            marks,
+            feature_variations,
+            append_forced_tags(plan),
+        ))
+    }
+}
+
+/// Compile each master's FEA into the pre-build state that [`merge`] consumes.
+///
+/// The masters that share a source each get their own compilation of it: the
+/// values in a master's feature file are that master's contribution to the
+/// variation model, not something to interpolate through. The default master
+/// comes first, as `merge` requires.
+///
+/// [`merge`]: fea_rs::compile::merge
+fn master_compilations(
+    features: &FeatureSources,
+    asts: &HashMap<FeaSourceIdx, Arc<FeaFirstPassOutput>>,
+    static_metadata: &StaticMetadata,
+    glyph_map: &GlyphMap,
+    opts: &Opts,
+) -> Result<Vec<(NormalizedLocation, PendingCompilation)>, Error> {
+    let mut masters = Vec::new();
+    for (idx, master) in features.iter().enumerate() {
+        // a source with no master is font-wide (a .glyphs file); we only get
+        // here when the sources are per-master, so this would be a bug
+        if master.locations.is_empty() {
+            return Err(Error::VariableFeaSourceWithoutMaster(
+                master.source.to_string(),
+            ));
+        }
+        let ast = asts
+            .get(&idx)
+            .unwrap_or_else(|| panic!("no first pass output for fea source {idx}"));
+        for design_location in &master.locations {
+            let location = design_location
+                .to_normalized(&static_metadata.all_source_axes)
+                .map_err(|error| Error::VariableFeaBadLocation {
+                    fea: master.source.to_string(),
+                    error,
+                })?
+                // point axes are not in the variation model
+                .subset_axes(&static_metadata.axes);
+            let (pending, warnings) =
+                fea_rs::compile::compile_for_merge(&ast.ast, glyph_map, opts.clone()).map_err(
+                    |errors| Error::FeaCompileError(CompilerError::CompilationFail(errors)),
+                )?;
+            log_fea_warnings("compilation", &warnings);
+            masters.push((location, pending));
+        }
+    }
+
+    let default_location = static_metadata
+        .default_location()
+        .subset_axes(&static_metadata.axes);
+    let Some(default) = masters
+        .iter()
+        .position(|(location, _)| *location == default_location)
+    else {
+        return Err(Error::VariableFeaNoDefaultMaster(features.n_sources()));
+    };
+    masters.swap(0, default);
+    Ok(masters)
 }
 
 fn write_debug_glyph_order(debug_dir: &Path, glyphs: &GlyphOrder) {
@@ -481,14 +553,24 @@ fn write_debug_glyph_order(debug_dir: &Path, glyphs: &GlyphOrder) {
     }
 }
 
-fn write_debug_fea(context: &Context, is_error: bool, why: &str, fea_content: &str) {
+fn write_debug_fea(
+    context: &Context,
+    is_error: bool,
+    why: &str,
+    fea_content: &str,
+    idx: FeaSourceIdx,
+) {
     let Some(debug_dir) = context.debug_dir.as_ref() else {
         if is_error {
             warn!("Debug fea not written for '{why}' because --emit-debug is off");
         }
         return;
     };
-    let debug_file = debug_dir.join("features.fea");
+    // one file per source; the default master keeps the historical name
+    let debug_file = match idx {
+        0 => debug_dir.join("features.fea"),
+        idx => debug_dir.join(format!("features_{idx}.fea")),
+    };
     match fs::write(&debug_file, fea_content) {
         Ok(_) if is_error => warn!("{why}; fea written to {debug_file:?}"),
         Ok(_) => debug!("fea written to {debug_file:?}"),
@@ -498,7 +580,7 @@ fn write_debug_fea(context: &Context, is_error: bool, why: &str, fea_content: &s
 
 impl Work<Context, AnyWorkId, Error> for FeatureFirstPassWork {
     fn id(&self) -> AnyWorkId {
-        WorkId::FeaturesAst.into()
+        WorkId::FeaturesAst(self.idx).into()
     }
 
     fn read_access(&self) -> Access<AnyWorkId> {
@@ -509,19 +591,32 @@ impl Work<Context, AnyWorkId, Error> for FeatureFirstPassWork {
             .build()
     }
 
+    #[tracing::instrument(name = "fontbe::FeatureFirstPassWork::exec", skip_all)]
     fn exec(&self, context: &Context) -> Result<(), Error> {
-        let features = context.ir.features.get();
+        let all_features = context.ir.features.get();
+        let features = &all_features
+            .get(self.idx)
+            .unwrap_or_else(|| panic!("no fea source {}", self.idx))
+            .source;
         let glyph_order = context.ir.glyph_order.get();
         let static_metadata = context.ir.static_metadata.get();
         let glyph_map = GlyphMap::new(glyph_order.names().cloned())?;
 
-        let result = self.parse(&features, &glyph_map);
+        let result = self.parse(features, &glyph_map);
 
-        if let Some(debug_dir) = context.debug_dir.as_ref() {
+        if self.is_default()
+            && let Some(debug_dir) = context.debug_dir.as_ref()
+        {
             write_debug_glyph_order(debug_dir, &glyph_order);
         }
-        if let FeaturesSource::Memory { fea_content, .. } = features.as_ref() {
-            write_debug_fea(context, result.is_err(), "compile failed", fea_content);
+        if let FeaturesSource::Memory { fea_content, .. } = features {
+            write_debug_fea(
+                context,
+                result.is_err(),
+                "compile failed",
+                fea_content,
+                self.idx,
+            );
         }
 
         let ast = result?;
@@ -541,15 +636,20 @@ impl Work<Context, AnyWorkId, Error> for FeatureFirstPassWork {
             Error::FeaCompileError(fea_rs::compile::error::CompilerError::CompilationFail(err))
         })?;
         context
-            .fea_ast
-            .set(FeaFirstPassOutput::new(ast, compilation)?);
+            .fea_asts
+            .set(FeaFirstPassOutput::new(self.idx, ast, compilation)?);
         Ok(())
     }
 }
 
 impl FeatureFirstPassWork {
-    pub fn create() -> Box<BeWork> {
-        Box::new(Self {})
+    pub fn create(idx: FeaSourceIdx) -> Box<BeWork> {
+        Box::new(Self { idx })
+    }
+
+    /// True if this is the default master's source
+    fn is_default(&self) -> bool {
+        WorkId::FeaturesAst(self.idx) == WorkId::DEFAULT_FEATURES_AST
     }
 
     fn parse(&self, features: &FeaturesSource, glyph_map: &GlyphMap) -> Result<ParseTree, Error> {
@@ -617,7 +717,10 @@ impl Work<Context, AnyWorkId, Error> for FeatureCompilationWork {
     fn read_access(&self) -> Access<AnyWorkId> {
         AccessBuilder::new()
             .variant(FeWorkId::GlyphOrder)
-            .variant(WorkId::FeaturesAst)
+            .variant(FeWorkId::Features)
+            // every master's fea, not just the default's: they must all
+            // compile, and we need to know if they disagree
+            .variant(WorkId::ALL_FEATURE_ASTS)
             .variant(WorkId::GatherBeKerning)
             .variant(WorkId::Marks)
             .build()
@@ -632,10 +735,11 @@ impl Work<Context, AnyWorkId, Error> for FeatureCompilationWork {
         ]
     }
 
+    #[tracing::instrument(name = "fontbe::FeatureCompilationWork::exec", skip_all)]
     fn exec(&self, context: &Context) -> Result<(), Error> {
         let static_metadata = context.ir.static_metadata.get();
         let gdef_categories = context.ir.gdef_categories.get();
-        let ast = context.fea_ast.get();
+        let features = context.ir.features.get();
         let glyph_order = context.ir.glyph_order.get();
         let kerns = context.fea_rs_kerns.get();
         let marks = context.fea_rs_marks.get();
@@ -643,15 +747,34 @@ impl Work<Context, AnyWorkId, Error> for FeatureCompilationWork {
         // Resolve the plan once for this work unit; separate work units (kern,
         // marks) resolve their own, since the work graph precludes threading one.
         let plan = ir::resolve_feature_generation(&static_metadata.misc.feature_generation);
-        let mut result = self.compile(
-            &static_metadata,
-            &glyph_order,
-            &ast,
-            kerns.as_ref(),
-            marks.as_ref(),
-            &plan,
-            context.compile_debg,
-        )?;
+        let mut result = if features.n_sources() > 1 {
+            let asts = context
+                .fea_asts
+                .all()
+                .into_iter()
+                .map(|(_, ast)| (ast.idx, ast))
+                .collect();
+            self.compile_merged(
+                &static_metadata,
+                &glyph_order,
+                &features,
+                &asts,
+                kerns.as_ref(),
+                marks.as_ref(),
+                &plan,
+                context.compile_debg,
+            )?
+        } else {
+            self.compile(
+                &static_metadata,
+                &glyph_order,
+                &context.default_fea_ast(),
+                kerns.as_ref(),
+                marks.as_ref(),
+                &plan,
+                context.compile_debg,
+            )?
+        };
         if plan.gdef && result.gdef_classes.is_none() && !gdef_categories.categories.is_empty() {
             // the FEA did not contain an explicit GDEF block with glyph categories,
             // so let's use the ones from the source, if present (i.e. from
@@ -707,11 +830,6 @@ impl Work<Context, AnyWorkId, Error> for FeatureCompilationWork {
             context.extra_fea_tables.set(ExtraFeaTables::from(result));
         }
 
-        // Enables the assumption that if the file exists features were compiled
-        if let Some(ir_dir) = context.ir_dir.as_ref() {
-            fs::write(Paths::target_file(ir_dir, &WorkId::Features), "1")
-                .map_err(Error::IoError)?;
-        }
         Ok(())
     }
 }
@@ -895,7 +1013,7 @@ mod tests {
 
     #[test]
     fn resolve_kern() {
-        let _ = env_logger::builder().is_test(true).try_init();
+        let _ = tracing_subscriber::fmt().with_test_writer().try_init();
         let wght = Tag::new(b"wght");
         let static_metadata = weight_variable_static_metadata();
         let var_info = FeaVariationInfo::new(&static_metadata);
@@ -910,6 +1028,47 @@ mod tests {
         assert!(!regions.iter().any(|(r, _)| is_default(r)));
         let region_values: Vec<_> = regions.into_iter().map(|(_, v)| v + default).collect();
         assert_eq!((15, vec![10, 20]), (default, region_values));
+    }
+
+    #[test]
+    fn variable_metric_bare_default_matches_explicit_default() {
+        fn compile_layout_tables(fea: &str) -> Result<(Vec<u8>, Vec<u8>), DiagnosticSet> {
+            let ast = parse_fea(fea);
+            let static_metadata = weight_variable_static_metadata();
+            let var_info = FeaVariationInfo::new(&static_metadata);
+            let glyph_map = fea_rs::GlyphMap::new([".notdef", "p", "y"]).unwrap();
+
+            let diagnostics = fea_rs::compile::validate(&ast, &glyph_map, Some(&var_info));
+            assert!(!diagnostics.has_errors(), "{diagnostics:?}");
+
+            let (compilation, _) = fea_rs::compile::compile::<
+                _,
+                fea_rs::compile::NopFeatureProvider,
+            >(
+                &ast, &glyph_map, Some(&var_info), None, Default::default()
+            )?;
+            Ok((
+                write_fonts::dump_table(compilation.gpos.as_ref().unwrap()).unwrap(),
+                write_fonts::dump_table(compilation.gdef.as_ref().unwrap()).unwrap(),
+            ))
+        }
+
+        let bare_default =
+            compile_layout_tables("feature kern {\n    pos p y (-12 wght=700:22);\n} kern;\n")
+                .unwrap();
+        let explicit_default = compile_layout_tables(
+            "feature kern {\n    pos p y (wght=400:-12 wght=700:22);\n} kern;\n",
+        )
+        .unwrap();
+
+        assert_eq!(bare_default, explicit_default);
+        // Both `10` and `wght=400:20` target the default; reject rather than choose one.
+        assert!(
+            compile_layout_tables(
+                "feature kern {\n    pos p y (10 wght=400:20 wght=700:30);\n} kern;\n",
+            )
+            .is_err()
+        );
     }
 
     fn parse_fea(fea: &str) -> ParseTree {

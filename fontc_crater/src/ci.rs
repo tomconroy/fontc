@@ -26,7 +26,7 @@ use crate::{
 mod html;
 mod results_cache;
 
-pub(crate) use results_cache::ResultsCache;
+pub(crate) use results_cache::{FontmakeOutput, ResultsCache};
 
 static SUMMARY_FILE: &str = "summary.json";
 static SOURCES_FILE: &str = "sources.json";
@@ -54,6 +54,12 @@ struct RunSummary {
     #[serde(default)]
     instance: Option<String>,
     stats: super::ttx_diff_runner::Summary,
+    /// How many targets skipped the comparison because fontc's output was unchanged.
+    #[serde(default)]
+    reused_cached_results: usize,
+    /// How many targets skipped building with fontmake because it failed last time.
+    #[serde(default)]
+    reused_fontmake_failures: usize,
 }
 
 impl RunSummary {
@@ -200,6 +206,8 @@ fn run_crater_and_save_results(args: &CiArgs) -> Result<(), Error> {
         results_cache,
         flavor: args.flavor,
         instance: args.instance.clone(),
+        reused_cached_results: Default::default(),
+        reused_fontmake_failures: Default::default(),
     };
 
     let began = Utc::now();
@@ -212,13 +220,27 @@ fn run_crater_and_save_results(args: &CiArgs) -> Result<(), Error> {
     let elapsed = elapsed.to_std().unwrap_or_default();
     let elapsed = super::human_readable_duration(elapsed);
 
-    log::info!("completed {n_targets} targets in {elapsed}");
+    let reused_cached_results = context
+        .reused_cached_results
+        .load(std::sync::atomic::Ordering::Relaxed);
+    let reused_fontmake_failures = context
+        .reused_fontmake_failures
+        .load(std::sync::atomic::Ordering::Relaxed);
+    log::info!(
+        "completed {n_targets} targets in {elapsed} ({reused_cached_results}/{n_targets} results reused from cache, {reused_fontmake_failures} fontmake failures reused)"
+    );
 
     let summary = super::ttx_diff_runner::Summary::new(&results);
     // if nothing has changed we still want to report it, but we don't need to
     // write a new big results file; we can reuse the previous one
     let (results_file, reuse_last_result) = match prev_runs.last() {
-        Some(prev) if prev.stats == summary => (prev.results_file.clone(), true),
+        Some(prev)
+            if prev
+                .try_load_results(&args.out_dir)
+                .is_ok_and(|prev| same_outcomes(&prev, &results)) =>
+        {
+            (prev.results_file.clone(), true)
+        }
         _ => (out_file.into(), false),
     };
 
@@ -232,6 +254,8 @@ fn run_crater_and_save_results(args: &CiArgs) -> Result<(), Error> {
         flavor: args.flavor,
         instance: args.instance.clone(),
         stats: summary,
+        reused_cached_results,
+        reused_fontmake_failures,
     };
 
     prev_runs.push(summary);
@@ -251,6 +275,20 @@ fn run_crater_and_save_results(args: &CiArgs) -> Result<(), Error> {
     super::try_write_json(&failures, &failures_file)
 }
 
+/// Whether every target got the same result in both runs.
+///
+/// Failures only need to fail the same way: their output contains timestamps
+/// and temporary paths, so it differs even when nothing has changed.
+fn same_outcomes(prev: &DiffResults, current: &DiffResults) -> bool {
+    prev.success == current.success
+        && prev.failure.len() == current.failure.len()
+        && prev.failure.iter().zip(&current.failure).all(
+            |((prev_target, prev_err), (target, err))| {
+                prev_target == target && prev_err.same_kind(err)
+            },
+        )
+}
+
 fn result_path_for_current_date() -> String {
     let now = chrono::Utc::now();
     let timestamp = now.format("%Y-%m-%d-%H%M%S");
@@ -263,9 +301,8 @@ fn ttx_diff_has_changes(last_run_sha: &str) -> bool {
         .arg(last_run_sha)
         .output()
         .unwrap();
-    std::str::from_utf8(&output.stdout)
-        .unwrap()
-        .contains("ttx_diff/")
+    let diff = std::str::from_utf8(&output.stdout).unwrap();
+    diff.contains("ttx_diff/") || diff.contains("otl-normalizer/")
 }
 
 #[derive(Debug, Default)]
@@ -426,6 +463,9 @@ fn copy_file_into_dir(file_path: &Path, dir_path: &Path) -> PathBuf {
 fn compile_crate_or_die(name: &str) -> PathBuf {
     let status = Command::new("cargo")
         .args(["build", "-p", name, "--release"])
+        // prevent fontc from including a git sha in its version in the name table
+        // this lets us skip work when two fontc builds produce identical output
+        .env("VERGEN_GIT_DESCRIBE", "VERGEN_IDEMPOTENT_OUTPUT")
         .status()
         .expect("failed to run cargo build");
     if !status.success() {
@@ -454,5 +494,72 @@ fn log_if_auth_or_not() {
             &token[token.len() - 10..]
         ),
         Err(_) => log::warn!("no auth token set, private repos will be skipped"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::*;
+
+    const GENTIUM: &str = "silnrsi/font-gentium/$VIRTUAL/google/fonts/ofl/gentiumbookplus/config.yaml source/GentiumPlusRoman.designspace?7ac5e5ca61 (default)";
+
+    // Target only deserializes from borrowed strings, so go through text
+    fn results(value: serde_json::Value) -> DiffResults {
+        serde_json::from_str(&value.to_string()).unwrap()
+    }
+
+    fn fontc_failure(stderr: &str) -> DiffResults {
+        results(json!({
+            "success": {},
+            "failure": {
+                GENTIUM: {
+                    "compile_failed": { "fontc": { "command": "fontc", "stderr": stderr } }
+                }
+            }
+        }))
+    }
+
+    #[test]
+    fn table_level_change_is_a_new_outcome() {
+        let before = || {
+            results(json!({
+                "success": {
+                    GENTIUM: { "diffs": { "GDEF": 0.99611986, "STAT": 0.68421054, "total": 0.99992245 } }
+                },
+                "failure": {}
+            }))
+        };
+        let after = results(json!({
+            "success": {
+                GENTIUM: { "diffs": { "STAT": 0.68421054, "total": 0.9999498 } }
+            },
+            "failure": {}
+        }));
+
+        assert!(same_outcomes(&before(), &before()));
+        assert!(!same_outcomes(&before(), &after));
+    }
+
+    #[test]
+    fn failure_output_is_ignored() {
+        assert!(same_outcomes(
+            &fontc_failure("[2026-09-23T16:29:44Z] oh no"),
+            &fontc_failure("[2026-09-24T00:06:37Z] oh no")
+        ));
+    }
+
+    #[test]
+    fn failing_compiler_is_not_ignored() {
+        let fontmake_failure = results(json!({
+            "success": {},
+            "failure": {
+                GENTIUM: {
+                    "compile_failed": { "fontmake": { "command": "fontmake", "stderr": "oh no" } }
+                }
+            }
+        }));
+        assert!(!same_outcomes(&fontc_failure("oh no"), &fontmake_failure));
     }
 }

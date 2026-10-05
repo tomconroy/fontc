@@ -1,0 +1,31 @@
+# Weekly audit of the committed (i.e. shipped) dependency graph against
+# RustSec advisories and crates.io yank status -- metadata no build
+# surfaces, which a pinned graph no longer sidesteps by accident either
+# (floating resolution auto-adopted semver-compatible fixes and refused
+# yanked versions). Triaged findings live in .cargo/audit.toml.
+
+on:
+  schedule:
+    - cron: "0 6 * * 1" # Mondays 06:00 UTC
+  workflow_dispatch:
+
+name: Audit
+
+permissions:
+  contents: read
+
+jobs:
+  audit:
+    name: audit the pinned graph
+    runs-on: ubuntu-latest
+    if: ${{ github.repository == 'googlefonts/fontc' }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: install cargo-audit
+        run: cargo install --locked cargo-audit
+
+      - name: cargo audit
+        run: cargo audit --deny yanked

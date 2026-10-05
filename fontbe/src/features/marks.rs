@@ -29,7 +29,7 @@ use write_fonts::{
 
 use crate::{
     error::Error,
-    features::properties::ScriptDirection,
+    features::properties::{ExtraSubstitutions, ScriptDirection},
     orchestration::{
         AnyWorkId, BeWork, Context, FeaFirstPassOutput, FeaRsMarks, MarkLookups, WorkId,
     },
@@ -74,6 +74,7 @@ struct MarkLookupBuilder<'a> {
     mark_glyphs: BTreeSet<GlyphId16>,
     lig_carets: BTreeMap<GlyphId16, Vec<CaretValueBuilder>>,
     char_map: HashMap<u32, GlyphId16>,
+    extra_substitutions: ExtraSubstitutions,
     // marks.rs fuses ufo2ft's Mark and Curs writers, so we carry the whole plan
     // and gate mark/curs (and GDEF ligature carets) independently.
     plan: FeatureGenerationPlan,
@@ -281,6 +282,8 @@ impl<'a> MarkLookupBuilder<'a> {
         });
 
         let mark_glyphs = find_mark_glyphs(&pruned, &gdef_classes);
+        let extra_substitutions =
+            super::properties::extra_substitutions(static_metadata, glyph_order);
         Ok(Self {
             anchor_lists: pruned,
             glyph_order,
@@ -290,6 +293,7 @@ impl<'a> MarkLookupBuilder<'a> {
             mark_glyphs,
             lig_carets,
             char_map,
+            extra_substitutions,
             plan,
         })
     }
@@ -604,6 +608,7 @@ impl<'a> MarkLookupBuilder<'a> {
         let dir_glyphs = super::properties::glyphs_by_script_direction(
             &self.char_map,
             self.fea_first_pass.gsub().as_ref(),
+            &self.extra_substitutions,
         )?;
 
         let mut ltr_builder = CursivePosBuilder::default();
@@ -755,12 +760,14 @@ impl<'a> MarkLookupBuilder<'a> {
             &self.char_map,
             unicode_is_abvm,
             gsub.as_ref(),
+            &self.extra_substitutions,
         )?;
 
         let mut non_abvm_glyphs = super::properties::glyphs_matching_predicate(
             &self.char_map,
             unicode_is_non_abvm,
             gsub.as_ref(),
+            &self.extra_substitutions,
         )?;
         // https://github.com/googlefonts/ufo2ft/blob/5a606b7884bb6da/Lib/ufo2ft/featureWriters/markFeatureWriter.py#L1156
         // TK: there's another bug here I think!? we can't trust char map, need
@@ -775,14 +782,14 @@ impl<'a> MarkLookupBuilder<'a> {
     }
 }
 
-// matching current fonttools behaviour, we treat treat every non-bottom as a top:
-// https://github.com/googlefonts/ufo2ft/blob/5a606b7884bb6da5/Lib/ufo2ft/featureWriters/markFeatureWriter.py#L998
+// matching current ufo2ft behaviour, we treat every non-bottom, non-nukta as a top:
+// https://github.com/googlefonts/ufo2ft/blob/b4890b5b/Lib/ufo2ft/featureWriters/markFeatureWriter.py#L1010
 fn is_above_mark(anchor_name: &GroupName) -> bool {
     !is_below_mark(anchor_name)
 }
 
 fn is_below_mark(anchor_name: &GroupName) -> bool {
-    anchor_name.starts_with("bottom") || anchor_name == "nukta"
+    anchor_name.starts_with("bottom") || anchor_name.starts_with("nukta")
 }
 
 impl Work<Context, AnyWorkId, Error> for MarkWork {
@@ -795,18 +802,19 @@ impl Work<Context, AnyWorkId, Error> for MarkWork {
             .variant(FeWorkId::StaticMetadata)
             .variant(FeWorkId::GlyphOrder)
             .variant(FeWorkId::GdefCategories)
-            .variant(WorkId::FeaturesAst)
+            .specific_instance(WorkId::DEFAULT_FEATURES_AST)
             .variant(FeWorkId::ALL_ANCHORS)
             .build()
     }
 
     /// Generate mark data structures.
+    #[tracing::instrument(name = "fontbe::MarkWork::exec", skip_all)]
     fn exec(&self, context: &Context) -> Result<(), Error> {
         let static_metadata = context.ir.static_metadata.get();
         let glyph_order = context.ir.glyph_order.get();
         let gdef_categories = context.ir.gdef_categories.get();
         let raw_anchors = context.ir.anchors.all();
-        let fea_first_pass = context.fea_ast.get();
+        let fea_first_pass = context.default_fea_ast();
 
         let anchors = raw_anchors
             .iter()
@@ -1117,11 +1125,12 @@ mod tests {
             ("candrabindu-kannada", '\u{0C81}'),
             ("halant-kannada", '\u{0CCD}'),
             ("ka-kannada", '\u{0C95}'),
+            ("aa-deva", '\u{0906}'),
             ("taonethousand", '\u{0BF2}'),
             ("uni25CC", '\u{25CC}'),
         ];
 
-        static UNMAPPED: &[&str] = &["ka-kannada.base", "a.alt"];
+        static UNMAPPED: &[&str] = &["ka-kannada.base", "a.alt", "nukta-deva.sat"];
 
         let c = agl::char_for_agl_name(name.as_str()).or_else(|| {
             MANUAL
@@ -1627,6 +1636,37 @@ mod tests {
                 dottedCircle @(x: 491, y: 458)
                   @(x: -456, y: 460) halant-kannada
 
+                "#
+        );
+    }
+
+    // reduced from NotoSansDevanagari's Santali nukta
+    #[test]
+    fn nukta_prefixed_anchor_is_below_mark() {
+        let mut input = MarksInput::default();
+        let out = input
+            .add_glyph("aa-deva", None, |anchors| {
+                anchors.add("nukta.sat", [(893, -150)]);
+            })
+            .add_glyph("nukta-deva.sat", None, |anchors| {
+                anchors.add("_nukta.sat", [(-283, -134)]);
+            })
+            .set_user_fea(
+                "
+            languagesystem DFLT dflt;
+            languagesystem deva dflt;
+            languagesystem dev2 dflt;",
+            )
+            .get_normalized_output();
+
+        assert_eq_ignoring_ws!(
+            out,
+            r#"
+                # blwm: DFLT/dflt, dev2/dflt, deva/dflt
+                # 1 MarkToBase rules
+                # lookupflag LookupFlag(0)
+                aa-deva @(x: 893, y: -150)
+                  @(x: -283, y: -134) nukta-deva.sat
                 "#
         );
     }

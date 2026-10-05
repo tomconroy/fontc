@@ -3,8 +3,6 @@
 use std::{
     collections::{BTreeMap, HashMap},
     fmt::Display,
-    fs::File,
-    io::{self, BufReader, BufWriter, Read, Write},
     path::PathBuf,
     sync::Arc,
 };
@@ -22,18 +20,17 @@ use fontdrasil::{
 use fontir::{
     ir::{self, GlyphOrder, KernGroup},
     orchestration::{
-        Context as FeContext, ContextItem, ContextMap, Flags, IdAware, Persistable,
-        PersistentStorage, WorkId as FeWorkIdentifier,
+        Context as FeContext, ContextItem, ContextMap, Flags, IdAware, WorkId as FeWorkIdentifier,
     },
 };
 
 use ordered_float::OrderedFloat;
-use serde::{Deserialize, Serialize};
 
 use write_fonts::{
     FontWrite, dump_table,
-    read::{FontRead, ReadArgs, collections::IntSet, tables::gsub::Gsub as ReadGsub},
+    read::{FontRead, TopLevelTable, collections::IntSet, tables::gsub::Gsub as ReadGsub},
     tables::{
+        avar::Avar,
         base::Base,
         cmap::Cmap,
         colr::Colr,
@@ -71,9 +68,16 @@ use write_fonts::{
     validate::Validate,
 };
 
-use crate::{avar::PossiblyEmptyAvar, error::Error, paths::Paths};
+use crate::error::Error;
 
 type KernBlock = usize;
+
+/// Identifies one of the (possibly several) FEA sources of a font.
+///
+/// Index 0 is always the default master's source; see [`FeatureSources`].
+///
+/// [`FeatureSources`]: fontir::ir::FeatureSources
+pub type FeaSourceIdx = usize;
 
 /// Unique identifier of work.
 ///
@@ -82,7 +86,7 @@ type KernBlock = usize;
 #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum WorkId {
     Features,
-    FeaturesAst,
+    FeaturesAst(FeaSourceIdx),
     Avar,
     Cff,
     Cmap,
@@ -128,6 +132,14 @@ impl WorkId {
 
     /// An id representing access to all gvar fragments
     pub const ALL_GVAR_FRAGMENTS: WorkId = WorkId::GvarFragment(GlyphName::NOTDEF);
+
+    /// An id representing access to every master's fea ast
+    pub const ALL_FEATURE_ASTS: WorkId = WorkId::FeaturesAst(0);
+
+    /// The ast of the default master's fea; see [`FeatureSources`]
+    ///
+    /// [`FeatureSources`]: fontir::ir::FeatureSources
+    pub const DEFAULT_FEATURES_AST: WorkId = WorkId::FeaturesAst(0);
 }
 
 impl Identifier for WorkId {
@@ -135,7 +147,7 @@ impl Identifier for WorkId {
         match self {
             WorkId::Features => "BeFeatures",
             WorkId::Meta => "BeMeta",
-            WorkId::FeaturesAst => "BeFeaturesAst",
+            WorkId::FeaturesAst(..) => "BeFeaturesAst",
             WorkId::Avar => "BeAvar",
             WorkId::Cff => "BeCff",
             WorkId::Cmap => "BeCmap",
@@ -182,8 +194,6 @@ impl Identifier for WorkId {
 pub enum AnyWorkId {
     Fe(FeWorkIdentifier),
     Be(WorkId),
-    /// Used to capture timing not associated with work
-    InternalTiming(&'static str),
 }
 
 impl Identifier for AnyWorkId {
@@ -191,23 +201,6 @@ impl Identifier for AnyWorkId {
         match self {
             AnyWorkId::Fe(id) => id.discriminant(),
             AnyWorkId::Be(id) => id.discriminant(),
-            AnyWorkId::InternalTiming(..) => "InternalTiming",
-        }
-    }
-}
-
-impl AnyWorkId {
-    pub fn unwrap_be(&self) -> &WorkId {
-        match self {
-            AnyWorkId::Be(id) => id,
-            _ => panic!("Not a BE identifier"),
-        }
-    }
-
-    pub fn unwrap_fe(&self) -> &FeWorkIdentifier {
-        match self {
-            AnyWorkId::Fe(id) => id,
-            _ => panic!("Not a FE identifier"),
         }
     }
 }
@@ -225,7 +218,7 @@ impl From<WorkId> for AnyWorkId {
 }
 
 /// Tables other than GPOS/GSUB/GDEF generated from FEA
-#[derive(Serialize, Deserialize, Debug, PartialEq)]
+#[derive(Debug, PartialEq)]
 pub struct ExtraFeaTables {
     pub name: Option<Name>,
     // TODO: currently we only handle merging the name table
@@ -238,8 +231,6 @@ pub struct ExtraFeaTables {
     pub debg: Option<Vec<u8>>,
     /// The OS/2 builder, preserving which fields were explicitly set in FEA.
     ///
-    /// Not serialized — only available in the same compilation session.
-    #[serde(skip)]
     pub os2_builder: Option<fea_rs::compile::Os2Builder>,
 }
 
@@ -268,64 +259,6 @@ impl From<Compilation> for ExtraFeaTables {
             debg,
             os2_builder,
         }
-    }
-}
-
-// we could use serde here but it produces really big outputs; so instead
-// we can use fontwrite on each table, and then serialize an array of Option<Vec<u8>>
-impl Persistable for ExtraFeaTables {
-    fn read(from: &mut dyn Read) -> Self {
-        fn read_table<'a, T: FontRead<'a> + ReadArgs<Args = ()>>(
-            bytes: Option<&'a Vec<u8>>,
-        ) -> Option<T> {
-            let bytes = bytes?.as_slice();
-            Some(T::read(bytes.into()).unwrap())
-        }
-
-        let [head, hhea, vhea, os2, base, stat, name, debg]: [Option<Vec<u8>>; 8] =
-            bincode::deserialize_from(from).unwrap();
-
-        Self {
-            head: read_table(head.as_ref()),
-            hhea: read_table(hhea.as_ref()),
-            vhea: read_table(vhea.as_ref()),
-            os2: read_table(os2.as_ref()),
-            base: read_table(base.as_ref()),
-            stat: read_table(stat.as_ref()),
-            name: read_table(name.as_ref()),
-            debg,
-            os2_builder: None, // not persisted
-        }
-    }
-
-    fn write(&self, to: &mut dyn Write) {
-        fn dump<T: Validate + FontWrite>(table: Option<&T>) -> Option<Vec<u8>> {
-            table.map(write_fonts::dump_table).transpose().unwrap()
-        }
-        let ExtraFeaTables {
-            head,
-            hhea,
-            vhea,
-            os2,
-            base,
-            stat,
-            name,
-            debg,
-            os2_builder: _, // not persisted
-        } = self;
-
-        let out = [
-            dump(head.as_ref()),
-            dump(hhea.as_ref()),
-            dump(vhea.as_ref()),
-            dump(os2.as_ref()),
-            dump(base.as_ref()),
-            dump(stat.as_ref()),
-            dump(name.as_ref()),
-            debg.clone(),
-        ];
-
-        bincode::serialize_into(to, &out).unwrap()
     }
 }
 
@@ -365,26 +298,12 @@ impl IdAware<AnyWorkId> for Glyph {
     }
 }
 
-impl Persistable for Glyph {
-    fn read(from: &mut dyn Read) -> Self {
-        let (name, bytes): (GlyphName, Vec<u8>) = bincode::deserialize_from(from).unwrap();
-        let glyph = FontRead::read(bytes.as_slice().into()).unwrap();
-        Glyph { name, data: glyph }
-    }
-
-    fn write(&self, to: &mut dyn Write) {
-        let glyph_bytes = dump_table(&self.data).unwrap();
-        let to_write = (&self.name, glyph_bytes);
-        bincode::serialize_into(to, &to_write).unwrap();
-    }
-}
-
 /// The compiled `CFF ` table plus the per-glyph bounds computed alongside it.
 ///
 /// A CFF font has no per-glyph bbox in the outline data itself, so the works
 /// that need bounds (hmtx/hhea/head, vmtx/vhea) read them from here instead
 /// of from glyf fragments.
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct CffOutput {
     pub table: Vec<u8>,
     /// Whether [`Self::table`] is a `CFF2` table rather than a `CFF `.
@@ -403,20 +322,10 @@ pub struct CffOutput {
     pub glyph_outer_bounds: Vec<Option<[i32; 4]>>,
 }
 
-impl Persistable for CffOutput {
-    fn read(from: &mut dyn Read) -> Self {
-        bincode::deserialize_from(from).unwrap()
-    }
-
-    fn write(&self, to: &mut dyn Write) {
-        bincode::serialize_into(to, self).unwrap();
-    }
-}
-
 /// Unusually we store something other than the binary gvar per glyph.
 ///
 /// <https://learn.microsoft.com/en-us/typography/opentype/spec/gvar>
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Debug)]
 pub struct GvarFragment {
     pub glyph_name: GlyphName,
     /// None entries are safe to omit per IUP
@@ -455,24 +364,14 @@ impl IdAware<AnyWorkId> for GvarFragment {
     }
 }
 
-impl Persistable for GvarFragment {
-    fn read(from: &mut dyn Read) -> Self {
-        bincode::deserialize_from(from).unwrap()
-    }
-
-    fn write(&self, to: &mut dyn io::Write) {
-        bincode::serialize_into(to, &self).unwrap();
-    }
-}
-
-#[derive(Default, Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Default, Debug, Clone, PartialEq)]
 pub struct MarkLookups {
     pub(crate) mark_base: Vec<PendingLookup<MarkToBaseBuilder>>,
     pub(crate) mark_mark: Vec<PendingLookup<MarkToMarkBuilder>>,
     pub(crate) mark_lig: Vec<PendingLookup<MarkToLigBuilder>>,
 }
 /// Marks, ready to feed to fea-rs in the form it expects
-#[derive(Default, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Default, Clone, PartialEq)]
 pub struct FeaRsMarks {
     pub(crate) glyphmap: GlyphMap,
     pub(crate) mark_mkmk: MarkLookups,
@@ -482,20 +381,10 @@ pub struct FeaRsMarks {
     pub(crate) lig_carets: BTreeMap<GlyphId16, Vec<CaretValueBuilder>>,
 }
 
-impl Persistable for FeaRsMarks {
-    fn read(from: &mut dyn Read) -> Self {
-        bincode::deserialize_from(from).unwrap()
-    }
-
-    fn write(&self, to: &mut dyn io::Write) {
-        bincode::serialize_into(to, self).unwrap()
-    }
-}
-
 /// Kerns, ready to feed to fea-rs in the form it expects
 ///
 /// The aggregation of all [KernFragment]s.
-#[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Default, Clone, PartialEq)]
 pub struct FeaRsKerns {
     /// ordered!
     pub lookups: Vec<PendingLookup<PairPosBuilder>>,
@@ -511,8 +400,10 @@ pub struct FeaRsKerns {
 ///
 /// Before storing the AST, ensure that it has been validated (via [`fea_rs::compile::validate`]).
 /// This does not include features that are generated, such as for kerning or marks.
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct FeaFirstPassOutput {
+    /// Which of the font's FEA sources this is the output for.
+    pub idx: FeaSourceIdx,
     /// A validated abstract syntax tree.
     pub ast: ParseTree,
     // bytes of the compiled gsub table
@@ -522,7 +413,7 @@ pub struct FeaFirstPassOutput {
 }
 
 impl FeaFirstPassOutput {
-    pub fn new(ast: ParseTree, compilation: Compilation) -> Result<Self, Error> {
+    pub fn new(idx: FeaSourceIdx, ast: ParseTree, compilation: Compilation) -> Result<Self, Error> {
         let gsub_bytes = compilation
             .gsub
             .as_ref()
@@ -533,6 +424,7 @@ impl FeaFirstPassOutput {
                 context: "GSUB".into(),
             })?;
         Ok(Self {
+            idx,
             ast,
             gsub_bytes,
             gdef_classes: compilation.gdef_classes,
@@ -553,7 +445,7 @@ impl FeaFirstPassOutput {
             None,
             Opts::new().compile_gpos(false),
         ) {
-            Ok((compilation, _)) => Self::new(ast, compilation),
+            Ok((compilation, _)) => Self::new(0, ast, compilation),
             Err(err) => panic!("{}", err.display()),
         }
     }
@@ -568,7 +460,7 @@ impl FeaFirstPassOutput {
 
 impl FeaRsKerns {
     pub fn is_empty(&self) -> bool {
-        self.lookups.is_empty()
+        self.lookups.is_empty() || self.features.is_empty()
     }
 
     #[cfg(test)]
@@ -585,23 +477,9 @@ impl FeaRsKerns {
     }
 }
 
-impl Persistable for FeaRsKerns {
-    fn read(from: &mut dyn Read) -> Self {
-        bincode::deserialize_from(from).unwrap()
-    }
-
-    fn write(&self, to: &mut dyn io::Write) {
-        bincode::serialize_into(to, self).unwrap()
-    }
-}
-
-impl Persistable for FeaFirstPassOutput {
-    fn read(from: &mut dyn Read) -> Self {
-        bincode::deserialize_from(from).unwrap()
-    }
-
-    fn write(&self, to: &mut dyn Write) {
-        bincode::serialize_into(to, self).unwrap()
+impl IdAware<AnyWorkId> for FeaFirstPassOutput {
+    fn id(&self) -> AnyWorkId {
+        AnyWorkId::Be(WorkId::FeaturesAst(self.idx))
     }
 }
 
@@ -613,28 +491,18 @@ pub type KernAdjustments = BTreeMap<NormalizedLocation, OrderedFloat<f64>>;
 /// It is an invariant that every group referenced in an adjustment exists in the
 /// groups mapping, and every glyph in a rule (including in all groups) is defined
 /// in the glyph order.
-#[derive(Default, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Default, Clone, PartialEq)]
 pub struct AllKerningPairs {
     /// A mapping from named kern groups to the appropriate set of glyphs
     pub groups: BTreeMap<KernGroup, GlyphSet>,
     pub adjustments: Vec<(ir::KernPair, KernAdjustments)>,
 }
 
-impl Persistable for AllKerningPairs {
-    fn read(from: &mut dyn Read) -> Self {
-        bincode::deserialize_from(from).unwrap()
-    }
-
-    fn write(&self, to: &mut dyn io::Write) {
-        bincode::serialize_into(to, self).unwrap()
-    }
-}
-
 /// One side of a kerning pair, represented as glyph ids
 ///
 /// This parallels the [`ir::KernSide`] type, with glyph names resolved
 /// to GIDs.
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, PartialOrd, Eq, Ord)]
+#[derive(Clone, Debug, PartialEq, PartialOrd, Eq, Ord)]
 pub(crate) enum KernSide {
     /// A specific glyph
     Glyph(GlyphId16),
@@ -646,7 +514,7 @@ pub(crate) enum KernSide {
 ///
 /// This parallels the [`ir::KernPair`] type, but using glyph ids instead
 /// of glyph names and a finalized value record instead of per-location positions.
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, PartialOrd, Eq, Ord)]
+#[derive(Clone, Debug, PartialEq, PartialOrd, Eq, Ord)]
 pub(crate) struct KernPair {
     pub(crate) side1: KernSide,
     pub(crate) side2: KernSide,
@@ -800,7 +668,7 @@ impl KernPair {
 /// A chunk of kerning that needs to be fed into a [PairPosBuilder]
 ///
 /// Points to a slice of [AllKerningPairs].
-#[derive(Default, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Default, Clone, PartialEq)]
 pub struct KernFragment {
     pub(crate) segment: usize,
     pub(crate) kerns: Vec<KernPair>,
@@ -812,90 +680,10 @@ impl IdAware<AnyWorkId> for KernFragment {
     }
 }
 
-impl Persistable for KernFragment {
-    fn read(from: &mut dyn Read) -> Self {
-        bincode::deserialize_from(from).unwrap()
-    }
-
-    fn write(&self, to: &mut dyn io::Write) {
-        bincode::serialize_into(to, self).unwrap()
-    }
-}
-
-// work around orphan rules.
-//
-// FIXME: Clarify if there's a good reason not to treat glyf/loca as a single
-// entity, for the purpose of persistence? like a struct that contains both
-// tables, and from which the format can be retrieved
-//
-// this whole thing needs a rethink, but this gets us working
-#[derive(Clone, Copy, Serialize, Deserialize, PartialEq)]
-pub struct LocaFormatWrapper(u8);
-
-impl From<LocaFormat> for LocaFormatWrapper {
-    fn from(value: LocaFormat) -> Self {
-        LocaFormatWrapper(value as _)
-    }
-}
-
-impl From<LocaFormatWrapper> for LocaFormat {
-    fn from(value: LocaFormatWrapper) -> Self {
-        if value.0 == 0 {
-            LocaFormat::Short
-        } else {
-            LocaFormat::Long
-        }
-    }
-}
-
-impl Persistable for LocaFormatWrapper {
-    fn read(from: &mut dyn Read) -> Self {
-        bincode::deserialize_from(from).unwrap()
-    }
-
-    fn write(&self, to: &mut dyn io::Write) {
-        bincode::serialize_into(to, self).unwrap()
-    }
-}
-
 pub type BeWork = dyn Work<Context, AnyWorkId, Error> + Send;
 
-pub struct BePersistentStorage {
-    dir: Option<PathBuf>,
-}
-
-impl PersistentStorage<AnyWorkId> for BePersistentStorage {
-    fn active(&self) -> bool {
-        self.dir.is_some()
-    }
-
-    fn reader(&self, id: &AnyWorkId) -> Option<Box<dyn Read>> {
-        let dir = self.dir.as_ref()?;
-        let file = Paths::target_file(dir, id.unwrap_be());
-        if !file.exists() {
-            return None;
-        }
-        let raw_file = File::open(file.clone())
-            .map_err(|e| panic!("Unable to read {file:?} {e}"))
-            .unwrap();
-        Some(Box::from(BufReader::new(raw_file)))
-    }
-
-    fn writer(&self, id: &AnyWorkId) -> Box<dyn io::Write> {
-        let dir = self
-            .dir
-            .as_ref()
-            .expect("Write requested with no output dir");
-        let file = Paths::target_file(dir, id.unwrap_be());
-        let raw_file = File::create(file.clone())
-            .map_err(|e| panic!("Unable to write {file:?} {e}"))
-            .unwrap();
-        Box::from(BufWriter::new(raw_file))
-    }
-}
-
-type BeContextItem<T> = ContextItem<AnyWorkId, T, BePersistentStorage>;
-type BeContextMap<T> = ContextMap<AnyWorkId, T, BePersistentStorage>;
+type BeContextItem<T> = ContextItem<AnyWorkId, T>;
+type BeContextMap<T> = ContextMap<AnyWorkId, T>;
 
 /// Read/write access to data for async work.
 ///
@@ -910,55 +698,52 @@ pub struct Context {
     pub compiler_version: Option<Arc<str>>,
 
     pub debug_dir: Option<PathBuf>,
-    pub ir_dir: Option<PathBuf>,
     pub compile_debg: bool,
-
-    pub persistent_storage: Arc<BePersistentStorage>,
 
     // The final, fully populated, read-only FE context
     pub ir: Arc<FeContext>,
 
-    // work results we've completed or restored from disk
+    // work results we've completed
     pub gvar_fragments: BeContextMap<GvarFragment>,
     pub glyphs: BeContextMap<Glyph>,
 
     // Allow avar to be explicitly None to record a noop avar being generated
-    pub avar: BeContextItem<PossiblyEmptyAvar>,
+    pub avar: BeContextItem<Option<Avar>>,
     pub cff: BeContextItem<CffOutput>,
     pub cmap: BeContextItem<Cmap>,
     pub colr: BeContextItem<Colr>,
     pub cpal: BeContextItem<Cpal>,
     pub fvar: BeContextItem<Fvar>,
     pub gasp: BeContextItem<Gasp>,
-    pub glyf: BeContextItem<Bytes>,
+    pub glyf: BeContextItem<Vec<u8>>,
     pub gsub: BeContextItem<Gsub>,
     pub gpos: BeContextItem<Gpos>,
     pub gdef: BeContextItem<Gdef>,
-    pub gvar: BeContextItem<Bytes>,
+    pub gvar: BeContextItem<Vec<u8>>,
     pub post: BeContextItem<Post>,
     pub meta: BeContextItem<Meta>,
-    pub loca: BeContextItem<Bytes>,
-    pub loca_format: BeContextItem<LocaFormatWrapper>,
+    pub loca: BeContextItem<Vec<u8>>,
+    pub loca_format: BeContextItem<LocaFormat>,
     pub maxp: BeContextItem<Maxp>,
     pub name: BeContextItem<Name>,
     pub os2: BeContextItem<Os2>,
     pub head: BeContextItem<Head>,
     pub hhea: BeContextItem<Hhea>,
-    pub hmtx: BeContextItem<Bytes>,
+    pub hmtx: BeContextItem<Vec<u8>>,
     pub hvar: BeContextItem<Hvar>,
     pub mvar: BeContextItem<Mvar>,
     pub vhea: BeContextItem<Vhea>,
-    pub vmtx: BeContextItem<Bytes>,
+    pub vmtx: BeContextItem<Vec<u8>>,
     pub vorg: BeContextItem<Vorg>,
     pub vvar: BeContextItem<Vvar>,
     pub all_kerning_pairs: BeContextItem<AllKerningPairs>,
     pub kern_fragments: BeContextMap<KernFragment>,
-    pub fea_ast: BeContextItem<FeaFirstPassOutput>,
+    pub fea_asts: BeContextMap<FeaFirstPassOutput>,
     pub fea_rs_kerns: BeContextItem<FeaRsKerns>,
     pub fea_rs_marks: BeContextItem<FeaRsMarks>,
     pub extra_fea_tables: BeContextItem<ExtraFeaTables>,
     pub stat: BeContextItem<Stat>,
-    pub font: BeContextItem<Bytes>,
+    pub font: BeContextItem<Vec<u8>>,
 }
 
 impl Context {
@@ -968,9 +753,7 @@ impl Context {
             flags: self.flags,
             compiler_version: self.compiler_version.clone(),
             debug_dir: self.debug_dir.clone(),
-            ir_dir: self.ir_dir.clone(),
             compile_debg: self.compile_debg,
-            persistent_storage: self.persistent_storage.clone(),
             ir: self.ir.clone(),
             glyphs: self.glyphs.clone_with_acl(acl.clone()),
             gvar_fragments: self.gvar_fragments.clone_with_acl(acl.clone()),
@@ -1007,7 +790,7 @@ impl Context {
             fea_rs_kerns: self.fea_rs_kerns.clone_with_acl(acl.clone()),
             fea_rs_marks: self.fea_rs_marks.clone_with_acl(acl.clone()),
             stat: self.stat.clone_with_acl(acl.clone()),
-            fea_ast: self.fea_ast.clone_with_acl(acl.clone()),
+            fea_asts: self.fea_asts.clone_with_acl(acl.clone()),
             extra_fea_tables: self.extra_fea_tables.clone_with_acl(acl.clone()),
             font: self.font.clone_with_acl(acl),
         }
@@ -1016,85 +799,55 @@ impl Context {
     pub fn new_root(
         flags: Flags,
         compiler_version: Option<Arc<str>>,
-        ir_dir: Option<PathBuf>,
         debug_dir: Option<PathBuf>,
         compile_debg: bool,
         ir: &fontir::orchestration::Context,
     ) -> Context {
         let acl = Arc::from(AccessControlList::read_only());
-        let persistent_storage = Arc::from(BePersistentStorage {
-            dir: ir_dir.clone(),
-        });
         Context {
             flags,
             compiler_version,
             debug_dir,
-            ir_dir,
             compile_debg,
-            persistent_storage: persistent_storage.clone(),
             ir: Arc::from(ir.read_only()),
-            glyphs: ContextMap::new(acl.clone(), persistent_storage.clone()),
-            gvar_fragments: ContextMap::new(acl.clone(), persistent_storage.clone()),
-            avar: ContextItem::new(WorkId::Avar.into(), acl.clone(), persistent_storage.clone()),
-            cff: ContextItem::new(WorkId::Cff.into(), acl.clone(), persistent_storage.clone()),
-            cmap: ContextItem::new(WorkId::Cmap.into(), acl.clone(), persistent_storage.clone()),
-            colr: ContextItem::new(WorkId::Colr.into(), acl.clone(), persistent_storage.clone()),
-            cpal: ContextItem::new(WorkId::Cpal.into(), acl.clone(), persistent_storage.clone()),
-            fvar: ContextItem::new(WorkId::Fvar.into(), acl.clone(), persistent_storage.clone()),
-            gasp: ContextItem::new(WorkId::Gasp.into(), acl.clone(), persistent_storage.clone()),
-            glyf: ContextItem::new(WorkId::Glyf.into(), acl.clone(), persistent_storage.clone()),
-            gpos: ContextItem::new(WorkId::Gpos.into(), acl.clone(), persistent_storage.clone()),
-            gsub: ContextItem::new(WorkId::Gsub.into(), acl.clone(), persistent_storage.clone()),
-            gdef: ContextItem::new(WorkId::Gdef.into(), acl.clone(), persistent_storage.clone()),
-            gvar: ContextItem::new(WorkId::Gvar.into(), acl.clone(), persistent_storage.clone()),
-            post: ContextItem::new(WorkId::Post.into(), acl.clone(), persistent_storage.clone()),
-            loca: ContextItem::new(WorkId::Loca.into(), acl.clone(), persistent_storage.clone()),
-            loca_format: ContextItem::new(
-                WorkId::LocaFormat.into(),
-                acl.clone(),
-                persistent_storage.clone(),
-            ),
-            maxp: ContextItem::new(WorkId::Maxp.into(), acl.clone(), persistent_storage.clone()),
-            name: ContextItem::new(WorkId::Name.into(), acl.clone(), persistent_storage.clone()),
-            os2: ContextItem::new(WorkId::Os2.into(), acl.clone(), persistent_storage.clone()),
-            head: ContextItem::new(WorkId::Head.into(), acl.clone(), persistent_storage.clone()),
-            hhea: ContextItem::new(WorkId::Hhea.into(), acl.clone(), persistent_storage.clone()),
-            hmtx: ContextItem::new(WorkId::Hmtx.into(), acl.clone(), persistent_storage.clone()),
-            hvar: ContextItem::new(WorkId::Hvar.into(), acl.clone(), persistent_storage.clone()),
-            mvar: ContextItem::new(WorkId::Mvar.into(), acl.clone(), persistent_storage.clone()),
-            meta: ContextItem::new(WorkId::Meta.into(), acl.clone(), persistent_storage.clone()),
-            vhea: ContextItem::new(WorkId::Vhea.into(), acl.clone(), persistent_storage.clone()),
-            vmtx: ContextItem::new(WorkId::Vmtx.into(), acl.clone(), persistent_storage.clone()),
-            vorg: ContextItem::new(WorkId::Vorg.into(), acl.clone(), persistent_storage.clone()),
-            vvar: ContextItem::new(WorkId::Vvar.into(), acl.clone(), persistent_storage.clone()),
-            all_kerning_pairs: ContextItem::new(
-                WorkId::GatherIrKerning.into(),
-                acl.clone(),
-                persistent_storage.clone(),
-            ),
-            kern_fragments: ContextMap::new(acl.clone(), persistent_storage.clone()),
-            fea_rs_kerns: ContextItem::new(
-                WorkId::GatherBeKerning.into(),
-                acl.clone(),
-                persistent_storage.clone(),
-            ),
-            fea_rs_marks: ContextItem::new(
-                WorkId::Marks.into(),
-                acl.clone(),
-                persistent_storage.clone(),
-            ),
-            fea_ast: ContextItem::new(
-                WorkId::FeaturesAst.into(),
-                acl.clone(),
-                persistent_storage.clone(),
-            ),
-            stat: ContextItem::new(WorkId::Stat.into(), acl.clone(), persistent_storage.clone()),
-            extra_fea_tables: ContextItem::new(
-                WorkId::ExtraFeaTables.into(),
-                acl.clone(),
-                persistent_storage.clone(),
-            ),
-            font: ContextItem::new(WorkId::Font.into(), acl, persistent_storage),
+            glyphs: ContextMap::new(acl.clone()),
+            gvar_fragments: ContextMap::new(acl.clone()),
+            avar: ContextItem::new(WorkId::Avar.into(), acl.clone()),
+            cff: ContextItem::new(WorkId::Cff.into(), acl.clone()),
+            cmap: ContextItem::new(WorkId::Cmap.into(), acl.clone()),
+            colr: ContextItem::new(WorkId::Colr.into(), acl.clone()),
+            cpal: ContextItem::new(WorkId::Cpal.into(), acl.clone()),
+            fvar: ContextItem::new(WorkId::Fvar.into(), acl.clone()),
+            gasp: ContextItem::new(WorkId::Gasp.into(), acl.clone()),
+            glyf: ContextItem::new(WorkId::Glyf.into(), acl.clone()),
+            gpos: ContextItem::new(WorkId::Gpos.into(), acl.clone()),
+            gsub: ContextItem::new(WorkId::Gsub.into(), acl.clone()),
+            gdef: ContextItem::new(WorkId::Gdef.into(), acl.clone()),
+            gvar: ContextItem::new(WorkId::Gvar.into(), acl.clone()),
+            post: ContextItem::new(WorkId::Post.into(), acl.clone()),
+            loca: ContextItem::new(WorkId::Loca.into(), acl.clone()),
+            loca_format: ContextItem::new(WorkId::LocaFormat.into(), acl.clone()),
+            maxp: ContextItem::new(WorkId::Maxp.into(), acl.clone()),
+            name: ContextItem::new(WorkId::Name.into(), acl.clone()),
+            os2: ContextItem::new(WorkId::Os2.into(), acl.clone()),
+            head: ContextItem::new(WorkId::Head.into(), acl.clone()),
+            hhea: ContextItem::new(WorkId::Hhea.into(), acl.clone()),
+            hmtx: ContextItem::new(WorkId::Hmtx.into(), acl.clone()),
+            hvar: ContextItem::new(WorkId::Hvar.into(), acl.clone()),
+            mvar: ContextItem::new(WorkId::Mvar.into(), acl.clone()),
+            meta: ContextItem::new(WorkId::Meta.into(), acl.clone()),
+            vhea: ContextItem::new(WorkId::Vhea.into(), acl.clone()),
+            vmtx: ContextItem::new(WorkId::Vmtx.into(), acl.clone()),
+            vorg: ContextItem::new(WorkId::Vorg.into(), acl.clone()),
+            vvar: ContextItem::new(WorkId::Vvar.into(), acl.clone()),
+            all_kerning_pairs: ContextItem::new(WorkId::GatherIrKerning.into(), acl.clone()),
+            kern_fragments: ContextMap::new(acl.clone()),
+            fea_rs_kerns: ContextItem::new(WorkId::GatherBeKerning.into(), acl.clone()),
+            fea_rs_marks: ContextItem::new(WorkId::Marks.into(), acl.clone()),
+            fea_asts: ContextMap::new(acl.clone()),
+            stat: ContextItem::new(WorkId::Stat.into(), acl.clone()),
+            extra_fea_tables: ContextItem::new(WorkId::ExtraFeaTables.into(), acl.clone()),
+            font: ContextItem::new(WorkId::Font.into(), acl),
         }
     }
 
@@ -1109,42 +862,23 @@ impl Context {
     pub fn copy_read_only(&self) -> Context {
         self.copy(AccessControlList::read_only())
     }
-}
 
-#[derive(PartialEq)]
-pub struct Bytes {
-    buf: Vec<u8>,
-}
-
-impl Bytes {
-    pub fn get(&self) -> &[u8] {
-        &self.buf
+    /// The first pass output for the default master's FEA.
+    ///
+    /// Anything that isn't compiled per-master works from this one.
+    pub fn default_fea_ast(&self) -> Arc<FeaFirstPassOutput> {
+        self.fea_asts.get(&WorkId::DEFAULT_FEATURES_AST.into())
     }
 }
 
-impl From<Vec<u8>> for Bytes {
-    fn from(buf: Vec<u8>) -> Self {
-        Bytes { buf }
-    }
-}
-
-impl Persistable for Bytes {
-    fn read(from: &mut dyn Read) -> Self {
-        let mut buf = Vec::new();
-        from.read_to_end(&mut buf).unwrap();
-        buf.into()
-    }
-
-    fn write(&self, to: &mut dyn io::Write) {
-        to.write_all(&self.buf).unwrap();
-    }
-}
-
-pub(crate) fn to_bytes<T>(table: &T) -> Option<Vec<u8>>
+pub(crate) fn to_bytes<T>(table: &T) -> Result<Vec<u8>, Error>
 where
-    T: FontWrite + Validate,
+    T: FontWrite + Validate + TopLevelTable,
 {
-    write_fonts::dump_table(table).ok()
+    write_fonts::dump_table(table).map_err(|e| Error::DumpTableError {
+        e,
+        context: T::TAG.to_string(),
+    })
 }
 
 #[cfg(test)]

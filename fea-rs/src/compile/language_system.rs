@@ -24,6 +24,14 @@ pub(crate) struct DefaultLanguageSystems {
     items: Rc<HashSet<LanguageSystem>>,
 }
 
+/// Only the resulting set matters: an implicit and an explicit 'DFLT dflt'
+/// are the same language system.
+impl PartialEq for DefaultLanguageSystems {
+    fn eq(&self, other: &Self) -> bool {
+        self.items == other.items
+    }
+}
+
 impl DefaultLanguageSystems {
     pub(crate) fn insert(&mut self, system: LanguageSystem) {
         if !self.has_explicit_entry {
@@ -37,17 +45,20 @@ impl DefaultLanguageSystems {
         self.items.contains(key)
     }
 
-    /// `true` if `key` is the *only* default language system.
-    ///
-    /// fonttools compares the whole set of currently active language systems
-    /// against a single system when deciding whether a `script` statement is a
-    /// no-op, and at the top of a feature block that set is this one.
-    pub(crate) fn is_only(&self, key: &LanguageSystem) -> bool {
-        self.items.len() == 1 && self.items.contains(key)
-    }
-
     pub fn iter(&self) -> impl Iterator<Item = LanguageSystem> + '_ {
         self.items.iter().copied()
+    }
+
+    /// The first declared language system, ordered by (script, language).
+    ///
+    /// This matches the ordering of makeotf's `langSysMap`, and that behaviour
+    /// is in turn adopted by feaLib.
+    pub(crate) fn first(&self) -> LanguageSystem {
+        self.items
+            .iter()
+            .copied()
+            .min_by_key(|sys| (sys.script, sys.language))
+            .unwrap_or_default()
     }
 }
 

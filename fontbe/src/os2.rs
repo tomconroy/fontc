@@ -218,7 +218,7 @@ fn x_avg_char_width(context: &Context) -> Result<i16, Error> {
     let hhea = context.hhea.get();
     let raw_hmtx = context.hmtx.get();
     let num_glyphs = glyph_order.len() as u64;
-    let hmtx = Hmtx::read(FontData::new(raw_hmtx.get()), hhea.number_of_h_metrics)
+    let hmtx = Hmtx::read(FontData::new(&raw_hmtx), hhea.number_of_h_metrics)
         .map_err(|_| Error::InvalidTableBytes(Hmtx::TAG))?;
 
     // count width > 0 only, including adding tail only if > 0
@@ -527,6 +527,7 @@ impl Work<Context, AnyWorkId, Error> for Os2Work {
     }
 
     /// Generate [OS/2](https://learn.microsoft.com/en-us/typography/opentype/spec/os2)
+    #[tracing::instrument(name = "fontbe::Os2Work::exec", skip_all)]
     fn exec(&self, context: &Context) -> Result<(), Error> {
         let static_metadata = context.ir.static_metadata.get();
 

@@ -3,7 +3,7 @@
 use std::{
     collections::BTreeMap,
     fmt::Display,
-    io::Write,
+    io::{IsTerminal, Write},
     path::Path,
     process::{Command, Stdio},
     sync::atomic::{AtomicUsize, Ordering},
@@ -26,7 +26,10 @@ use error::Error;
 use target::{BuildType, Target};
 
 fn main() {
-    env_logger::init();
+    tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .with_ansi(std::io::stdout().is_terminal())
+        .init();
     let args = Args::parse();
     // clap cannot express "this flavor rules out this flag", so check it here
     // and report it the way clap reports its own conflicts: a usage error, not
@@ -78,6 +81,9 @@ fn run_all<T: Send, E: Send, Cx: Sync>(
     let results = threadpool.install(|| {
         targets
             .into_par_iter()
+            // each job is its own unit of work; this ensures that multiple
+            // slow jobs don't run sequentially on a single thread.
+            .with_max_len(1)
             .map(|target| {
                 let i = counter.fetch_add(1, Ordering::Relaxed) + 1;
                 currently_running.fetch_add(1, Ordering::Relaxed);

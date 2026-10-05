@@ -2,7 +2,6 @@
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet, hash_map::RandomState},
     fmt::{Debug, Display},
-    io::Read,
     path::PathBuf,
 };
 
@@ -15,18 +14,19 @@ use serde::{Deserialize, Serialize, de::Error as _};
 use smol_str::{SmolStr, format_smolstr};
 use write_fonts::{
     OtRound,
+    tables::os2::SelectionFlags,
     types::{GlyphId16, NameId, Tag},
 };
 
 use fontdrasil::{
-    coords::NormalizedLocation,
+    coords::{DesignLocation, NormalizedLocation},
     types::{Axes, GlyphName},
     variations::{ModelDeltas, RoundingBehaviour, VariationModel},
 };
 
 use crate::{
     error::{BadAnchor, BadAnchorReason, BadGlyph, BadGlyphKind, Error},
-    orchestration::{IdAware, Persistable, WorkId},
+    orchestration::{IdAware, WorkId},
 };
 
 // just public so we publish the docs
@@ -43,10 +43,10 @@ pub use feature_writers::{
 };
 pub use path_builder::GlyphPathBuilder;
 pub use static_metadata::{
-    Condition, ConditionSet, GdefCategories, GlyphPredicateAttrs, InstanceOverrides,
-    MetaTableValues, MiscMetadata, NameKey, NamedInstance, Panose, PostscriptNames,
-    PostscriptSettings, PreliminaryGdefCategories, Rule, StaticMetadata, StyleMapStyle,
-    Substitution, VariableFeature,
+    AxisMapping, AxisValueLabel, Condition, ConditionSet, FilterScope, GdefCategories,
+    GlyphPredicateAttrs, InstanceOverrides, MetaTableValues, MiscMetadata, NameKey, NamedInstance,
+    Panose, PostscriptNames, PostscriptSettings, PreliminaryGdefCategories, Rule, StatAxis,
+    StaticMetadata, StyleMapStyle, Substitution, VariableFeature,
 };
 
 pub const DEFAULT_VENDOR_ID: &str = "NONE";
@@ -595,36 +595,28 @@ impl GlobalMetricsBuilder {
         self.set_if_absent(GlobalMetric::CaretOffset, pos, 0.0);
 
         // https://github.com/googlefonts/ufo2ft/blob/0d2688cd/Lib/ufo2ft/outlineCompiler.py#L575-L616
-        let subscript_x_size = self
-            .get(GlobalMetric::SubscriptXSize, pos)
-            .unwrap_or_else(|| (units_per_em * 0.65).into());
-        let subscript_y_size = self
-            .get(GlobalMetric::SubscriptYSize, pos)
-            .unwrap_or_else(|| (units_per_em * 0.60).into());
-        let subscript_y_offset = self
-            .get(GlobalMetric::SubscriptYOffset, pos)
-            .unwrap_or_else(|| (units_per_em * 0.075).into());
-        let superscript_y_offset = self
-            .get(GlobalMetric::SuperscriptYOffset, pos)
-            .unwrap_or_else(|| (units_per_em * 0.35).into());
+        let mut rounded = |metric, fallback: f64| -> f64 {
+            self.set_if_absent(metric, pos, OtRound::<f64>::ot_round(fallback))
+                .0
+                .ot_round()
+        };
+        let subscript_x_size = rounded(GlobalMetric::SubscriptXSize, units_per_em * 0.65);
+        let subscript_y_size = rounded(GlobalMetric::SubscriptYSize, units_per_em * 0.60);
+        let subscript_y_offset = rounded(GlobalMetric::SubscriptYOffset, units_per_em * 0.075);
+        let superscript_y_offset = rounded(GlobalMetric::SuperscriptYOffset, units_per_em * 0.35);
 
-        self.set_if_absent(GlobalMetric::SubscriptXSize, pos, subscript_x_size);
-        self.set_if_absent(GlobalMetric::SubscriptYSize, pos, subscript_y_size);
         self.set_if_absent(
             GlobalMetric::SubscriptXOffset,
             pos,
-            adjust_offset(-subscript_y_offset.0, italic_angle),
+            adjust_offset(-subscript_y_offset, italic_angle),
         );
-        self.set_if_absent(GlobalMetric::SubscriptYOffset, pos, subscript_y_offset);
-
         self.set_if_absent(GlobalMetric::SuperscriptXSize, pos, subscript_x_size);
         self.set_if_absent(GlobalMetric::SuperscriptYSize, pos, subscript_y_size);
         self.set_if_absent(
             GlobalMetric::SuperscriptXOffset,
             pos,
-            adjust_offset(superscript_y_offset.0, italic_angle),
+            adjust_offset(superscript_y_offset, italic_angle),
         );
-        self.set_if_absent(GlobalMetric::SuperscriptYOffset, pos, superscript_y_offset);
 
         // ufo2ft and Glyphs.app have different defaults for the post.underlinePosition:
         // the former uses 0.075*UPEM whereas the latter 0.1*UPEM (both use the same
@@ -665,10 +657,6 @@ impl GlobalMetricsBuilder {
         metric: GlobalMetric,
     ) -> &mut HashMap<NormalizedLocation, OrderedFloat<f64>> {
         self.values.entry(metric).or_default()
-    }
-
-    fn get(&self, metric: GlobalMetric, pos: &NormalizedLocation) -> Option<OrderedFloat<f64>> {
-        self.values.get(&metric)?.get(pos).copied()
     }
 
     /// Note that the source, not a fallback, is where this value came from.
@@ -1091,6 +1079,28 @@ impl NameBuilder {
         family.join(" ")
     }
 
+    /// The style-linked family name, e.g. "Family Bold" becomes "Family" when
+    /// the selection flags say bold.
+    ///
+    /// <https://github.com/googlefonts/glyphsLib/blob/7819ab5e/Lib/glyphsLib/builder/names.py#L98-L112>
+    pub fn style_map_family_name(family: &str, style_name: &str, flags: SelectionFlags) -> String {
+        let mut is_bold = flags.contains(SelectionFlags::BOLD);
+        let mut is_italic = flags.contains(SelectionFlags::ITALIC);
+        let mut is_regular = !(is_bold || is_italic);
+        let mut linked_style = Vec::new();
+        for part in style_name.split_ascii_whitespace().rev() {
+            match part {
+                "Regular" if is_regular => is_regular = false,
+                "Bold" if is_bold => is_bold = false,
+                "Italic" | "Oblique" if is_italic => is_italic = false,
+                _ => linked_style.push(part),
+            }
+        }
+        linked_style.push(family);
+        linked_style.reverse();
+        linked_style.join(" ")
+    }
+
     pub fn add(&mut self, name_id: NameId, value: String) {
         // Work around plist crate not performing XML end-of-line normalization
         // (XML 1.0 §2.11: \r\n → \n, bare \r → \n)
@@ -1342,6 +1352,91 @@ impl FeaturesSource {
             fea_content,
             include_dir: None,
         }
+    }
+}
+
+impl Display for FeaturesSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            FeaturesSource::Empty => f.write_str("<no features>"),
+            FeaturesSource::File { fea_file, .. } => write!(f, "{}", fea_file.display()),
+            FeaturesSource::Memory { .. } => f.write_str("<memory>"),
+        }
+    }
+}
+
+/// One FEA source, and the masters that use it.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct MasterFeaSource {
+    /// Where the FEA for these masters comes from.
+    pub source: FeaturesSource,
+    /// The design locations of every master that shares this exact source.
+    ///
+    /// Empty if the source isn't associated with any particular master, e.g.
+    /// the features of a .glyphs file, which are font-wide.
+    pub locations: Vec<DesignLocation>,
+}
+
+/// Every distinct FEA source for a font.
+///
+/// The masters of a designspace can each have their own features.fea. Sources
+/// that are equivalent - the overwhelmingly common case, where every master
+/// has the same features - are collapsed into a single entry that records all
+/// the masters sharing it.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct FeatureSources {
+    /// Never empty; `sources[0]` is the source we treat as the default master's.
+    sources: Vec<MasterFeaSource>,
+}
+
+impl FeatureSources {
+    /// One source, used by the entire font
+    pub fn single(source: FeaturesSource) -> Self {
+        FeatureSources {
+            sources: vec![MasterFeaSource {
+                source,
+                locations: Vec::new(),
+            }],
+        }
+    }
+
+    /// Distinct sources, one entry per set of masters that share a source.
+    ///
+    /// The first entry is the one we treat as the default master's; see
+    /// [`FeatureSources::default_source`].
+    ///
+    /// Panics if `sources` is empty; a font always has at least one (possibly
+    /// [`FeaturesSource::Empty`]) source.
+    pub fn new(sources: Vec<MasterFeaSource>) -> Self {
+        assert!(!sources.is_empty(), "a font always has a default source");
+        FeatureSources { sources }
+    }
+
+    /// The source used to compile everything that is not per-master.
+    ///
+    /// This is the default master's FEA, if it has any; a designspace where
+    /// only non-default masters have a features.fea uses the first one found.
+    pub fn default_source(&self) -> &FeaturesSource {
+        &self.sources[0].source
+    }
+
+    /// The number of distinct sources; always at least one.
+    pub fn n_sources(&self) -> usize {
+        self.sources.len()
+    }
+
+    pub fn get(&self, idx: usize) -> Option<&MasterFeaSource> {
+        self.sources.get(idx)
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = &MasterFeaSource> {
+        self.sources.iter()
+    }
+}
+
+impl Default for FeatureSources {
+    fn default() -> Self {
+        FeatureSources::single(FeaturesSource::Empty)
     }
 }
 
@@ -1650,6 +1745,9 @@ pub struct Glyph {
     pub name: GlyphName,
     /// Whether to "export" in source terms
     pub emit_to_binary: bool,
+    /// Keep explicitly supplied anchors, without propagating anchors from components.
+    #[serde(default)]
+    pub skip_anchor_propagation: bool,
     pub codepoints: HashSet<u32>, // single unicodes that each point to this glyph. Typically 0 or 1.
     default_location: NormalizedLocation,
     sources: HashMap<NormalizedLocation, GlyphInstance>,
@@ -1743,6 +1841,7 @@ impl Glyph {
         Ok(Glyph {
             name,
             emit_to_binary,
+            skip_anchor_propagation: false,
             codepoints,
             default_location,
             sources: instances,
@@ -1845,66 +1944,6 @@ impl IdAware<WorkId> for Glyph {
     }
 }
 
-impl Persistable for Glyph {
-    fn read(from: &mut dyn Read) -> Self {
-        serde_yaml::from_reader(from).unwrap()
-    }
-
-    fn write(&self, to: &mut dyn std::io::Write) {
-        serde_yaml::to_writer(to, self).unwrap();
-    }
-}
-
-impl Persistable for GlyphOrder {
-    fn read(from: &mut dyn Read) -> Self {
-        serde_yaml::from_reader(from).unwrap()
-    }
-
-    fn write(&self, to: &mut dyn std::io::Write) {
-        serde_yaml::to_writer(to, self).unwrap();
-    }
-}
-
-impl Persistable for GlobalMetrics {
-    fn read(from: &mut dyn Read) -> Self {
-        serde_yaml::from_reader(from).unwrap()
-    }
-
-    fn write(&self, to: &mut dyn std::io::Write) {
-        serde_yaml::to_writer(to, self).unwrap();
-    }
-}
-
-impl Persistable for FeaturesSource {
-    fn read(from: &mut dyn Read) -> Self {
-        serde_yaml::from_reader(from).unwrap()
-    }
-
-    fn write(&self, to: &mut dyn std::io::Write) {
-        serde_yaml::to_writer(to, self).unwrap();
-    }
-}
-
-impl Persistable for KerningLocations {
-    fn read(from: &mut dyn Read) -> Self {
-        serde_yaml::from_reader(from).unwrap()
-    }
-
-    fn write(&self, to: &mut dyn std::io::Write) {
-        serde_yaml::to_writer(to, self).unwrap();
-    }
-}
-
-impl Persistable for KerningInstance {
-    fn read(from: &mut dyn Read) -> Self {
-        serde_yaml::from_reader(from).unwrap()
-    }
-
-    fn write(&self, to: &mut dyn std::io::Write) {
-        serde_yaml::to_writer(to, self).unwrap();
-    }
-}
-
 impl IdAware<WorkId> for KerningInstance {
     fn id(&self) -> WorkId {
         WorkId::KernInstance(self.location.clone())
@@ -1917,36 +1956,6 @@ impl IdAware<WorkId> for GlyphAnchors {
     }
 }
 
-impl Persistable for GlyphAnchors {
-    fn read(from: &mut dyn Read) -> Self {
-        serde_yaml::from_reader(from).unwrap()
-    }
-
-    fn write(&self, to: &mut dyn std::io::Write) {
-        serde_yaml::to_writer(to, self).unwrap();
-    }
-}
-
-impl Persistable for ColorPalettes {
-    fn read(from: &mut dyn Read) -> Self {
-        serde_yaml::from_reader(from).unwrap()
-    }
-
-    fn write(&self, to: &mut dyn std::io::Write) {
-        serde_yaml::to_writer(to, self).unwrap();
-    }
-}
-
-impl Persistable for ColorGlyphs {
-    fn read(from: &mut dyn Read) -> Self {
-        serde_yaml::from_reader(from).unwrap()
-    }
-
-    fn write(&self, to: &mut dyn std::io::Write) {
-        serde_yaml::to_writer(to, self).unwrap();
-    }
-}
-
 /// A variable definition of a single glyph.
 ///
 /// If defined in many locations, presumed to vary continuously
@@ -1955,6 +1964,8 @@ impl Persistable for ColorGlyphs {
 pub struct GlyphBuilder {
     pub name: GlyphName,
     pub emit_to_binary: bool,
+    #[serde(default)]
+    pub skip_anchor_propagation: bool,
     pub codepoints: HashSet<u32>, // single unicodes that each point to this glyph. Typically 0 or 1.
     pub sources: HashMap<NormalizedLocation, GlyphInstance>,
 }
@@ -1964,6 +1975,7 @@ impl GlyphBuilder {
         Self {
             name,
             emit_to_binary: true,
+            skip_anchor_propagation: false,
             codepoints: HashSet::new(),
             sources: HashMap::new(),
         }
@@ -1991,12 +2003,14 @@ impl GlyphBuilder {
     }
 
     pub fn build(self) -> Result<Glyph, BadGlyph> {
-        Glyph::new(
+        let mut glyph = Glyph::new(
             self.name,
             self.emit_to_binary,
             self.codepoints,
             self.sources,
-        )
+        )?;
+        glyph.skip_anchor_propagation = self.skip_anchor_propagation;
+        Ok(glyph)
     }
 }
 
@@ -2005,6 +2019,7 @@ impl From<Glyph> for GlyphBuilder {
         Self {
             name: value.name,
             emit_to_binary: value.emit_to_binary,
+            skip_anchor_propagation: value.skip_anchor_propagation,
             codepoints: value.codepoints,
             sources: value.sources,
         }
@@ -2162,10 +2177,10 @@ impl GlyphInstance {
         let components = self
             .components
             .iter()
-            .zip(values.chunks_exact(6))
+            .zip(values.as_chunks::<6>().0)
             .map(|(comp, coeffs)| Component {
                 base: comp.base.clone(),
-                transform: Affine::new(coeffs.try_into().unwrap()),
+                transform: Affine::new(*coeffs),
                 anchor: comp.anchor.clone(),
             })
             .collect();
@@ -2618,6 +2633,33 @@ mod tests {
         assert_name(&names, "Halant", NameId::FAMILY_NAME);
     }
 
+    // Expected values from glyphsLib build_stylemap_names
+    #[test]
+    fn style_map_family_name_strips_only_what_the_flags_account_for() {
+        let bold = SelectionFlags::BOLD;
+        let italic = SelectionFlags::ITALIC;
+        for (style_name, flags, expected) in [
+            ("Regular", SelectionFlags::empty(), "Family"),
+            ("Bold", bold, "Family"),
+            ("Italic", italic, "Family"),
+            ("Bold Italic", bold | italic, "Family"),
+            ("Italic", SelectionFlags::empty(), "Family Italic"),
+            ("Bold Italic", bold, "Family Italic"),
+            ("Semi Bold", SelectionFlags::empty(), "Family Semi Bold"),
+            ("Condensed Bold Oblique", bold | italic, "Family Condensed"),
+            ("Bold Bold", bold, "Family Bold"),
+            ("Regular Italic", italic, "Family Regular"),
+            ("Light", SelectionFlags::empty(), "Family Light"),
+            ("", SelectionFlags::empty(), "Family"),
+        ] {
+            assert_eq!(
+                expected,
+                NameBuilder::style_map_family_name("Family", style_name, flags),
+                "{style_name:?} with {flags:?}"
+            );
+        }
+    }
+
     #[test]
     fn both_legacy_and_typo_names_defined_and_distinct() {
         let mut builder = NameBuilder::default();
@@ -2699,6 +2741,62 @@ mod tests {
             .0
             .ot_round();
         assert_eq!(451, rounded);
+    }
+
+    // ufo2ft rounds the fallback Y offsets (2048 * 0.075 = 153.6 -> 154,
+    // 2048 * 0.35 = 716.8 -> 717) before deriving the X offsets from the italic
+    // angle; feeding the raw floats to adjust_offset gives -35 and 165 instead.
+    // Expected values produced by ufo2ft.compileTTF on a UFO with these settings.
+    //
+    // NOTE: this test is not about 'correctness' in a meaningful way, it is just
+    // checking that our behaviour matches the python. This may not be important
+    // when you are reading this.
+    #[test]
+    fn subscript_x_offset_derived_from_rounded_y_offset() {
+        let pos = NormalizedLocation::for_pos(&[("wght", 0.0)]);
+        let mut metrics = GlobalMetricsBuilder::new();
+        metrics.populate_defaults(&pos, 2048, None, None, None, Some(-13.0));
+        let metrics = metrics.build(&Axes::default()).unwrap();
+        let get = |metric| OtRound::<i16>::ot_round(metrics.get(metric, &pos).0);
+        assert_eq!(
+            [1331, 1229, -36, 154, 1331, 1229, 166, 717],
+            [
+                get(GlobalMetric::SubscriptXSize),
+                get(GlobalMetric::SubscriptYSize),
+                get(GlobalMetric::SubscriptXOffset),
+                get(GlobalMetric::SubscriptYOffset),
+                get(GlobalMetric::SuperscriptXSize),
+                get(GlobalMetric::SuperscriptYSize),
+                get(GlobalMetric::SuperscriptXOffset),
+                get(GlobalMetric::SuperscriptYOffset),
+            ]
+        );
+    }
+
+    // ufo2ft derives the X offset from the explicit Y offset as given, so an
+    // explicit integer Y offset must not be replaced by the rounded fallback.
+    //
+    // NOTE: this test is not about 'correctness' in a meaningful way, it is just
+    // checking that our behaviour matches the python. This may not be important
+    // when you are reading this.
+    #[test]
+    fn subscript_x_offset_derived_from_explicit_y_offset() {
+        let pos = NormalizedLocation::for_pos(&[("wght", 0.0)]);
+        let mut metrics = GlobalMetricsBuilder::new();
+        metrics.set(GlobalMetric::SubscriptYOffset, pos.clone(), 150.0);
+        metrics.set(GlobalMetric::SuperscriptYOffset, pos.clone(), 700.0);
+        metrics.populate_defaults(&pos, 2048, None, None, None, Some(-13.0));
+        let metrics = metrics.build(&Axes::default()).unwrap();
+        let get = |metric| OtRound::<i16>::ot_round(metrics.get(metric, &pos).0);
+        assert_eq!(
+            [-35, 150, 162, 700],
+            [
+                get(GlobalMetric::SubscriptXOffset),
+                get(GlobalMetric::SubscriptYOffset),
+                get(GlobalMetric::SuperscriptXOffset),
+                get(GlobalMetric::SuperscriptYOffset),
+            ]
+        );
     }
 
     #[test]

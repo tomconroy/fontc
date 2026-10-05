@@ -106,7 +106,11 @@ pub fn propagate_all_anchors(context: &Context) -> Result<(), Error> {
             let anchors = anchors_traversing_components(
                 &glyph_name,
                 &existing_anchors,
-                &instance.components,
+                if glyph.skip_anchor_propagation {
+                    &[]
+                } else {
+                    &instance.components
+                },
                 is_mark,
                 is_ligature,
                 location,
@@ -642,8 +646,7 @@ mod tests {
         )
         .unwrap();
         let flags = Flags::default();
-        let ctx = Context::new_root(flags, None, None) // ir_dir=None => no IR writing
-            .copy_for_work(Access::All, Access::All);
+        let ctx = Context::new_root(flags).copy_for_work(Access::All, Access::All);
         ctx.static_metadata.set(meta);
 
         // Initialize empty GDEF categories (will be set by test builders)

@@ -114,13 +114,14 @@ impl Work<Context, AnyWorkId, Error> for HeadWork {
     }
 
     /// Generate [head](https://learn.microsoft.com/en-us/typography/opentype/spec/head)
+    #[tracing::instrument(name = "fontbe::HeadWork::exec", skip_all)]
     fn exec(&self, context: &Context) -> Result<(), Error> {
         let static_metadata = context.ir.static_metadata.get();
         // CFF fonts have no loca table; indexToLocFormat stays 0
         let loca_format = if context.flags.contains(IrFlags::CFF_OUTLINES) {
             LocaFormat::Short
         } else {
-            (*context.loca_format.get().as_ref()).into()
+            *context.loca_format.get()
         };
         let mut head = init_head(
             static_metadata.units_per_em,

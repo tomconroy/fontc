@@ -15,7 +15,7 @@ use super::{
     tags,
 };
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub(crate) struct FeatureLookups {
     /// the base (not variation specific) lookups
     pub(crate) base: Vec<LookupId>,
@@ -25,7 +25,7 @@ pub(crate) struct FeatureLookups {
 /// A type to store accumulated features during compilation
 ///
 /// We update this type as we encounter feature blocks in the source FEA.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub(crate) struct AllFeatures {
     pub(crate) features: BTreeMap<FeatureKey, FeatureLookups>,
     required_features: HashSet<FeatureKey>,
@@ -44,7 +44,9 @@ pub(crate) struct ActiveFeature {
     pub(crate) tag: Tag,
     condition_set: Option<ConditionSet>,
     default_systems: DefaultLanguageSystems,
-    current_lang_sys: Option<LanguageSystem>,
+    current_lang_systems: Vec<LanguageSystem>,
+    /// Whether a script or language statement has been seen
+    seen_script_lang: bool,
     lookups: HashMap<LanguageSystem, Vec<LookupId>>,
     script_default_lookups: HashMap<Tag, Vec<LookupId>>,
 }
@@ -54,7 +56,7 @@ pub(crate) struct ActiveFeature {
 /// This is a special and annoying case. We create this object when we encounter
 /// the aalt feature block, and then we use this to generate the aalt lookups
 /// once we've finished processing the input.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub(crate) struct AaltFeature {
     aalt_features: Vec<Tag>,
     pub(crate) all_alts: HashMap<GlyphId16, Vec<GlyphId16>>,
@@ -64,7 +66,7 @@ pub(crate) struct AaltFeature {
 }
 
 /// Helper for compiling the `size` feature
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub(crate) struct SizeFeature {
     pub design_size: u16,
     pub identifier: u16,
@@ -73,7 +75,7 @@ pub(crate) struct SizeFeature {
     pub names: Vec<NameSpec>,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub(crate) struct CvParams {
     pub feat_ui_label_name: Vec<NameSpec>,
     pub feat_ui_tooltip_text_name: Vec<NameSpec>,
@@ -97,7 +99,7 @@ pub(crate) enum SpecialVerticalFeatureState {
 
 /// maps names to conditionsets, also tracking declaration order (which
 /// is maintained in the final output table)
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub(crate) struct ConditionSetMap {
     named_conditionsets: HashMap<SmolStr, ConditionSet>,
     // used for sorting
@@ -349,34 +351,56 @@ impl ActiveFeature {
             condition_set,
             script_default_lookups: Default::default(),
             lookups: Default::default(),
-            current_lang_sys: Default::default(),
+            current_lang_systems: vec![default_systems.first()],
+            seen_script_lang: false,
             default_systems,
         }
     }
 
-    /// `true` if the currently active language systems are exactly `{system}`.
-    ///
-    /// This mirrors fonttools' `Builder.language_systems`, which is a *set*:
-    /// before any `script`/`language` statement in a feature block it is the
-    /// set of default language systems (from the file's `languagesystem`
-    /// statements, or `DFLT dflt` if there are none), and after one it is
-    /// always a single system.
-    pub(crate) fn active_systems_are_only(&self, system: LanguageSystem) -> bool {
-        match self.current_lang_sys {
-            Some(current) => current == system,
-            None => self.default_systems.is_only(&system),
-        }
+    pub(crate) fn current_lang_sys(&self) -> LanguageSystem {
+        self.current_lang_systems[0]
     }
 
-    /// Change the active language system.
+    pub(crate) fn is_only_current_system(&self, system: LanguageSystem) -> bool {
+        self.current_lang_systems.as_slice() == [system]
+    }
+
+    /// Change the active language systems.
     ///
     /// This method is called when encountering 'script' and 'language' statements
     /// in a feature block. These statements have strange semantics, best documented
     /// in issues like <https://github.com/fonttools/fonttools/pull/1307>.
     ///
     /// This method handles figuring out what previously declared lookups should
-    /// be included with the newly assigned language system.
-    pub(crate) fn set_system(&mut self, system: LanguageSystem, exclude_dflt: bool) -> FeatureKey {
+    /// be included with each newly assigned language system. All assigned
+    /// systems share subsequent rules and lookup references.
+    pub(crate) fn set_systems(
+        &mut self,
+        systems: impl IntoIterator<Item = LanguageSystem>,
+        exclude_dflt: bool,
+    ) -> Vec<FeatureKey> {
+        let mut seen = HashSet::new();
+        let systems = systems
+            .into_iter()
+            .filter(|system| seen.insert(*system))
+            .collect::<Vec<_>>();
+        assert!(
+            !systems.is_empty(),
+            "language statement has at least one tag"
+        );
+
+        for &system in &systems {
+            self.prepare_system(system, exclude_dflt);
+        }
+        self.current_lang_systems = systems;
+        self.seen_script_lang = true;
+        self.current_lang_systems
+            .iter()
+            .map(|system| (*system).to_feature_key(self.tag))
+            .collect()
+    }
+
+    fn prepare_system(&mut self, system: LanguageSystem, exclude_dflt: bool) {
         // if the language is default, this is either the DFLT dflt system
         // or a script default (like latn dflt). In this second case, we keep
         // the script dflt lookups separate from the DFLT dflt lookups, because
@@ -414,42 +438,44 @@ impl ActiveFeature {
                     .flat_map(|v| v.iter().copied()),
             );
 
-            // fonttools *assigns* here rather than merging, so a second
-            // 'language xxx' statement in the same feature block throws away
-            // whatever the first one accumulated and starts again from the
-            // script defaults; and when the defaults are excluded it removes
-            // them from what has accumulated so far.
-            //https://github.com/fonttools/fonttools/blob/5ae2943a43/Lib/fontTools/feaLib/builder.py#L1160-L1171
-            if !exclude_dflt && !dflt_lookups.is_empty() {
-                self.lookups.insert(system, dflt_lookups);
-            } else {
-                let lookups = self.lookups.entry(system).or_default();
+            // fonttools only ever adds or removes the default lookups here,
+            // never replaces the list: a repeated 'language xxx' statement
+            // keeps what the first one accumulated, gains any defaults it is
+            // missing, and 'exclude_dflt' removes the defaults from what has
+            // accumulated so far.
+            //https://github.com/fonttools/fonttools/blob/4.66.1/Lib/fontTools/feaLib/builder.py#L1193-L1204
+            let lookups = self.lookups.entry(system).or_default();
+            if exclude_dflt {
                 lookups.retain(|lookup| !dflt_lookups.contains(lookup));
+            } else {
+                for lookup in dflt_lookups {
+                    if !lookups.contains(&lookup) {
+                        lookups.push(lookup);
+                    }
+                }
             }
         }
-
-        self.current_lang_sys = Some(system);
-        system.to_feature_key(self.tag)
     }
 
     pub(crate) fn add_lookup(&mut self, lookup: LookupId) {
         // there is a distinction between "implicit DFLT/dflt" and having
         // an explicit 'DFLT' script in the lookup block.
-        let is_script_default = match self.current_lang_sys {
-            None => false,
-            Some(sys) => sys.language == tags::LANG_DFLT,
-        };
-
-        if is_script_default {
-            self.script_default_lookups
-                .entry(self.current_lang_sys.unwrap().script)
+        if !self.seen_script_lang {
+            self.lookups
+                .entry(LanguageSystem::default())
                 .or_default()
                 .push(lookup);
         } else {
-            self.lookups
-                .entry(self.current_lang_sys.unwrap_or_default())
-                .or_default()
-                .push(lookup);
+            for &system in &self.current_lang_systems {
+                if system.language == tags::LANG_DFLT {
+                    self.script_default_lookups
+                        .entry(system.script)
+                        .or_default()
+                        .push(lookup);
+                } else {
+                    self.lookups.entry(system).or_default().push(lookup);
+                }
+            }
         }
     }
 
@@ -703,17 +729,36 @@ mod tests {
     const TAG_TEST: Tag = Tag::new(b"test");
 
     #[test]
+    fn multiple_current_language_systems_share_lookups() {
+        let [id] = make_ids();
+        let mut feature = ActiveFeature::new(TAG_TEST, Default::default(), None);
+
+        feature.set_systems([LATN_DEU, LATN_TRK, LATN_DEU], true);
+        feature.add_lookup(id);
+
+        let built = feature.build_features();
+        assert_eq!(
+            built.get_base(&LATN_DEU.to_feature_key(TAG_TEST)),
+            Some([id].as_slice())
+        );
+        assert_eq!(
+            built.get_base(&LATN_TRK.to_feature_key(TAG_TEST)),
+            Some([id].as_slice())
+        );
+    }
+
+    #[test]
     fn non_default_script_default() {
         let default_systems = default_systems([DFLT_DFLT, LATN_DEU, LATN_POL]);
         let [id_1, id_2] = make_ids();
 
         let mut feature = ActiveFeature::new(TAG_TEST, default_systems, None);
         feature.add_lookup(id_1); // added to default lookups
-        feature.set_system(LATN_DFLT, false);
+        feature.set_systems([LATN_DFLT], false);
         feature.add_lookup(id_2); // added to script-default lookups
 
-        feature.set_system(LATN_TRK, false);
-        feature.set_system(LATN_POL, false);
+        feature.set_systems([LATN_TRK], false);
+        feature.set_systems([LATN_POL], false);
 
         let built = feature.build_features();
 
@@ -745,19 +790,19 @@ mod tests {
 
         let mut feature = ActiveFeature::new(TAG_TEST, defaults, None);
         feature.add_lookup(id1);
-        feature.set_system(DFLT_DFLT, false);
+        feature.set_systems([DFLT_DFLT], false);
         feature.add_lookup(id2);
-        feature.set_system(DFLT_DFLT, false);
+        feature.set_systems([DFLT_DFLT], false);
         feature.add_lookup(id3);
-        feature.set_system(DFLT_FRE, false);
+        feature.set_systems([DFLT_FRE], false);
         feature.add_lookup(id4);
-        feature.set_system(LATN_DFLT, false);
+        feature.set_systems([LATN_DFLT], false);
         feature.add_lookup(id5);
-        feature.set_system(LATN_DFLT, false);
+        feature.set_systems([LATN_DFLT], false);
         feature.add_lookup(id6);
-        feature.set_system(LATN_FRE, false);
+        feature.set_systems([LATN_FRE], false);
         feature.add_lookup(id7);
-        feature.set_system(LATN_DEF, true);
+        feature.set_systems([LATN_DEF], true);
         feature.add_lookup(id8);
 
         let built = feature.build_features();

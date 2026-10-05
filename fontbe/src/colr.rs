@@ -350,6 +350,7 @@ impl Work<Context, AnyWorkId, Error> for ColrWork {
     }
 
     /// Generate [COLR](https://learn.microsoft.com/en-us/typography/opentype/spec/colr)
+    #[tracing::instrument(name = "fontbe::ColrWork::exec", skip_all)]
     fn exec(&self, context: &Context) -> Result<(), Error> {
         let Some(paint_graph) = context.ir.paint_graph.try_get() else {
             return Ok(());
@@ -363,6 +364,7 @@ impl Work<Context, AnyWorkId, Error> for ColrWork {
         let glyph_order = context.ir.glyph_order.get();
         let static_metadata = context.ir.static_metadata.get();
         let quantization = colr_clip_box_quantization(static_metadata.units_per_em);
+        let is_variable = !static_metadata.axes.is_empty();
 
         let mut colr_v0_glyphs = Vec::new();
         let mut colr_v0_layers = Vec::new();
@@ -424,12 +426,14 @@ impl Work<Context, AnyWorkId, Error> for ColrWork {
                         paint,
                     )?,
                 ));
-                add_or_extend_clip(
-                    &mut clips,
-                    quantization,
-                    glyph_order.glyph_id(glyph_name).expect("Prevalidated"),
-                    &glyph,
-                );
+                if !is_variable {
+                    add_or_extend_clip(
+                        &mut clips,
+                        quantization,
+                        glyph_order.glyph_id(glyph_name).expect("Prevalidated"),
+                        &glyph,
+                    );
+                }
             }
         }
 
@@ -493,8 +497,8 @@ mod tests {
     fn v1_palette_index_0xffff() {
         use fontir::orchestration::Context as IrContext;
 
-        let ir_ctx = IrContext::new_root(Default::default(), None, None);
-        let context = Context::new_root(Default::default(), None, None, None, false, &ir_ctx);
+        let ir_ctx = IrContext::new_root(Default::default());
+        let context = Context::new_root(Default::default(), None, None, false, &ir_ctx);
 
         let palette = ColorPalettes::default();
         let mut glyph_order = GlyphOrder::new();

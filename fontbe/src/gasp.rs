@@ -29,6 +29,7 @@ impl Work<Context, AnyWorkId, Error> for GaspWork {
     }
 
     /// Generate [gasp](https://learn.microsoft.com/en-us/typography/opentype/spec/gasp) if necessary
+    #[tracing::instrument(name = "fontbe::GaspWork::exec", skip_all)]
     fn exec(&self, context: &Context) -> Result<(), Error> {
         // gasp only advises TrueType rasterizers; ufo2ft lists it among the
         // TTF-only tables, so a CFF font never gets one

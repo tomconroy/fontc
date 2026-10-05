@@ -318,6 +318,7 @@ impl Work<Context, AnyWorkId, Error> for MetricAndLimitWork {
     /// * [maxp](https://learn.microsoft.com/en-us/typography/opentype/spec/maxp)
     ///
     /// Touchup [head](https://learn.microsoft.com/en-us/typography/opentype/spec/head)
+    #[tracing::instrument(name = "fontbe::MetricAndLimitWork::exec", skip_all)]
     fn exec(&self, context: &Context) -> Result<(), Error> {
         let static_metadata = context.ir.static_metadata.get();
         let glyph_order = context.ir.glyph_order.get();
@@ -424,12 +425,10 @@ impl Work<Context, AnyWorkId, Error> for MetricAndLimitWork {
         context.hhea.set(hhea);
 
         let hmtx = Hmtx::new(metrics.long_metrics, metrics.first_side_bearings);
-        let raw_hmtx = dump_table(&hmtx)
-            .map_err(|e| Error::DumpTableError {
-                e,
-                context: "hmtx".into(),
-            })?
-            .into();
+        let raw_hmtx = dump_table(&hmtx).map_err(|e| Error::DumpTableError {
+            e,
+            context: "hmtx".into(),
+        })?;
         context.hmtx.set(raw_hmtx);
 
         let (maxp, font_bbox) = if cff.is_some() {

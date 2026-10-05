@@ -9,13 +9,14 @@ use quick_xml::{
 };
 use std::{
     borrow::Cow,
-    collections::{BTreeSet, HashMap},
+    collections::HashMap,
     fmt::Display,
     num::ParseIntError,
     path::{Path, PathBuf},
     str::FromStr,
 };
 
+use fontdrasil::unicode18;
 use icu_properties::props::GeneralCategory;
 
 use smol_str::SmolStr;
@@ -291,6 +292,7 @@ pub struct QueryResult {
 }
 
 #[derive(Clone, Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum GlyphDataError {
     #[error("Couldn't read user file at '{path}': '{reason}'")]
     UserFile {
@@ -422,7 +424,9 @@ fn parse_glyph_xml(item: BytesStart) -> Result<GlyphInfoFromXml, GlyphDataError>
 
     for attr in item.attributes() {
         let attr = attr?;
-        let value = attr.unescape_value()?;
+        // GlyphData files may lack an XML declaration (and we don't track it),
+        // so per the XML spec version 1.0 is assumed.
+        let value = attr.normalized_value(quick_xml::XmlVersion::Implicit1_0)?;
         match attr.key.as_ref() {
             b"name" => name = Some(value),
             b"category" => category = Some(value),
@@ -494,7 +498,7 @@ impl GlyphData {
     /// 1. A computed value based on name heuristics
     ///
     // See https://github.com/googlefonts/glyphsLib/blob/e2ebf5b517d/Lib/glyphsLib/glyphdata.py#L94
-    pub fn query(&self, name: &str, codepoints: Option<&BTreeSet<u32>>) -> Option<QueryResult> {
+    pub fn query(&self, name: &str, codepoints: Option<&[u32]>) -> Option<QueryResult> {
         self.query_no_synthesis(name, codepoints)
             // we don't have info for this glyph: can we synthesize it?
             .or_else(|| self.construct_result(name))
@@ -503,11 +507,7 @@ impl GlyphData {
     /// As [`Self::query`] but without a fallback to computed values.
     ///
     /// Exists to enable result synthesis to query.
-    fn query_no_synthesis(
-        &self,
-        name: &str,
-        codepoints: Option<&BTreeSet<u32>>,
-    ) -> Option<QueryResult> {
+    fn query_no_synthesis(&self, name: &str, codepoints: Option<&[u32]>) -> Option<QueryResult> {
         // Override?
         if let (Some(overrides), Some(overrides_by_codepoint)) = (
             self.overrides.as_ref(),
@@ -536,7 +536,7 @@ impl GlyphData {
 
         // No override, perhaps we have a direct answer?
         bundled::find_pos_by_name(name)
-            .or_else(|| find_pos_by_prod_name(name.into()))
+            .or_else(|| find_pos_by_prod_name(name))
             .or_else(|| {
                 codepoints
                     .into_iter()
@@ -789,7 +789,7 @@ impl GlyphData {
 
 // https://github.com/googlefonts/glyphsLib/blob/e2ebf5b517d/Lib/glyphsLib/glyphdata.py#L261
 fn category_from_icu(c: char) -> (Category, Option<Subcategory>) {
-    match icu_properties::CodePointMapData::<GeneralCategory>::new().get(c) {
+    match unicode18::general_category(c) {
         GeneralCategory::Unassigned | GeneralCategory::OtherSymbol => (Category::Symbol, None),
         GeneralCategory::UppercaseLetter
         | GeneralCategory::LowercaseLetter
@@ -1043,6 +1043,15 @@ mod tests {
     use rstest::rstest;
 
     #[test]
+    fn unicode_18_general_category() {
+        assert_eq!(
+            category_from_icu('\u{11DF0}'),
+            (Category::Mark, Some(Subcategory::Nonspacing))
+        );
+        assert_eq!(category_from_icu('\u{12550}'), (Category::Number, None));
+    }
+
+    #[test]
     fn simple_overrides() {
         let overrides = HashMap::from([(
             "A".into(),
@@ -1087,9 +1096,8 @@ mod tests {
     }
 
     fn get_category(name: &str, codepoints: &[u32]) -> Option<(Category, Option<Subcategory>)> {
-        let codepoints = codepoints.iter().copied().collect();
         GlyphData::new(None)
-            .query(name, Some(&codepoints))
+            .query(name, Some(codepoints))
             .map(|result| (result.category, result.subcategory))
     }
 
@@ -1264,6 +1272,56 @@ mod tests {
         )
     }
 
+    // Entries like allahlong-ar carry their codepoint only as unicodeLegacy, so
+    // "uniFDFA" is reachable solely through the production name; glyphsLib finds
+    // these via its production name map.
+    #[rstest(name, expected,
+        case("uniFDFA", Some((Category::Letter, Some(Subcategory::Ligature)))),
+        case("uniFDFB", Some((Category::Letter, Some(Subcategory::Ligature)))),
+        case("uniFBF9", Some((Category::Letter, Some(Subcategory::Ligature)))),
+        // an absent uniXXXX name still synthesizes via AGL + unicode category
+        case("uniE000", Some((Category::Letter, Some(Subcategory::Compatibility)))),
+    )]
+    fn unicode_legacy_only_prod_name(
+        name: &str,
+        expected: Option<(Category, Option<Subcategory>)>,
+    ) {
+        assert_eq!(expected, get_category(name, &[]));
+    }
+
+    #[test]
+    fn unicode_legacy_not_found_by_codepoint() {
+        // glyphsLib only indexes the unicode attribute, not unicodeLegacy
+        assert!(
+            GlyphData::new(None)
+                .query_no_synthesis("allahlong", Some(&[0xFDFA]))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn unicode_legacy_only_prod_name_result() {
+        let result = GlyphData::new(None)
+            .query_no_synthesis("uniFDFA", None)
+            .unwrap();
+        assert_eq!(
+            (
+                Category::Letter,
+                Some(Subcategory::Ligature),
+                None,
+                Some(Script::Arabic),
+                Some("uniFDFA".to_string())
+            ),
+            (
+                result.category,
+                result.subcategory,
+                result.codepoint,
+                result.script,
+                result.production_name.map(|p| p.to_string())
+            )
+        );
+    }
+
     #[rstest(name, expected,
         case("A", None),  // AGLFN names *are* production names
         case("z", None),
@@ -1371,9 +1429,8 @@ mod tests {
         // with unicode = (0x25BA, 0x25B6). The codepoint fallback must not
         // match U+25B6 → "uni25B6" before the production name lookup can
         // match "triagrt" → U+25BA (which needs no rename).
-        let codepoints: BTreeSet<u32> = [0x25BA, 0x25B6].into_iter().collect();
         let result = GlyphData::new(None)
-            .query("triagrt", Some(&codepoints))
+            .query("triagrt", Some(&[0x25BA, 0x25B6]))
             .unwrap();
         // "triagrt" IS the AGLFN production name for U+25BA, so the result's
         // production name must be "triagrt" (a no-op rename), NOT "uni25B6".
@@ -1381,5 +1438,17 @@ mod tests {
             result.production_name.as_ref().map(|p| p.to_string()),
             Some("triagrt".to_string()),
         );
+    }
+
+    #[test]
+    fn codepoint_lookup_uses_first_listed_codepoint() {
+        let prod_name = |codepoints: &[u32]| {
+            GlyphData::new(None)
+                .query("Nablasansbold-math", Some(codepoints))
+                .and_then(|result| result.production_name)
+                .map(|name| name.to_string())
+        };
+        assert_eq!(prod_name(&[0x1D76F, 0x1D6C1]).as_deref(), Some("u1D76F"));
+        assert_eq!(prod_name(&[0x1D6C1, 0x1D76F]).as_deref(), Some("u1D6C1"));
     }
 }

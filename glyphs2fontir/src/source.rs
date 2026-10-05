@@ -19,12 +19,12 @@ use fontir::{
     ir::{
         self, AnchorBuilder, ColorGlyphs, ColorPalettes, Condition, ConditionSet,
         DEFAULT_VENDOR_ID, FEATURE_WRITERS_LIB_KEY, FeatureWriterOptionValue, FeatureWriterSpec,
-        GlobalMetric, GlobalMetrics, GlobalMetricsBuilder, GlyphAnchors, GlyphInstance, GlyphOrder,
-        GlyphPredicateAttrs, InstanceOverrides, KernGroup, KernSide, KerningInstance,
-        KerningLocations, MetaTableValues, NameBuilder, NameKey, NamedInstance, Paint, PaintGlyph,
-        Panose, PostscriptNames, PostscriptSettings, PreliminaryGdefCategories, Rule,
-        StaticMetadata, StyleMapStyle, Substitution, VariableFeature, reject_duplicate_writers,
-        validate_feature_writer,
+        FilterScope, GlobalMetric, GlobalMetrics, GlobalMetricsBuilder, GlyphAnchors,
+        GlyphInstance, GlyphOrder, GlyphPredicateAttrs, InstanceOverrides, KernGroup, KernSide,
+        KerningInstance, KerningLocations, MetaTableValues, NameBuilder, NameKey, NamedInstance,
+        Paint, PaintGlyph, Panose, PostscriptNames, PostscriptSettings, PreliminaryGdefCategories,
+        Rule, StaticMetadata, StyleMapStyle, Substitution, VariableFeature,
+        reject_duplicate_writers, validate_feature_writer,
     },
     orchestration::{Context, Flags, IrWork, WorkId},
     source::Source,
@@ -32,9 +32,9 @@ use fontir::{
 use glyphs_reader::{
     Font, FontMaster, Instance, InstanceType, Layer, Plist,
     glyphdata::{Category, Subcategory},
-    master_style_map_family_name,
 };
 use indexmap::IndexMap;
+use kurbo::Affine;
 use ordered_float::OrderedFloat;
 use smol_str::{SmolStr, format_smolstr};
 use write_fonts::{
@@ -47,10 +47,13 @@ use write_fonts::{
     types::{NameId, Tag},
 };
 
+use crate::stat::to_stat_axes;
 use crate::toir::{
     FontInfo, design_location, to_ir_color, to_ir_contours_and_components, to_ir_features,
     to_ir_paint,
 };
+
+const UFO2FT_FILTERS: &str = "com.github.googlei18n.ufo2ft.filters";
 
 #[derive(Debug, Clone)]
 pub struct GlyphsIrSource {
@@ -152,7 +155,6 @@ impl Source for GlyphsIrSource {
     }
 
     fn compilation_flags(&self) -> Flags {
-        const UFO2FT_FILTERS: &str = "com.github.googlei18n.ufo2ft.filters";
         let mut flags = Flags::empty();
 
         let master = self.font_info.font.default_master();
@@ -173,26 +175,28 @@ impl Source for GlyphsIrSource {
                 match name {
                     "flattenComponents" => flags.set(Flags::FLATTEN_COMPONENTS, true),
                     "eraseOpenCorners" => flags.set(Flags::ERASE_OPEN_CORNERS, true),
-                    "propagateAnchors" => flags.set(Flags::PROPAGATE_ANCHORS, true),
+                    // Glyphs sources handle this as a font transformation; the
+                    // custom parameter below is authoritative.
+                    "propagateAnchors" => (),
                     "decomposeTransformedComponents" => {
                         flags.set(Flags::DECOMPOSE_TRANSFORMED_COMPONENTS, true)
                     }
+                    "decomposeComponents" => (),
                     other => log::info!("unhandled ufo2ft filter '{other}'"),
                 }
             }
         } else {
             // No ufo2ft filters defined - use Glyphs native defaults
             flags.set(Flags::ERASE_OPEN_CORNERS, true);
-            // Check custom parameter to allow opt-out while defaulting to true
-            if self
-                .font_info
-                .font
-                .custom_parameters
-                .propagate_anchors
-                .unwrap_or(true)
-            {
-                flags.set(Flags::PROPAGATE_ANCHORS, true);
-            }
+        }
+        if self
+            .font_info
+            .font
+            .custom_parameters
+            .propagate_anchors
+            .unwrap_or(true)
+        {
+            flags.set(Flags::PROPAGATE_ANCHORS, true);
         }
         flags
     }
@@ -274,14 +278,12 @@ fn names(font: &Font, flags: SelectionFlags) -> HashMap<NameKey, String> {
     };
     builder.add(NameId::SUBFAMILY_NAME, subfamily.to_string());
 
-    // The family name takes on whatever the default master's style name has
-    // left to say once the style linking has said its piece
-    // <https://github.com/googlefonts/glyphsLib/blob/6.13.1/Lib/glyphsLib/builder/names.py#L21-L42>
     let original_family = builder
         .get(NameId::FAMILY_NAME)
         .map(|s| s.to_string())
         .unwrap_or_default();
-    let family = master_style_map_family_name(&original_family, font.default_master());
+    let family =
+        NameBuilder::style_map_family_name(&original_family, &font.default_master().name, flags);
     builder.add(NameId::FAMILY_NAME, family.clone());
 
     if let Some(typographic_family) = &builder
@@ -546,6 +548,31 @@ fn feature_writers_from_user_data(
     Ok(Some(specs))
 }
 
+/// Read the `decomposeComponents` entry of the ufo2ft filter list in the
+/// default master's userData, if any.
+fn decompose_components_from_user_data(
+    user_data: &BTreeMap<SmolStr, Plist>,
+) -> Option<FilterScope> {
+    let filter = user_data
+        .get(UFO2FT_FILTERS)?
+        .as_array()?
+        .iter()
+        .filter_map(Plist::as_dict)
+        .find(|f| f.get("name").and_then(Plist::as_str) == Some("decomposeComponents"))?;
+    let scope = FilterScope::from_lists(filter.get("include"), filter.get("exclude"), |v| {
+        v.as_array()?
+            .iter()
+            .map(|v| v.as_str().map(GlyphName::from))
+            .collect()
+    });
+    if scope.is_none() {
+        warn!(
+            "ignoring decomposeComponents filter: include and exclude are mutually exclusive and must be lists of glyph names"
+        );
+    }
+    scope
+}
+
 fn plist_to_feature_writer_option(key: &str, value: &Plist) -> FeatureWriterOptionValue {
     match value {
         // glyphs plist has no boolean type: booleans round-trip as integers. The
@@ -581,6 +608,7 @@ impl Work<Context, WorkId, Error> for StaticMetadataWork {
         ]
     }
 
+    #[tracing::instrument(name = "glyphs2fontir::StaticMetadataWork::exec", skip_all)]
     fn exec(&self, context: &Context) -> Result<(), Error> {
         let font_info = self.0.font_info.as_ref();
         let font = &font_info.font;
@@ -640,6 +668,7 @@ impl Work<Context, WorkId, Error> for StaticMetadataWork {
             .collect();
 
         let number_values = get_number_values(font_info, font);
+        let stat_axes = to_stat_axes(font, &axes);
 
         // negate the italic angle because it's clockwise in Glyphs.app whereas it's
         // counter-clockwise in UFO/OpenType and our GlobalMetrics follow the latter
@@ -652,6 +681,7 @@ impl Work<Context, WorkId, Error> for StaticMetadataWork {
 
         warn_master_font_custom_param_mismatch(font);
 
+        let master_name = &font.default_master().name;
         let mut selection_flags = match font.custom_parameters.use_typo_metrics.unwrap_or_default() {
             true => SelectionFlags::USE_TYPO_METRICS,
             false => SelectionFlags::empty(),
@@ -659,17 +689,19 @@ impl Work<Context, WorkId, Error> for StaticMetadataWork {
             true => SelectionFlags::WWS,
             false => SelectionFlags::empty(),
         } |
-        // if there is an italic angle we're italic
-        // <https://github.com/googlefonts/glyphsLib/blob/74c63244fdbef1da540d646b0784ae6d2c3ca834/Lib/glyphsLib/builder/names.py#L25>
-        match italic_angle {
-            0.0 => SelectionFlags::empty(),
-            _ => SelectionFlags::ITALIC,
+        // if there is an italic angle, or the master is named e.g. "Thin Italic", we're italic
+        // <https://github.com/googlefonts/glyphsLib/pull/1178>
+        match italic_angle != 0.0
+            || master_name
+                .split_ascii_whitespace()
+                .any(|word| matches!(word, "Italic" | "Oblique"))
+        {
+            true => SelectionFlags::ITALIC,
+            false => SelectionFlags::empty(),
         } |
-        // https://github.com/googlefonts/glyphsLib/blob/42bc1db912fd4b66f130fb3bdc63a0c1e774eb38/Lib/glyphsLib/builder/names.py#L27
-        match font.default_master().name.to_ascii_lowercase().as_str() {
-            "italic" => SelectionFlags::ITALIC,
-            "bold" => SelectionFlags::BOLD,
-            "bold italic" => SelectionFlags::BOLD | SelectionFlags::ITALIC,
+        // https://github.com/googlefonts/glyphsLib/blob/87da5926/Lib/glyphsLib/builder/names.py#L39
+        match master_name.as_str() {
+            "Bold" | "Bold Italic" | "Bold Oblique" => SelectionFlags::BOLD,
             _ => SelectionFlags::empty(),
         };
         if selection_flags.intersection(SelectionFlags::ITALIC | SelectionFlags::BOLD)
@@ -682,7 +714,7 @@ impl Work<Context, WorkId, Error> for StaticMetadataWork {
         // - Preliminary categories (without anchor inspection) computed here.
         // - Final categories (with anchor inspection) computed after anchor propagation
         //   in fontir/src/glyph.rs
-        let preliminary_gdef_categories = make_preliminary_glyph_categories(font, &axes);
+        let preliminary_gdef_categories = make_preliminary_glyph_categories(font_info);
 
         // Build vertical metrics if:
         // 1. At least one glyph defines a vertical attribute (vertWidth/vertOrigin), OR
@@ -749,7 +781,13 @@ impl Work<Context, WorkId, Error> for StaticMetadataWork {
         )
         .map_err(Error::VariationModelError)?;
         static_metadata.misc.selection_flags = selection_flags;
+        if let Some(stat_axes) = stat_axes {
+            // glyphsLib's fixed elided fallback name
+            static_metadata.set_stat(stat_axes, Some("Regular".to_string()));
+        }
         static_metadata.misc.feature_generation = feature_writers_from_user_data(&font.user_data)?;
+        static_metadata.misc.decompose_components =
+            decompose_components_from_user_data(&font.default_master().user_data);
         static_metadata.variations = variations;
         // always Some for a Glyphs source, even when no glyph sets anything:
         // it is what tells the FEA compiler that predicate tokens can be
@@ -904,19 +942,35 @@ impl Work<Context, WorkId, Error> for StaticMetadataWork {
             }
         }
 
-        let mut glyph_order: GlyphOrder =
-            font.glyph_order.iter().cloned().map(Into::into).collect();
+        static_metadata.misc.unicode_variation_sequences = unicode_variation_sequences(font);
 
-        let mut bracket_glyphs = font
+        // Bracket and color glyphs are absent from public.glyphOrder, so ufo2ft
+        // appends them together in sorted order.
+        // <https://github.com/googlefonts/ufo2ft/blob/9b9ced585/Lib/ufo2ft/util.py#L32-L54>
+        let color_glyphs: HashSet<&SmolStr> = font_info.color_glyphs.values().flatten().collect();
+        let mut glyph_order: GlyphOrder = font
+            .glyph_order
+            .iter()
+            .filter(|name| !color_glyphs.contains(name))
+            .cloned()
+            .map(Into::into)
+            .collect();
+
+        let mut generated_glyphs = font
             .glyphs
             .values()
             .filter(|g| g.export)
             .flat_map(|g| {
                 bracket_glyph_names(g, &static_metadata.axes).map(|(bracket_name, _)| bracket_name)
             })
+            .chain(
+                color_glyphs
+                    .iter()
+                    .map(|name| GlyphName::from(name.as_str())),
+            )
             .collect::<Vec<_>>();
-        bracket_glyphs.sort();
-        glyph_order.extend(bracket_glyphs);
+        generated_glyphs.sort();
+        glyph_order.extend(generated_glyphs);
 
         context.static_metadata.set(static_metadata);
         context.preliminary_glyph_order.set(glyph_order);
@@ -996,6 +1050,46 @@ fn postscript_settings(font: &Font, master: &FontMaster) -> PostscriptSettings {
             .postscript_nominal_width_x
             .or(font_params.postscript_nominal_width_x),
     }
+}
+
+/// The variation selector a `.uvNNN` glyph name suffix stands for, if any.
+///
+/// <https://github.com/googlefonts/glyphsLib/blob/bb60aebe/Lib/glyphsLib/builder/glyph.py#L53-L69>
+fn variation_selector_for_suffix(suffix: &str) -> Option<u32> {
+    let digits = suffix.strip_prefix("uv")?;
+    if digits.len() != 3 || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    match digits.parse::<u32>().ok()? {
+        n @ 1..=16 => Some(0xFE00 + n - 1),
+        n @ 17..=256 => Some(0xE0100 + n - 17),
+        _ => None,
+    }
+}
+
+/// <https://github.com/googlefonts/glyphsLib/blob/bb60aebe/Lib/glyphsLib/builder/glyph.py#L96-L106>
+fn unicode_variation_sequences(font: &Font) -> BTreeMap<u32, BTreeMap<u32, GlyphName>> {
+    let mut sequences: BTreeMap<u32, BTreeMap<u32, GlyphName>> = BTreeMap::new();
+    for glyph in font.glyphs.values().filter(|g| g.export) {
+        let Some((base_name, suffix)) = glyph.name.rsplit_once('.') else {
+            continue;
+        };
+        let Some(selector) = variation_selector_for_suffix(suffix) else {
+            continue;
+        };
+        let Some(codepoint) = font
+            .glyphs
+            .get(base_name)
+            .and_then(|base| base.unicode.first().copied())
+        else {
+            continue;
+        };
+        sequences
+            .entry(selector)
+            .or_default()
+            .insert(codepoint, glyph.name.clone().into());
+    }
+    sequences
 }
 
 fn make_feature_variations(fontinfo: &FontInfo) -> Option<VariableFeature> {
@@ -1143,11 +1237,11 @@ fn get_bracket_info(layer: &Layer, axes: &Axes) -> ConditionSet {
         .map(|(axis, rule)| {
             let min = rule
                 .min
-                .map(|v| DesignCoord::new(v as f64))
+                .map(DesignCoord::new)
                 .unwrap_or(axis.min.to_design(&axis.converter));
             let max = rule
                 .max
-                .map(|v| DesignCoord::new(v as f64))
+                .map(DesignCoord::new)
                 .unwrap_or(axis.max.to_design(&axis.converter));
             Condition::new(axis.tag, min.into(), max.into())
         })
@@ -1155,19 +1249,25 @@ fn get_bracket_info(layer: &Layer, axes: &Axes) -> ConditionSet {
 }
 
 /// Compute GDEF glyph categories using only category and subcategory, no anchor inspection.
-fn make_preliminary_glyph_categories(font: &Font, axes: &Axes) -> PreliminaryGdefCategories {
-    let mark_category_glyphs = font
-        .glyphs
-        .values()
+fn make_preliminary_glyph_categories(font_info: &FontInfo) -> PreliminaryGdefCategories {
+    let font = &font_info.font;
+    let axes = &font_info.axes;
+    // glyphsLib computes categories before it splits color layers into glyphs
+    // <https://github.com/googlefonts/glyphsLib/blob/bb60aebe/Lib/glyphsLib/builder/builders.py#L255-L258>
+    let color_glyphs: HashSet<&SmolStr> = font_info.color_glyphs.values().flatten().collect();
+    let glyphs = || {
+        font.glyphs
+            .values()
+            .filter(|glyph| !color_glyphs.contains(&glyph.name))
+    };
+    let mark_category_glyphs = glyphs()
         .filter(|glyph| glyph.category == Some(Category::Mark))
         .flat_map(|glyph| {
             std::iter::once(glyph.name.clone().into())
                 .chain(bracket_glyph_names(glyph, axes).map(|(name, _)| name))
         })
         .collect();
-    let categories = font
-        .glyphs
-        .values()
+    let categories = glyphs()
         .flat_map(|glyph| {
             let main = category_for_glyph_preliminary(glyph.category, glyph.sub_category)
                 .map(|cat| (glyph.name.clone().into(), cat));
@@ -1182,11 +1282,16 @@ fn make_preliminary_glyph_categories(font: &Font, axes: &Axes) -> PreliminaryGde
                 )
         })
         .collect();
+    let excluded = color_glyphs
+        .iter()
+        .map(|name| (*name).clone().into())
+        .collect();
 
     PreliminaryGdefCategories {
         categories,
         infer_from_anchors: true,
         mark_category_glyphs,
+        excluded,
     }
 }
 
@@ -1269,6 +1374,7 @@ impl Work<Context, WorkId, Error> for GlobalMetricWork {
         Access::Variant(WorkId::StaticMetadata)
     }
 
+    #[tracing::instrument(name = "glyphs2fontir::GlobalMetricWork::exec", skip_all)]
     fn exec(&self, context: &Context) -> Result<(), Error> {
         let font_info = self.0.as_ref();
         let font = &font_info.font;
@@ -1428,6 +1534,7 @@ impl Work<Context, WorkId, Error> for FeatureWork {
         WorkId::Features
     }
 
+    #[tracing::instrument(name = "glyphs2fontir::FeatureWork::exec", skip_all)]
     fn exec(&self, context: &Context) -> Result<(), Error> {
         trace!("Generate features");
         let font_info = self.font_info.as_ref();
@@ -1506,6 +1613,7 @@ impl Work<Context, WorkId, Error> for KerningLocationsWork {
         Access::None
     }
 
+    #[tracing::instrument(name = "glyphs2fontir::KerningLocationsWork::exec", skip_all)]
     fn exec(&self, context: &Context) -> Result<(), Error> {
         trace!("Generate IR for kerning");
         let font_info = self.0.as_ref();
@@ -1524,7 +1632,7 @@ impl Work<Context, WorkId, Error> for KerningLocationsWork {
             .iter()
             .filter_map(|(master_id, pos)| {
                 let keep = master_id.as_str() == default_master_id.as_str()
-                    || font.has_kerns_for_master(master_id);
+                    || font.has_kerns_for_master(font.kerning_source_id(master_id));
                 keep.then(|| pos.clone())
             })
             .collect();
@@ -1746,6 +1854,7 @@ impl Work<Context, WorkId, Error> for KerningInstanceWork {
         AccessBuilder::new().variant(WorkId::GlyphOrder).build()
     }
 
+    #[tracing::instrument(name = "glyphs2fontir::KerningInstanceWork::exec", skip_all)]
     fn exec(&self, context: &Context) -> Result<(), Error> {
         trace!("Generate IR for kerning at {:?}", self.location);
         let groups = self.font_info.kern_groups();
@@ -1802,19 +1911,10 @@ fn kerning_at_location<'a>(
         .iter()
         .find_map(|(id, pos)| (pos == location).then_some(id))?;
 
-    // Check if this master has linked metrics via "Link Metrics With Master" or
-    // "Link Metrics With First Master" custom parameters.
-    // See https://github.com/googlefonts/glyphsLib/blob/682ff4b1/Lib/glyphsLib/builder/kerning.py#L33-L35
-    let metrics_source_id = font_info
-        .font
-        .masters
-        .iter()
-        .find(|m| m.id == *our_id)
-        .and_then(|m| m.metrics_source_id.as_deref())
-        .unwrap_or(our_id);
+    let source_id = font_info.font.kerning_source_id(our_id);
 
-    let ltr = font_info.font.kerning_ltr.get(metrics_source_id);
-    let rtl = font_info.font.kerning_rtl.get(metrics_source_id);
+    let ltr = font_info.font.kerning_ltr.get(source_id);
+    let rtl = font_info.font.kerning_rtl.get(source_id);
     // if there's no RTL, just return LTR, unchanged.
     let Some(rtl) = rtl else {
         // if there's no rtl we can just return ltr,
@@ -1879,6 +1979,11 @@ fn expand_kerning_to_brackets(
             .iter()
             .copied()
             .map(|gn| (participants.0.clone(), gn.clone().into()))
+            .collect(),
+        (Some(left), Some(_)) if participants.0 == participants.1 => left
+            .iter()
+            .copied()
+            .map(|gn| (KernSide::Glyph(gn.clone()), KernSide::Glyph(gn.clone())))
             .collect(),
         (Some(left), Some(right)) => left
             .iter()
@@ -1956,6 +2061,7 @@ impl Work<Context, WorkId, Error> for GlyphIrWork {
         vec![WorkId::Anchor(self.glyph_name.clone())]
     }
 
+    #[tracing::instrument(name = "glyphs2fontir::GlyphIrWork::exec", skip_all)]
     fn exec(&self, context: &Context) -> Result<(), Error> {
         trace!("Generate IR for '{}'", self.glyph_name.as_str());
         let font_info = self.font_info.as_ref();
@@ -1977,6 +2083,14 @@ impl Work<Context, WorkId, Error> for GlyphIrWork {
 
         let mut ir_glyph = ir::GlyphBuilder::new(self.glyph_name.clone());
         ir_glyph.emit_to_binary = glyph.export;
+        // Generated color glyphs supply painting outlines; attachment anchors
+        // belong to the base glyph. Skip component-anchor propagation for all
+        // their sources, including brace layers, but keep explicitly supplied anchors.
+        ir_glyph.skip_anchor_propagation = font_info
+            .color_glyphs
+            .values()
+            .flatten()
+            .any(|name| name.as_str() == self.glyph_name.as_str());
         // only non-bracket glyphs get codepoints
         ir_glyph.codepoints = if !self.is_bracket_glyph() {
             glyph.unicode.iter().copied().collect()
@@ -2031,8 +2145,13 @@ impl Work<Context, WorkId, Error> for GlyphIrWork {
             // Collect anchors from all glyphs (including non-exporting) so that
             // anchor propagation can copy them into composites. Non-exporting glyphs
             // may have invalid anchors (issue #1397) so we handle errors gracefully.
+            let origin = layer_origin_shift(layer);
             for anchor in layer.anchors.iter() {
-                if let Err(e) = ir_anchors.add(anchor.name.clone(), location.clone(), anchor.pos) {
+                if anchor.name == GLYPHS_ORIGIN_ANCHOR {
+                    continue;
+                }
+                let pos = anchor.pos - origin;
+                if let Err(e) = ir_anchors.add(anchor.name.clone(), location.clone(), pos) {
                     if glyph.export {
                         return Err(e.into());
                     }
@@ -2080,9 +2199,13 @@ impl Work<Context, WorkId, Error> for GlyphIrWork {
                         axis_positions.entry(*tag).or_default().insert(*coord);
                     }
                     // See comment above about handling non-exporting glyphs
+                    let origin = layer_origin_shift(layer);
                     for anchor in layer.anchors.iter() {
-                        if let Err(e) = ir_anchors.add(anchor.name.clone(), loc.clone(), anchor.pos)
-                        {
+                        if anchor.name == GLYPHS_ORIGIN_ANCHOR {
+                            continue;
+                        }
+                        let pos = anchor.pos - origin;
+                        if let Err(e) = ir_anchors.add(anchor.name.clone(), loc.clone(), pos) {
                             if glyph.export {
                                 return Err(e.into());
                             }
@@ -2136,6 +2259,30 @@ impl Work<Context, WorkId, Error> for GlyphIrWork {
         context.glyphs.set(ir_glyph);
         Ok(())
     }
+}
+
+/// A special anchor Glyphs.app uses to shift a layer's geometry and ordinary anchors.
+///
+/// The layer is drawn as if the origin anchor were at (0, 0), so contours,
+/// components and every other anchor are translated by -origin. Advance
+/// width and metrics are unaffected.
+///
+/// See <https://github.com/googlefonts/glyphsLib/pull/1155> for a reference
+/// implementation (glyphsLib applies this before anchor propagation).
+const GLYPHS_ORIGIN_ANCHOR: &str = "*origin";
+
+/// The `*origin` anchor's position, if the layer has one.
+fn layer_origin(layer: &Layer) -> Option<kurbo::Point> {
+    layer
+        .anchors
+        .iter()
+        .find(|a| a.name == GLYPHS_ORIGIN_ANCHOR)
+        .map(|a| a.pos)
+}
+
+/// The shift to apply to everything else on the layer, or zero if unset.
+fn layer_origin_shift(layer: &Layer) -> kurbo::Vec2 {
+    layer_origin(layer).map(|p| p.to_vec2()).unwrap_or_default()
 }
 
 fn process_layer(
@@ -2209,11 +2356,36 @@ fn process_layer(
         .into_inner();
 
     // TODO populate width and height properly
-    let (contours, components) = to_ir_contours_and_components(
+    let (mut contours, mut components) = match to_ir_contours_and_components(
         glyph.name.clone().into(),
         &instance.shapes,
         erase_open_corners,
-    )?;
+    ) {
+        Ok(result) => result,
+        // fontmake only draws a non-exporting glyph if something uses it as a
+        // component, so a bad outline in an unreferenced one is not an error
+        Err(e) if !glyph.export && !font_info.font.is_used_as_component(&glyph.name) => {
+            log::warn!(
+                "Ignoring shapes in layer {} of non-exporting glyph: {e}",
+                instance.layer_id
+            );
+            Default::default()
+        }
+        Err(e) => return Err(e.into()),
+    };
+
+    // See GLYPHS_ORIGIN_ANCHOR. Anchors are shifted where layer.anchors is read.
+    if let Some(origin) = layer_origin(instance) {
+        let shift = Affine::translate(-origin.to_vec2());
+        for contour in contours.iter_mut() {
+            contour.apply_affine(shift);
+        }
+        for component in components.iter_mut() {
+            // left-multiply: apply the component's own transform first, then shift
+            component.transform = shift * component.transform;
+        }
+    }
+
     let glyph_instance = GlyphInstance {
         // https://github.com/googlefonts/fontmake-rs/issues/285 glyphs non-spacing marks are 0-width
         width: if glyph.is_nonspacing_mark() {
@@ -2284,6 +2456,7 @@ impl Work<Context, WorkId, Error> for ColorPaletteWork {
         Access::Variant(WorkId::ColorPalettes)
     }
 
+    #[tracing::instrument(name = "glyphs2fontir::ColorPaletteWork::exec", skip_all)]
     fn exec(&self, context: &Context) -> Result<(), Error> {
         // Directly declared palette(s), preferring master to global
         let mut palettes = if let Some(declared_palettes) = self.font_info.font.color_palettes() {
@@ -2404,6 +2577,7 @@ impl Work<Context, WorkId, Error> for ColorGlyphsWork {
         Access::Variant(WorkId::PaintGraph)
     }
 
+    #[tracing::instrument(name = "glyphs2fontir::ColorGlyphsWork::exec", skip_all)]
     fn exec(&self, context: &Context) -> Result<(), Error> {
         let default_master_id = self.font_info.font.default_master().id.as_str();
 
@@ -2508,7 +2682,10 @@ mod tests {
     };
     use glyphs_reader::{AxisRule, Font, glyphdata::Category};
 
+    use crate::stat::assert_labels;
+
     use ir::{Panose, test_helpers::Round2};
+    use kurbo::{Rect, Shape};
     use write_fonts::types::{NameId, Tag};
 
     use crate::source::names;
@@ -2561,7 +2738,7 @@ mod tests {
 
     fn context_for(glyphs_file: &Path) -> (impl Source + use<>, Context) {
         let source = GlyphsIrSource::new(glyphs_file).unwrap();
-        (source, Context::new_root(Flags::default(), None, None))
+        (source, Context::new_root(Flags::default()))
     }
 
     #[test]
@@ -2732,7 +2909,7 @@ mod tests {
     }
 
     fn build_static_metadata(glyphs_file: PathBuf) -> (impl Source, Context) {
-        let _ = env_logger::builder().is_test(true).try_init();
+        let _ = tracing_subscriber::fmt().with_test_writer().try_init();
         let (source, context) = context_for(&glyphs_file);
         let task_context = context.copy_for_work(
             Access::None,
@@ -3030,6 +3207,20 @@ mod tests {
         );
     }
 
+    // Glyphs split from color layers never get a GDEF class, even though their layers
+    // carry the same attaching anchors as the glyph they came from.
+    // https://github.com/googlefonts/fontc/issues/1870
+    #[test]
+    fn color_layer_glyphs_are_excluded_from_gdef() {
+        let (_, context) = build_static_metadata(glyphs3_dir().join("COLRv0-2layers.glyphs"));
+        let preliminary = context.preliminary_gdef_categories.get();
+        assert_eq!(
+            BTreeSet::from([GlyphName::new("A.color0"), GlyphName::new("A.color1")]),
+            preliminary.excluded
+        );
+        assert!(!preliminary.excluded.contains(&GlyphName::new("A")));
+    }
+
     // An explicit `subCategory` of `Ligature` yields a preliminary Ligature, but the
     // non-ligature subcategories used to mark Indic conjuncts (`Other`, `Conjunct`) must
     // NOT: they defer to anchor inspection and become Base, so marks attach to the whole
@@ -3194,7 +3385,7 @@ mod tests {
     #[test]
     fn name_table_with_preferred_names() {
         let font = Font::load(&glyphs3_dir().join("PreferableNames.glyphs")).unwrap();
-        let mut names: Vec<_> = names(&font, SelectionFlags::REGULAR).into_iter().collect();
+        let mut names: Vec<_> = names(&font, SelectionFlags::BOLD).into_iter().collect();
         names.sort_by_key(|(id, v)| (id.name_id, v.clone()));
         // typographic family and subfamily should be present now
         let mut expected_names = the_best_names();
@@ -3208,10 +3399,6 @@ mod tests {
                 (
                     NameKey::new_bmp_only(NameId::FULL_NAME),
                     "Pref Family Name Pref Regular".to_string(),
-                ),
-                (
-                    NameKey::new_bmp_only(NameId::SUBFAMILY_NAME),
-                    "Regular".to_string(),
                 ),
                 (
                     NameKey::new_bmp_only(NameId::TYPOGRAPHIC_FAMILY_NAME),
@@ -3228,6 +3415,23 @@ mod tests {
             ],
         );
         assert_eq!(expected_names, names);
+    }
+
+    // <https://github.com/googlefonts/fontc/issues/1815>
+    #[test]
+    fn family_name_keeps_style_parts_the_flags_do_not_account_for() {
+        let font = Font::load(&glyphs3_dir().join("StaticBoldItalic.glyphs")).unwrap();
+        let family_name = |flags| {
+            names(&font, flags)
+                .remove(&NameKey::new_bmp_only(NameId::FAMILY_NAME))
+                .unwrap()
+        };
+        assert_eq!(
+            "WghtVar",
+            family_name(SelectionFlags::BOLD | SelectionFlags::ITALIC)
+        );
+        assert_eq!("WghtVar Italic", family_name(SelectionFlags::BOLD));
+        assert_eq!("WghtVar Bold Italic", family_name(SelectionFlags::REGULAR));
     }
 
     #[test]
@@ -3677,6 +3881,9 @@ mod tests {
                 ("a.BRACKET.varAlt01", "x.BRACKET.varAlt01", -100),
                 ("a", "x.BRACKET.varAlt02", -100),
                 ("a.BRACKET.varAlt01", "x.BRACKET.varAlt02", -100),
+                ("x", "x", -50),
+                ("x.BRACKET.varAlt01", "x.BRACKET.varAlt01", -50),
+                ("x.BRACKET.varAlt02", "x.BRACKET.varAlt02", -50),
             ])
         );
     }
@@ -3812,6 +4019,36 @@ mod tests {
     }
 
     #[test]
+    fn non_default_master_with_linked_kerning_is_kept() {
+        // AR One Sans: a master with no kerning of its own but a "Link Metrics
+        // With Master" link to one that kerns is not kernless, so it keeps its
+        // location and carries the linked master's pairs. In
+        // KerningLinkedMaster.glyphs m02 (Bold, wght 0.5) links to m04 (Black).
+        let (_, context) = build_kerning(glyphs3_dir().join("KerningLinkedMaster.glyphs"));
+
+        let bold = NormalizedLocation::for_pos(&[("wght", 0.5)]);
+        assert!(
+            context.kerning_locations.get().locations.contains(&bold),
+            "the master inheriting kerning through the link must be kept"
+        );
+        assert_eq!(
+            context.kerning_at.get(&WorkId::KernInstance(bold)).kerns,
+            make_kerning(&[("@side1.A", "@side2.B", -40)])
+        );
+    }
+
+    #[test]
+    fn master_linked_to_kernless_master_is_skipped() {
+        // the link supplies the master's kerning *instead of* its own, so a
+        // master linked to a kernless one is itself kernless however much it
+        // kerns directly. m03 (Heavy, wght 0.75) kerns but links to m02.
+        let (_, context) = build_kerning(glyphs3_dir().join("KerningLinkedMaster.glyphs"));
+
+        let heavy = NormalizedLocation::for_pos(&[("wght", 0.75)]);
+        assert!(!context.kerning_locations.get().locations.contains(&heavy));
+    }
+
+    #[test]
     fn captures_anchors() {
         let base_name = "A".into();
         let mark_name = "macroncomb".into();
@@ -3858,9 +4095,54 @@ mod tests {
     }
 
     #[test]
+    fn ignores_bad_contour_in_unreferenced_non_export_glyph() {
+        let (source, context) =
+            build_global_metrics(glyphs3_dir().join("NoExportBadContour.glyphs"));
+        build_glyphs(&source, &context).unwrap();
+    }
+
+    #[test]
     fn reads_fs_type_0x0000() {
         let (_, context) = build_static_metadata(glyphs3_dir().join("fstype_0x0000.glyphs"));
         assert_eq!(Some(0), context.static_metadata.get().misc.fs_type);
+    }
+
+    #[test]
+    fn unicode_variation_sequences_from_glyph_names() {
+        let (_, context) =
+            build_static_metadata(glyphs3_dir().join("UnicodeVariationSequences.glyphs"));
+        let static_metadata = context.static_metadata.get();
+        let sequences = static_metadata
+            .misc
+            .unicode_variation_sequences
+            .iter()
+            .flat_map(|(selector, mappings)| {
+                mappings
+                    .iter()
+                    .map(|(codepoint, name)| (*selector, *codepoint, name.as_str()))
+            })
+            .collect::<Vec<_>>();
+        // b.uv002 isn't exported, c.uv003 has no base glyph, d has no unicode
+        // and a.uv999 and a.uv001.ss01 don't end in .uvNNN
+        assert_eq!(
+            sequences,
+            vec![
+                (0xFE00, 0x61, "a.uv001"),
+                (0xFE0F, 0x62, "b.uv016"),
+                (0xE0100, 0x61, "a.uv017"),
+            ]
+        );
+    }
+
+    #[test]
+    fn variation_selector_suffixes() {
+        assert_eq!(super::variation_selector_for_suffix("uv001"), Some(0xFE00));
+        assert_eq!(super::variation_selector_for_suffix("uv016"), Some(0xFE0F));
+        assert_eq!(super::variation_selector_for_suffix("uv017"), Some(0xE0100));
+        assert_eq!(super::variation_selector_for_suffix("uv256"), Some(0xE01EF));
+        for bad in ["uv000", "uv257", "uv1", "uv0001", "uv01a", "uvs001", "ss01"] {
+            assert_eq!(super::variation_selector_for_suffix(bad), None, "{bad}");
+        }
     }
 
     // Some fonts use the long UFO name "openTypeOS2Type" instead of the Glyphs-native "fsType"
@@ -4119,6 +4401,54 @@ mod tests {
     }
 
     #[test]
+    fn italic_from_master_name_without_angle() {
+        let (_, context) = build_static_metadata(glyphs3_dir().join("StaticThinItalic.glyphs"));
+        let static_metadata = context.static_metadata.get();
+        let name = |id: NameId| {
+            static_metadata
+                .names
+                .get(&NameKey::new_bmp_only(id))
+                .map(|s| s.as_str())
+                .unwrap_or_default()
+        };
+
+        assert_eq!(
+            (
+                name(NameId::FAMILY_NAME),
+                name(NameId::SUBFAMILY_NAME),
+                static_metadata.misc.selection_flags
+            ),
+            ("Family Thin", "Italic", SelectionFlags::ITALIC)
+        );
+    }
+
+    #[test]
+    fn bold_oblique_master_is_bold_italic() {
+        let (_, context) = build_static_metadata(glyphs3_dir().join("StaticBoldOblique.glyphs"));
+        let static_metadata = context.static_metadata.get();
+        let name = |id: NameId| {
+            static_metadata
+                .names
+                .get(&NameKey::new_bmp_only(id))
+                .map(|s| s.as_str())
+                .unwrap_or_default()
+        };
+
+        assert_eq!(
+            (
+                name(NameId::FAMILY_NAME),
+                name(NameId::SUBFAMILY_NAME),
+                static_metadata.misc.selection_flags
+            ),
+            (
+                "Family",
+                "Bold Italic",
+                SelectionFlags::BOLD | SelectionFlags::ITALIC
+            )
+        );
+    }
+
+    #[test]
     fn prefers_last_if_defined_repeatedly() {
         let (_, context) =
             build_static_metadata(glyphs3_dir().join("CustomParamRedefinition.glyphs"));
@@ -4255,6 +4585,35 @@ mod tests {
                 "peso.001",
                 "peso.001.BRACKET.varAlt01",
                 "peso.BRACKET.varAlt01",
+            ])
+        );
+    }
+
+    // color and bracket glyphs are sorted together, not as two separate runs
+    #[test]
+    fn color_and_bracket_glyph_sort_order() {
+        let (source, context) =
+            build_global_metrics(glyphs3_dir().join("color-and-bracket-glyph-order.glyphs"));
+        build_glyphs(&source, &context).unwrap();
+        let prelim_order = context.preliminary_glyph_order.get();
+
+        assert_eq!(
+            prelim_order.as_ref(),
+            &make_glyph_order([
+                "A",
+                "B",
+                "A.BRACKET.varAlt01",
+                "B.color0",
+                "B.color1",
+                "B.color10",
+                "B.color2",
+                "B.color3",
+                "B.color4",
+                "B.color5",
+                "B.color6",
+                "B.color7",
+                "B.color8",
+                "B.color9",
             ])
         );
     }
@@ -4480,7 +4839,7 @@ mod tests {
         let mut layer = Layer::default();
         layer.attributes.axis_rules = vec![
             AxisRule {
-                min: Some(42),
+                min: Some(OrderedFloat(42.0)),
                 max: None,
             },
             Default::default(),
@@ -4505,6 +4864,27 @@ mod tests {
                     Some(DesignCoord::new(125.))
                 )
             ])
+        )
+    }
+
+    #[test]
+    fn bracket_info_fractional_axis_rules() {
+        let axes = Axes::for_test(&["wght"]);
+        let mut layer = Layer::default();
+        layer.attributes.axis_rules = vec![AxisRule {
+            min: Some(OrderedFloat(39.6)),
+            max: Some(OrderedFloat(39.99)),
+        }];
+
+        let result = get_bracket_info(&layer, &axes);
+
+        assert_eq!(
+            result,
+            ConditionSet::from_iter([Condition::new(
+                WGHT,
+                Some(DesignCoord::new(39.6)),
+                Some(DesignCoord::new(39.99))
+            )])
         )
     }
 
@@ -4829,8 +5209,108 @@ unitsPerEm = 1000;
     }
 
     #[test]
+    fn propagate_anchors_governed_by_custom_param_not_filters() {
+        let flags = |file: &str| {
+            GlyphsIrSource::new(&glyphs3_dir().join(file))
+                .unwrap()
+                .compilation_flags()
+        };
+        assert!(
+            flags("UfoFiltersWithoutPropagateAnchors.glyphs").contains(Flags::PROPAGATE_ANCHORS)
+        );
+        assert!(!flags("UfoFiltersDontPropagateAnchors.glyphs").contains(Flags::PROPAGATE_ANCHORS));
+    }
+
+    fn decompose_components_scope(filter: &str) -> Option<FilterScope> {
+        let source = GlyphsIrSource::new_from_memory(&format!(
+            r#"{{
+.appVersion = "3227";
+.formatVersion = 3;
+fontMaster = (
+{{
+id = "master01";
+userData = {{
+com.github.googlei18n.ufo2ft.filters = (
+{{
+name = flattenComponents;
+}},
+{{
+{filter}
+}}
+);
+}};
+}}
+);
+unitsPerEm = 1000;
+}}"#
+        ))
+        .unwrap();
+        decompose_components_from_user_data(&source.font_info.font.default_master().user_data)
+    }
+
+    #[test]
+    fn decompose_components_filter_scope() {
+        assert_eq!(
+            decompose_components_scope("name = decomposeComponents;"),
+            Some(FilterScope::All)
+        );
+        assert_eq!(
+            decompose_components_scope(
+                "name = decomposeComponents;\npre = 1;\ninclude = (Aacute, Agrave);"
+            ),
+            Some(FilterScope::Include(
+                ["Aacute", "Agrave"].map(GlyphName::from).into()
+            ))
+        );
+        assert_eq!(
+            decompose_components_scope("name = decomposeComponents;\nexclude = (Aacute);"),
+            Some(FilterScope::Exclude(["Aacute"].map(GlyphName::from).into()))
+        );
+    }
+
+    #[test]
+    fn malformed_decompose_components_filter_is_ignored() {
+        assert_eq!(decompose_components_scope("name = propagateAnchors;"), None);
+        assert_eq!(
+            decompose_components_scope(
+                "name = decomposeComponents;\ninclude = (Aacute);\nexclude = (Agrave);"
+            ),
+            None
+        );
+        assert_eq!(
+            decompose_components_scope("name = decomposeComponents;\ninclude = Aacute;"),
+            None
+        );
+    }
+
+    trait ExecForTest {
+        fn try_create_static_metadata(
+            &self,
+            source: &impl Source,
+        ) -> Result<Arc<StaticMetadata>, Error>;
+        fn create_static_metadata(&self, source: &impl Source) -> Arc<StaticMetadata>;
+    }
+
+    impl ExecForTest for Context {
+        fn try_create_static_metadata(
+            &self,
+            source: &impl Source,
+        ) -> Result<Arc<StaticMetadata>, Error> {
+            let work = source
+                .create_static_metadata_work()
+                .expect("To create static metadata work");
+            let task_context = self.copy_for_work(work.read_access(), work.write_access());
+            work.exec(&task_context).map(|_| self.static_metadata.get())
+        }
+
+        fn create_static_metadata(&self, source: &impl Source) -> Arc<StaticMetadata> {
+            self.try_create_static_metadata(source).unwrap()
+        }
+    }
+
+    #[test]
     fn reads_feature_writers_from_font_user_data() {
-        let _ = env_logger::builder().is_test(true).try_init();
+        let _ = tracing_subscriber::fmt().with_test_writer().try_init();
         // NotoMusic-shaped config: curs+kern appended, mark skipped, no Gdef writer.
         let source = GlyphsIrSource::new_from_memory(
             r#"{
@@ -4866,22 +5346,10 @@ mode = skip;
 }"#,
         )
         .unwrap();
-        let context = Context::new_root(Flags::default(), None, None);
-        let task_context = context.copy_for_work(
-            Access::None,
-            AccessBuilder::new()
-                .variant(WorkId::StaticMetadata)
-                .variant(WorkId::PreliminaryGlyphOrder)
-                .variant(WorkId::PreliminaryGdefCategories)
-                .build(),
-        );
-        source
-            .create_static_metadata_work()
-            .unwrap()
-            .exec(&task_context)
-            .unwrap();
+        let context = Context::new_root(Flags::default());
+        let static_metadata = context.create_static_metadata(&source);
         assert_eq!(
-            context.static_metadata.get().misc.feature_generation,
+            static_metadata.misc.feature_generation,
             Some(vec![
                 FeatureWriterSpec {
                     writer: KnownFeatureWriter::Curs,
@@ -4902,12 +5370,9 @@ mode = skip;
         );
     }
 
-    /// Exec the static metadata work over an in-memory glyphs source, returning
-    /// the error it is expected to produce.
-    fn feature_writers_error_from_glyphs_source(source: &str) -> Error {
-        let _ = env_logger::builder().is_test(true).try_init();
-        let source = GlyphsIrSource::new_from_memory(source).unwrap();
-        let context = Context::new_root(Flags::default(), None, None);
+    fn stat_labels_from_glyphs_source(glyphs_file: &Path) -> Vec<fontir::ir::StatAxis> {
+        let source = GlyphsIrSource::new(glyphs_file).unwrap();
+        let context = Context::new_root(Flags::default());
         let task_context = context.copy_for_work(
             Access::None,
             AccessBuilder::new()
@@ -4920,7 +5385,45 @@ mode = skip;
             .create_static_metadata_work()
             .unwrap()
             .exec(&task_context)
-            .unwrap_err()
+            .unwrap();
+        context.static_metadata.get().misc.stat_axes.clone()
+    }
+
+    #[test]
+    fn static_metadata_installs_glyphs_stat_labels() {
+        let stat = stat_labels_from_glyphs_source(&glyphs3_dir().join("StatLabels.glyphs"));
+        // Black lies outside the variable font's user region and gets no label
+        assert_labels(
+            &stat,
+            "wght",
+            &[
+                ("Regular", 400.0, true, Some(700.0)),
+                ("Bold", 700.0, false, None),
+            ],
+        );
+    }
+
+    #[test]
+    fn glyphs_stat_labels_sit_at_the_mapped_user_locations() {
+        // Axis Mappings puts the masters at user 300 and 800; the instances'
+        // weightClass values (400, 500, 700) do not match and must be ignored
+        let stat = stat_labels_from_glyphs_source(&glyphs3_dir().join("StatAxisMappings.glyphs"));
+        assert_labels(
+            &stat,
+            "wght",
+            &[
+                ("Regular", 300.0, true, Some(800.0)),
+                ("Medium", 550.0, false, None),
+                ("Bold", 800.0, false, None),
+            ],
+        );
+    }
+
+    fn feature_writers_error_from_glyphs_source(source: &str) -> Error {
+        let _ = tracing_subscriber::fmt().with_test_writer().try_init();
+        let source = GlyphsIrSource::new_from_memory(source).unwrap();
+        let context = Context::new_root(Flags::default());
+        context.try_create_static_metadata(&source).unwrap_err()
     }
 
     #[test]
@@ -4948,25 +5451,11 @@ ignoreMarks = 0;
     }
 
     fn feature_writers_from_glyphs_source(source: &str) -> Option<Vec<FeatureWriterSpec>> {
-        let _ = env_logger::builder().is_test(true).try_init();
+        let _ = tracing_subscriber::fmt().with_test_writer().try_init();
         let source = GlyphsIrSource::new_from_memory(source).unwrap();
-        let context = Context::new_root(Flags::default(), None, None);
-        let task_context = context.copy_for_work(
-            Access::None,
-            AccessBuilder::new()
-                .variant(WorkId::StaticMetadata)
-                .variant(WorkId::PreliminaryGlyphOrder)
-                .variant(WorkId::PreliminaryGdefCategories)
-                .build(),
-        );
-        source
-            .create_static_metadata_work()
-            .unwrap()
-            .exec(&task_context)
-            .unwrap();
+        let context = Context::new_root(Flags::default());
         context
-            .static_metadata
-            .get()
+            .create_static_metadata(&source)
             .misc
             .feature_generation
             .clone()
@@ -4982,5 +5471,181 @@ unitsPerEm = 1000;
 }"#,
         );
         assert_eq!(writers, None);
+    }
+
+    /// Glyphs.app treats a "*origin" anchor as a layer-wide coordinate shift:
+    /// everything else on that layer (contours, components, other anchors) is
+    /// drawn as if "*origin" were at (0, 0), then translated back by -origin.
+    ///
+    /// The "a" glyph in this fixture has different "*origin" positions on its
+    /// two masters, so this also guards that the shift is applied per-source
+    /// rather than e.g. only at the default location.
+    #[test]
+    fn origin_anchor_shifts_glyph_geometry_and_anchors() {
+        let (source, context) =
+            build_global_metrics(glyphs3_dir().join("PropagateAnchorsTest.glyphs"));
+        build_glyphs(&source, &context).unwrap();
+
+        let glyph = context.get_glyph("a");
+        let static_metadata = context.static_metadata.get();
+        let default_loc = static_metadata.default_location();
+
+        let sources = glyph.sources();
+        assert_eq!(sources.len(), 2, "glyph 'a' should have exactly 2 masters");
+
+        // default master: *origin = (-20, 0); unshifted contour bounds were 47..448
+        let default_instance = sources.get(default_loc).unwrap();
+        let default_contour = default_instance.contours.first().unwrap();
+        assert_eq!(
+            default_contour.bounding_box(),
+            Rect::new(67.0, 0.0, 468.0, 517.0),
+            "contour should be shifted by -(-20, 0) = (20, 0), matching Glyphs.app's native export"
+        );
+        assert_eq!(
+            default_instance.width, 500.0,
+            "advance width must not be affected by the origin shift"
+        );
+
+        // the other master: *origin = (-10, 0); unshifted contour bounds were 47..508
+        let (other_loc, other_instance) = sources
+            .iter()
+            .find(|(loc, _)| *loc != default_loc)
+            .expect("should have a non-default source");
+        let other_contour = other_instance.contours.first().unwrap();
+        assert_eq!(
+            other_contour.bounding_box(),
+            Rect::new(57.0, 0.0, 518.0, 517.0),
+            "the other master has a different origin (-10, 0) and must be shifted independently"
+        );
+
+        let anchors = context.anchors.get(&WorkId::Anchor("a".into()));
+        assert!(
+            anchors.anchors.iter().all(|a| a.original_name != "*origin"),
+            "the *origin pseudo-anchor must never surface as a real anchor"
+        );
+
+        let anchor_pos = |name: &str| {
+            anchors
+                .anchors
+                .iter()
+                .find(|a| a.original_name == name)
+                .unwrap_or_else(|| panic!("no anchor named '{name}'"))
+        };
+
+        // one anchor is enough; they all take the same code path
+        let top = anchor_pos("top");
+        assert_eq!(top.default_pos(), (266.0, 548.0).into());
+        assert_eq!(
+            *top.positions.get(other_loc).unwrap(),
+            (287.0, 559.0).into()
+        );
+    }
+
+    /// The component transform shift must be `shift * component.transform`
+    /// (apply the component's own transform first, then the layer shift) --
+    /// getting this backwards is invisible for pure-translation transforms, so
+    /// this uses a transform with non-uniform scale to catch the reversed
+    /// composition.
+    #[test]
+    fn origin_anchor_shifts_component_transform_with_correct_multiplication_order() {
+        let source = GlyphsIrSource::new_from_memory(
+            r#"{
+.appVersion = "3227";
+.formatVersion = 3;
+fontMaster = (
+{
+id = "m01";
+}
+);
+glyphs = (
+{
+glyphname = base;
+layers = (
+{
+layerId = "m01";
+shapes = (
+{
+closed = 1;
+nodes = (
+(0,0,l),
+(0,10,l),
+(10,10,l),
+(10,0,l)
+);
+}
+);
+width = 10;
+}
+);
+},
+{
+glyphname = composite;
+layers = (
+{
+layerId = "m01";
+anchors = (
+{
+name = "*origin";
+pos = (-20,10);
+},
+{
+name = top;
+pos = (30,40);
+}
+);
+shapes = (
+{
+closed = 1;
+nodes = (
+(0,0,l),
+(0,10,l),
+(10,10,l),
+(10,0,l)
+);
+},
+{
+ref = base;
+pos = (100,50);
+scale = (2,3);
+}
+);
+width = 200;
+}
+);
+}
+);
+unitsPerEm = 1000;
+}"#,
+        )
+        .unwrap();
+
+        let context = Context::new_root(Flags::default());
+
+        let static_metadata = context.create_static_metadata(&source);
+
+        let task_context = context.copy_for_work(
+            Access::Variant(WorkId::StaticMetadata),
+            Access::Variant(WorkId::GlobalMetrics),
+        );
+        source
+            .create_global_metric_work()
+            .unwrap()
+            .exec(&task_context)
+            .unwrap();
+
+        build_glyphs(&source, &context).unwrap();
+
+        let glyph = context.get_glyph("composite");
+        let default_loc = static_metadata.default_location();
+        let instance = glyph.sources().get(default_loc).unwrap();
+
+        let shift = Affine::translate((20.0, -10.0)); // -(-20, 10)
+        let base_transform = Affine::new([2.0, 0.0, 0.0, 3.0, 100.0, 50.0]);
+        let expected = shift * base_transform;
+        let component = instance.components.first().unwrap();
+        assert_eq!(
+            component.transform, expected,
+            "component transform must be shift * transform (left-multiply), not the reverse"
+        );
     }
 }
