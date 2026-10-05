@@ -630,6 +630,11 @@ impl AxisRule {
     }
 }
 
+/// Placeholder for a v4 `-` layer coordinate, "the default value for this axis".
+///
+/// Only ever seen between parsing a layer and building it.
+const DEFAULT_COORDINATE: f64 = f64::NAN;
+
 // hand-parse because they can take multiple shapes
 impl FromPlist for LayerAttributes {
     fn parse(tokenizer: &mut Tokenizer<'_>) -> Result<Self, crate::plist::Error> {
@@ -648,7 +653,21 @@ impl FromPlist for LayerAttributes {
             let key: String = tokenizer.parse()?;
             tokenizer.eat(b'=')?;
             match key.as_str() {
-                "coordinates" => coordinates = tokenizer.parse()?,
+                "coordinates" => {
+                    // v4 writes "-" for "the default value for this axis";
+                    // it is a placeholder until RawLayer::build resolves it
+                    coordinates = tokenizer
+                        .parse::<Vec<Plist>>()?
+                        .into_iter()
+                        .map(|coord| match coord.as_str() {
+                            Some("-") => Ok(OrderedFloat(DEFAULT_COORDINATE)),
+                            _ => coord
+                                .as_f64()
+                                .map(OrderedFloat)
+                                .ok_or(crate::plist::Error::ExpectedNumber),
+                        })
+                        .collect::<Result<_, _>>()?
+                }
                 "color" => color = tokenizer.parse()?,
                 "axisRules" => axis_rules = tokenizer.parse()?,
                 "colorPalette" => {
@@ -832,6 +851,10 @@ enum FormatVersion {
     #[default]
     V2,
     V3,
+    /// Written by Glyphs 4.1 and later.
+    ///
+    /// <https://github.com/schriftgestalt/GlyphsSDK/blob/Glyphs4/GlyphsFileFormat/GlyphsFileFormatv4.md>
+    V4,
 }
 
 // The font you get directly from a plist, minimally modified
@@ -863,9 +886,20 @@ struct RawFont {
     #[fromplist(alt_name = "kerning")]
     kerning_LTR: Kerning,
     kerning_RTL: Kerning,
+    /// v4 contextual kerning, which we don't support
+    kerning_context: BTreeMap<SmolStr, Plist>,
     custom_parameters: RawCustomParameters,
     numbers: Vec<NumberName>,
     user_data: BTreeMap<SmolStr, Plist>,
+}
+
+/// The `kerning.plist` of a v4 package
+#[derive(Default, Debug, PartialEq, FromPlist)]
+#[allow(non_snake_case)]
+struct RawKerning {
+    kerning_LTR: Kerning,
+    kerning_RTL: Kerning,
+    kerning_context: BTreeMap<SmolStr, Plist>,
 }
 
 #[derive(Default, Debug, PartialEq, FromPlist)]
@@ -898,13 +932,13 @@ impl RawCustomParameterValue {
 impl FromPlist for FormatVersion {
     fn parse(tokenizer: &mut Tokenizer) -> Result<Self, crate::plist::Error> {
         let raw: i64 = FromPlist::parse(tokenizer)?;
-        if raw == 3 {
-            Ok(FormatVersion::V3)
-        } else {
-            // format version 2 is the default value, if no explicit version is set
-            Err(crate::plist::Error::Parse(
-                "'3' is the only known format version".into(),
-            ))
+        // format version 2 is the default value, if no explicit version is set
+        match raw {
+            3 => Ok(FormatVersion::V3),
+            4 => Ok(FormatVersion::V4),
+            _ => Err(crate::plist::Error::Parse(format!(
+                "unknown format version '{raw}', expected 3 or 4"
+            ))),
         }
     }
 }
@@ -914,10 +948,14 @@ impl FormatVersion {
         self == FormatVersion::V2
     }
 
+    fn is_v4(self) -> bool {
+        self == FormatVersion::V4
+    }
+
     fn codepoint_radix(self) -> u32 {
         match self {
             FormatVersion::V2 => 16,
-            FormatVersion::V3 => 10,
+            FormatVersion::V3 | FormatVersion::V4 => 10,
         }
     }
 }
@@ -1004,6 +1042,7 @@ impl PlistParamsExt for Plist {
             name: name.into(),
             tag: tag.into(),
             hidden,
+            names: Vec::new(),
         })
     }
 
@@ -1093,6 +1132,36 @@ impl PlistParamsExt for Plist {
     }
 
     fn as_color_palettes(&self) -> Option<Vec<Vec<Color>>> {
+        // v4: {palettes = ({colors = (...); name = ...;}, ...); names = {...};}
+        // with color components normalized to 0..1
+        if let Some(raw_palettes) = self.get("palettes").and_then(Plist::as_array) {
+            let mut palettes = Vec::with_capacity(raw_palettes.len());
+            for raw_palette in raw_palettes {
+                let Some(raw_colors) = raw_palette.get("colors").and_then(Plist::as_array) else {
+                    warn!("Color palette without colors, ignored");
+                    continue;
+                };
+                let mut palette = Vec::with_capacity(raw_colors.len());
+                for raw_color in raw_colors {
+                    let components: Option<Vec<i64>> = raw_color.as_array().and_then(|values| {
+                        values
+                            .iter()
+                            .map(|v| {
+                                v.as_f64()
+                                    .map(|v| (v.clamp(0.0, 1.0) * 255.0).round() as i64)
+                            })
+                            .collect()
+                    });
+                    match components.map(|c| Color::from_glyphs_color(&c)) {
+                        Some(Ok(color)) => palette.push(color),
+                        _ => warn!("Invalid color palette entry, ignored"),
+                    }
+                }
+                palettes.push(palette);
+            }
+            return Some(palettes);
+        }
+
         let raw_palettes = self.as_array()?;
         let mut palettes = Vec::with_capacity(raw_palettes.len());
         for raw_palette in raw_palettes {
@@ -1549,6 +1618,8 @@ struct RawFeature {
     tag: Option<String>,
     notes: Option<String>,
     code: String,
+    /// v4 packages store the code in `features/{file}`
+    file: Option<String>,
     labels: Vec<RawNameValue>,
 
     #[fromplist(ignore)]
@@ -1562,6 +1633,9 @@ pub struct Axis {
     #[fromplist(alt_name = "Tag")]
     pub tag: String,
     pub hidden: Option<bool>,
+    /// The localized names of the axis (v4), consumed while loading to
+    /// provide `name` when the file doesn't
+    names: Vec<RawNameValue>,
 }
 
 #[derive(Default, Clone, Debug, PartialEq, FromPlist)]
@@ -1579,6 +1653,8 @@ struct RawGlyph {
     #[fromplist(alt_name = "production")]
     production_name: Option<SmolStr>,
     parts_settings: Vec<RawPartSetting>,
+    /// v4 Smart Glyph axes, which we don't support
+    axes: Vec<Plist>,
     #[fromplist(ignore)]
     other_stuff: BTreeMap<String, Plist>,
 }
@@ -1596,6 +1672,8 @@ struct RawPartSetting {
 struct RawLayer {
     name: String,
     layer_id: String,
+    /// v4: inactive layers are not exported
+    active: Option<bool>,
     associated_master_id: Option<String>,
     width: Option<OrderedFloat<f64>>,
     vert_width: Option<OrderedFloat<f64>>,
@@ -1647,7 +1725,7 @@ impl RawLayer {
             //https://github.com/googlefonts/glyphsLib/blob/c4db6b981d5/Lib/glyphsLib/classes.py#L3942
             && match format_version {
                 FormatVersion::V2 => AxisRule::from_layer_name(&self.name).is_some(),
-                FormatVersion::V3 => !self.attributes.axis_rules.is_empty(),
+                FormatVersion::V3 | FormatVersion::V4 => !self.attributes.axis_rules.is_empty(),
             }
     }
 
@@ -1704,7 +1782,7 @@ struct RawShape {
 
     // When I'm a path
     closed: Option<bool>,
-    nodes: Vec<Node>,
+    nodes: Vec<RawNode>,
 
     // When I'm a component I specifically want all my attributes to end up in other_stuff
     // My Component'ness can be detected by presence of a ref (Glyphs3) or name(Glyphs2) attribute
@@ -1724,9 +1802,363 @@ struct RawShape {
     scale: Vec<f64>,           // v3
     /// Horizontal and vertical slant, in degrees (v3)
     slant: Vec<f64>,
+    /// Whether a component passes its anchors on to the composite (v4)
+    traverse_anchors: Option<bool>,
+
+    // When I'm an image (v4)
+    image_path: Option<String>,
+    #[fromplist(key = "imageURL")]
+    image_url: Option<String>,
+
+    // When I'm a shape group (v4); the shapes in the group are siblings of
+    // this entry that name it in their `attr.group`.
+    group_id: Option<SmolStr>,
 
     #[fromplist(alt_name = "attr")]
-    attributes: ShapeAttributes,
+    attributes: RawShapeAttributes,
+}
+
+/// The attributes of a shape as written in the file.
+///
+/// Colors are kept raw because their encoding depends on the format version:
+/// 0-255 integers up to v3, 0-1 floats in v4.
+#[derive(Clone, Default, Debug, PartialEq, FromPlist)]
+struct RawShapeAttributes {
+    gradient: Option<RawGradient>,
+    fill_color: Option<RawColor>,
+    /// v4: hidden shapes
+    hidden: Option<bool>,
+    /// v4: 0 = none, 1 = subtract, 2 = intersect
+    mask: Option<i64>,
+    /// v4
+    opacity: Option<f64>,
+    /// v4
+    compositing: Option<String>,
+}
+
+#[derive(Clone, Default, Debug, PartialEq, FromPlist)]
+struct RawGradient {
+    start: Vec<OrderedFloat<f64>>,
+    end: Vec<OrderedFloat<f64>>,
+    colors: Vec<RawColorStop>,
+    #[fromplist(key = "type")]
+    style: String,
+    // v4 additions
+    extend: Option<String>,
+    angle: Option<f64>,
+    start_radius: Option<f64>,
+    end_radius: Option<f64>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+enum RawColor {
+    /// Gray + alpha, RGBA or CMYK + alpha
+    Components(Vec<f64>),
+    /// `("p", index, alpha)`, a reference into the `Color Palettes` parameter
+    PaletteRef,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct RawColorStop {
+    color: RawColor,
+    stop_offset: f64,
+}
+
+impl FromPlist for RawColor {
+    fn parse(tokenizer: &mut Tokenizer<'_>) -> Result<Self, crate::plist::Error> {
+        let values: Vec<Plist> = tokenizer.parse()?;
+        if values.first().and_then(Plist::as_str) == Some("p") {
+            return Ok(RawColor::PaletteRef);
+        }
+        values
+            .iter()
+            .map(|v| v.as_f64().ok_or(crate::plist::Error::ExpectedNumber))
+            .collect::<Result<_, _>>()
+            .map(RawColor::Components)
+    }
+}
+
+impl FromPlist for RawColorStop {
+    fn parse(tokenizer: &mut Tokenizer<'_>) -> Result<Self, crate::plist::Error> {
+        tokenizer.eat(b'(')?;
+        let color = RawColor::parse(tokenizer)?;
+        tokenizer.eat(b',')?;
+        let stop_offset = tokenizer.parse::<f64>()?;
+        // v4 writes a trailing comma in multi-line arrays
+        let _ = tokenizer.eat(b',');
+        tokenizer.eat(b')')?;
+        Ok(RawColorStop { color, stop_offset })
+    }
+}
+
+impl RawColor {
+    fn cook(&self, format_version: FormatVersion) -> Result<Color, String> {
+        let RawColor::Components(values) = self else {
+            return Err(
+                "palette color references ('p', index, alpha) in shape colors are not supported"
+                    .into(),
+            );
+        };
+        let values = values
+            .iter()
+            .map(|v| {
+                if format_version.is_v4() {
+                    // v4 normalizes color components to 0..1
+                    (v.clamp(0.0, 1.0) * 255.0).round() as i64
+                } else {
+                    *v as i64
+                }
+            })
+            .collect::<Vec<_>>();
+        Color::from_glyphs_color(&values).map_err(|e| format!("bad color: {e}"))
+    }
+}
+
+impl RawGradient {
+    fn cook(&self, format_version: FormatVersion) -> Result<Gradient, String> {
+        if let Some(extend) = self.extend.as_deref().filter(|e| *e != "pad") {
+            return Err(format!("gradient extend mode '{extend}' is not supported"));
+        }
+        let style = match self.style.as_str() {
+            // A v4 radial gradient that sets none of the new geometry is the v3
+            // 'circle' gradient: one circle centered at 'start'.
+            "radial"
+                if self.start_radius.unwrap_or_default() == 0.0
+                    && self.end_radius.is_none()
+                    && self.angle.unwrap_or_default() == 0.0 =>
+            {
+                "circle".to_string()
+            }
+            "radial" => {
+                return Err(
+                    "radial gradients with startRadius, endRadius or angle are not supported"
+                        .into(),
+                );
+            }
+            "conic" => return Err("conic gradients are not supported".into()),
+            other => other.to_string(),
+        };
+        Ok(Gradient {
+            start: self.start.clone(),
+            end: self.end.clone(),
+            colors: self
+                .colors
+                .iter()
+                .map(|stop| {
+                    Ok(ColorStop {
+                        color: stop.color.cook(format_version)?,
+                        stop_offset: stop.stop_offset.into(),
+                    })
+                })
+                .collect::<Result<_, String>>()?,
+            style,
+        })
+    }
+}
+
+impl RawShapeAttributes {
+    fn cook(&self, format_version: FormatVersion) -> Result<ShapeAttributes, String> {
+        Ok(ShapeAttributes {
+            gradient: self
+                .gradient
+                .as_ref()
+                .map(|g| g.cook(format_version))
+                .transpose()?,
+            fill_color: self
+                .fill_color
+                .as_ref()
+                .map(|c| c.cook(format_version))
+                .transpose()?,
+        })
+    }
+}
+
+/// A node as written in the file, before its type token is interpreted.
+#[derive(Clone, Debug, PartialEq)]
+struct RawNode {
+    pt: Point,
+    token: SmolStr,
+    /// v4 node attributes; v3 node userData
+    attrs: Option<Plist>,
+}
+
+impl FromPlist for RawNode {
+    fn parse(tokenizer: &mut Tokenizer<'_>) -> Result<Self, crate::plist::Error> {
+        match tokenizer.lex()? {
+            // Glyphs 2: "x y TYPE [SMOOTH] {userData}"
+            Token::Atom(value) | Token::String(Cow::Borrowed(value)) => {
+                RawNode::from_v2_string(value)
+            }
+            Token::String(Cow::Owned(value)) => RawNode::from_v2_string(&value),
+            // Glyphs 3+: (x,y,type) or (x,y,type,{attrs})
+            Token::OpenParen => {
+                let x: f64 = tokenizer.parse()?;
+                tokenizer.eat(b',')?;
+                let y: f64 = tokenizer.parse()?;
+                tokenizer.eat(b',')?;
+                let token: SmolStr = tokenizer.parse()?;
+                let mut attrs = None;
+                let mut closed = false;
+                if tokenizer.eat(b',').is_ok() {
+                    // a trailing comma, or node attributes (maybe followed by one)
+                    closed = tokenizer.eat(b')').is_ok();
+                    if !closed {
+                        attrs = Some(tokenizer.parse::<Plist>()?);
+                        let _ = tokenizer.eat(b',');
+                    }
+                }
+                if !closed {
+                    tokenizer.eat(b')')?;
+                }
+                Ok(RawNode {
+                    pt: Point::new(x, y),
+                    token,
+                    attrs,
+                })
+            }
+            _ => Err(crate::plist::Error::ExpectedString),
+        }
+    }
+}
+
+impl RawNode {
+    fn from_v2_string(value: &str) -> Result<Self, crate::plist::Error> {
+        let bad = || crate::plist::Error::Parse(format!("bad node '{value}'"));
+        let mut spl = value.splitn(3, ' ');
+        let x = spl.next().and_then(|v| v.parse().ok()).ok_or_else(bad)?;
+        let y = spl.next().and_then(|v| v.parse().ok()).ok_or_else(bad)?;
+        let mut token = spl.next().ok_or_else(bad)?;
+        // drop the userData dict, we don't use it for compilation
+        if token.contains('{') {
+            token = token.split('{').next().unwrap().trim_end();
+        }
+        Ok(RawNode {
+            pt: Point::new(x, y),
+            token: token.into(),
+            attrs: None,
+        })
+    }
+
+    fn has_hoi(&self) -> bool {
+        self.attrs.as_ref().and_then(|a| a.get("hoi")).is_some()
+    }
+}
+
+/// How a node token says a node should be drawn.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct NodeSpec {
+    node_type: NodeType,
+    /// v4 `t` connection: Glyphs keeps the node at its G2 position between
+    /// its neighboring handles, see [`harmonize`]
+    tangent: bool,
+}
+
+/// Interpret a node type token.
+///
+/// Glyphs 3 and 4 tokens are a type character (`l c q o`, plus in v4 the
+/// uncompilable `m u h r`) followed by modifiers: `s` smooth or `t` tangent
+/// (on-curves only), `R`/`C` orientation and `X` lock, the last two being
+/// editor-only. Glyphs 2 tokens are words like `CURVE SMOOTH`.
+///
+/// `starts_open_path` allows `m`, which fontc already draws for the first
+/// node of an open path.
+fn parse_node_token(token: &str, starts_open_path: bool) -> Result<NodeSpec, String> {
+    if let Ok(node_type) = NodeType::from_str(token) {
+        return Ok(NodeSpec {
+            node_type,
+            tangent: false,
+        });
+    }
+    let mut chars = token.chars();
+    let base = match chars.next() {
+        Some('l') => NodeType::Line,
+        Some('c') => NodeType::Curve,
+        Some('q') => NodeType::QCurve,
+        Some('o') => NodeType::OffCurve,
+        Some('m') if starts_open_path => NodeType::Line,
+        Some(kind @ ('m' | 'u' | 'h' | 'r')) => {
+            let what = match kind {
+                'm' => "a move that does not start an open path",
+                'u' => "a quartic curve",
+                'h' => "a Hobby curve",
+                _ => "a Raph Levien spiral",
+            };
+            return Err(format!(
+                "node type '{token}' is {what}, which fontc cannot compile"
+            ));
+        }
+        _ => return Err(format!("unknown node type '{token}'")),
+    };
+    let mut smooth = false;
+    let mut tangent = false;
+    for modifier in chars {
+        match modifier {
+            's' if base != NodeType::OffCurve => smooth = true,
+            't' if base != NodeType::OffCurve => tangent = true,
+            // orientation and lock only matter to the editor
+            'R' | 'C' | 'X' => (),
+            _ => return Err(format!("unknown node type '{token}'")),
+        }
+    }
+    if smooth && tangent {
+        return Err(format!("unknown node type '{token}'"));
+    }
+    let node_type = match (base, smooth || tangent) {
+        (NodeType::Line, true) => NodeType::LineSmooth,
+        (NodeType::Curve, true) => NodeType::CurveSmooth,
+        (NodeType::QCurve, true) => NodeType::QCurveSmooth,
+        (base, _) => base,
+    };
+    Ok(NodeSpec { node_type, tangent })
+}
+
+/// Move a tangent (`t`) node to the position Glyphs draws and exports it at.
+///
+/// Glyphs 4 keeps a tangent node between two cubic segments at its G2
+/// (curvature-continuous) position on the line between its neighboring
+/// handles, and leaves the stored coordinate as the designer placed it. The
+/// curvatures on either side match when `h1 / t² = h2 / (1 - t)²`, where `t`
+/// is the node's fraction of the way from the incoming handle to the outgoing
+/// one and `h1`/`h2` are the distances of the outer handles from that line.
+///
+/// Anywhere else (a line on either side, or handles that are all collinear)
+/// there is nothing to harmonize and the stored coordinate is kept.
+fn harmonize(nodes: &mut [Node], idx: usize, closed: bool) -> bool {
+    let n = nodes.len();
+    let at = |offset: isize| -> Option<&Node> {
+        let i = idx as isize + offset;
+        if closed {
+            Some(&nodes[i.rem_euclid(n as isize) as usize])
+        } else if (0..n as isize).contains(&i) {
+            Some(&nodes[i as usize])
+        } else {
+            None
+        }
+    };
+    let (Some(a1), Some(a2), Some(b1), Some(b2)) = (at(-2), at(-1), at(1), at(2)) else {
+        return false;
+    };
+    if n < 5
+        || ![a1, a2, b1, b2]
+            .iter()
+            .all(|node| node.node_type == NodeType::OffCurve)
+    {
+        return false;
+    }
+    let (a1, a2, b1, b2) = (a1.pt, a2.pt, b1.pt, b2.pt);
+    let line = b1 - a2;
+    let len = line.hypot();
+    if len == 0.0 {
+        return false;
+    }
+    let h1 = line.cross(a1 - a2).abs() / len;
+    let h2 = line.cross(b2 - a2).abs() / len;
+    if h1 + h2 == 0.0 {
+        return false;
+    }
+    let t = h1.sqrt() / (h1.sqrt() + h2.sqrt());
+    nodes[idx].pt = a2 + line * t;
+    true
 }
 
 /// <https://github.com/schriftgestalt/GlyphsSDK/blob/Glyphs3/GlyphsFileFormat/GlyphsFileFormatv3.md#spec-glyphs-3-path>
@@ -1907,6 +2339,8 @@ fn resolve_metrics_source_id(
 struct RawFontMaster {
     id: String,
     name: Option<String>,
+    /// v4: inactive masters are not exported
+    active: Option<bool>,
 
     weight: Option<String>,
     width: Option<String>,
@@ -2400,7 +2834,46 @@ impl RawFont {
 
         // ignore UIState.plist which stuff like displayStrings that are not used by us
 
+        // v4 moves feature code, kerning and the font note out of fontinfo.plist.
+        // We have no use for the note (note.md).
+        raw_font.load_package_feature_files(glyphs_package)?;
+        let kerning_file = glyphs_package.join("kerning.plist");
+        if kerning_file.exists() {
+            let kerning_data = fs::read_to_string(&kerning_file).map_err(Error::IoError)?;
+            let kerning = RawKerning::parse_plist(&kerning_data)
+                .map_err(|e| Error::ParseError(kerning_file.clone(), e.to_string()))?;
+            raw_font.kerning_LTR = kerning.kerning_LTR;
+            raw_font.kerning_RTL = kerning.kerning_RTL;
+            raw_font.kerning_context = kerning.kerning_context;
+        }
+
         Ok(raw_font)
+    }
+
+    /// Read the code of features, classes and prefixes stored in `features/` (v4)
+    fn load_package_feature_files(&mut self, glyphs_package: &path::Path) -> Result<(), Error> {
+        let features_dir = glyphs_package.join("features");
+        for feature in self
+            .classes
+            .iter_mut()
+            .chain(self.feature_prefixes.iter_mut())
+            .chain(self.features.iter_mut())
+        {
+            let Some(file) = feature.file.take() else {
+                continue;
+            };
+            let path = features_dir.join(&file);
+            // the file is named after the feature, never a path elsewhere
+            if path::Path::new(&file).file_name() != Some(OsStr::new(&file)) {
+                return Err(Error::ParseError(
+                    path,
+                    "feature file must be a file name in features/".into(),
+                ));
+            }
+            feature.code = fs::read_to_string(&path)
+                .map_err(|e| Error::ParseError(path.clone(), e.to_string()))?;
+        }
+        Ok(())
     }
 
     fn v2_to_v3_axes(&mut self) -> Result<Vec<String>, Error> {
@@ -2419,16 +2892,19 @@ impl RawFont {
                 name: "Weight".into(),
                 tag: "wght".into(),
                 hidden: None,
+                names: Vec::new(),
             });
             self.axes.push(Axis {
                 name: "Width".into(),
                 tag: "wdth".into(),
                 hidden: None,
+                names: Vec::new(),
             });
             self.axes.push(Axis {
                 name: "Custom".into(),
                 tag: "XXXX".into(),
                 hidden: None,
+                names: Vec::new(),
             });
         }
 
@@ -2739,6 +3215,75 @@ impl RawFont {
             }
         }
         Ok(())
+    }
+
+    /// Move v4 data to where v3 keeps it.
+    ///
+    /// Returns the ids of inactive masters, which have been removed.
+    ///
+    /// <https://github.com/schriftgestalt/GlyphsSDK/blob/Glyphs4/GlyphsFileFormat/GlyphsFileFormatv4.md>
+    fn v4_to_v3(&mut self) -> Result<HashSet<String>, Error> {
+        // v4 drops the top-level familyName in favor of the familyNames property
+        if self.family_name.is_empty()
+            && let Some(name) = self
+                .properties
+                .iter()
+                .find(|p| p.key == "familyNames")
+                .and_then(RawName::get_value)
+        {
+            self.family_name = name.to_string();
+        }
+
+        // axes can have localized names instead of a name
+        for axis in self.axes.iter_mut() {
+            let names = std::mem::take(&mut axis.names);
+            if axis.name.is_empty() {
+                let localized = RawName {
+                    values: names,
+                    ..Default::default()
+                };
+                axis.name = localized.get_value().unwrap_or_default().to_string();
+            }
+        }
+
+        // instances name themselves with a localized styleNames property
+        for instance in self.instances.iter_mut() {
+            if !instance.name.is_empty() {
+                continue;
+            }
+            if let Some(idx) = instance
+                .properties
+                .iter()
+                .position(|p| p.key == "styleNames")
+            {
+                let style_names = instance.properties.remove(idx);
+                instance.name = style_names.get_value().unwrap_or_default().to_string();
+            }
+        }
+
+        if !self.kerning_context.is_empty() {
+            warn!(
+                "contextual kerning (kerningContext) is not supported; ignoring {} contexts",
+                self.kerning_context.len()
+            );
+        }
+
+        // Inactive masters are not exported; drop them before anything
+        // (default master, axis mappings, instances) looks at the masters.
+        let inactive: HashSet<String> = self
+            .font_master
+            .iter()
+            .filter(|m| m.active == Some(false))
+            .map(|m| m.id.clone())
+            .collect();
+        if !inactive.is_empty() {
+            self.font_master.retain(|m| m.active != Some(false));
+            if self.font_master.is_empty() {
+                return Err(Error::StructuralError("all masters are inactive".into()));
+            }
+            warn!("ignoring inactive masters {inactive:?}");
+        }
+        Ok(inactive)
     }
 
     /// `<See https://github.com/schriftgestalt/GlyphsSDK/blob/Glyphs3/GlyphsFileFormat/GlyphsFileFormatv3.md#differences-between-version-2>`
@@ -3058,19 +3603,51 @@ impl UserToDesignMapping {
     }
 }
 
-impl TryFrom<RawShape> for Shape {
-    type Error = Error;
-
-    fn try_from(from: RawShape) -> Result<Self, Self::Error> {
+impl RawShape {
+    /// Build the shape, or `None` for shapes that draw no outline.
+    ///
+    /// `context` names the glyph and layer, for warnings. An `Err` is a
+    /// description of what is wrong with the shape.
+    fn build(self, format_version: FormatVersion, context: &str) -> Result<Option<Shape>, String> {
+        let from = self;
         // TODO: handle numerous unsupported attributes
         // See <https://github.com/schriftgestalt/GlyphsSDK/blob/Glyphs3/GlyphsFileFormat/GlyphsFileFormatv3.md#differences-between-version-2>
+
+        // Glyphs 4 can put images and shape groups among the shapes. Neither
+        // draws an outline: images are bitmaps, which we don't compile, and a
+        // group entry only carries attributes for its member shapes, which
+        // are listed alongside it.
+        if from.group_id.is_some() {
+            if from.attributes != RawShapeAttributes::default() {
+                log_once_warn!("{context}: shape group attributes are not supported");
+            }
+            return Ok(None);
+        }
+        if from.image_path.is_some() || from.image_url.is_some() {
+            log_once_warn!("{context}: image shapes are not supported and were ignored");
+            return Ok(None);
+        }
+        if from.attributes.hidden == Some(true) {
+            return Err("hidden shapes are not supported".into());
+        }
+        match from.attributes.mask.unwrap_or_default() {
+            0 => (),
+            1 => return Err("subtracting mask shapes are not supported".into()),
+            _ => return Err("intersecting mask shapes are not supported".into()),
+        }
+        if from.attributes.opacity.is_some_and(|o| o != 1.0)
+            || from.attributes.compositing.is_some()
+        {
+            log_once_warn!("{context}: shape opacity and compositing are not supported");
+        }
+        let attributes = from.attributes.cook(format_version)?;
 
         let shape = if let Some(glyph_name) = from.glyph_name {
             assert!(!glyph_name.is_empty(), "A pointless component");
 
             // V3 vs v2: The transform entry has been replaced by angle, pos, scale and slant.
             let mut transform = if let Some(transform) = from.transform {
-                Affine::parse_plist(&transform)?
+                Affine::parse_plist(&transform).map_err(|e| e.to_string())?
             } else {
                 Affine::IDENTITY
             };
@@ -3081,16 +3658,13 @@ impl TryFrom<RawShape> for Shape {
             // Glyphs 2 and Glyphs 3 then trying to convert one to the other.
             if !from.pos.is_empty() {
                 if from.pos.len() != 2 {
-                    return Err(Error::StructuralError(format!("Bad pos: {:?}", from.pos)));
+                    return Err(format!("Bad pos: {:?}", from.pos));
                 }
                 transform *= Affine::translate((from.pos[0], from.pos[1]));
             }
             if !from.slant.is_empty() {
                 if from.slant.len() != 2 {
-                    return Err(Error::StructuralError(format!(
-                        "Bad slant: {:?}",
-                        from.slant
-                    )));
+                    return Err(format!("Bad slant: {:?}", from.slant));
                 }
                 // Glyphs stores slant as angles in degrees; Affine::skew wants the
                 // shear factors, i.e. the tangent of those angles.
@@ -3104,30 +3678,58 @@ impl TryFrom<RawShape> for Shape {
             }
             if !from.scale.is_empty() {
                 if from.scale.len() != 2 {
-                    return Err(Error::StructuralError(format!(
-                        "Bad scale: {:?}",
-                        from.scale
-                    )));
+                    return Err(format!("Bad scale: {:?}", from.scale));
                 }
                 transform *= Affine::scale_non_uniform(from.scale[0], from.scale[1]);
+            }
+            if from.traverse_anchors == Some(false) {
+                log_once_warn!(
+                    "{context}: component '{glyph_name}' does not traverse anchors, which is not supported; its anchors are propagated"
+                );
             }
 
             Shape::Component(Component {
                 name: glyph_name,
                 transform,
                 anchor: from.anchor,
-                attributes: from.attributes,
+                attributes,
                 smart_component_values: from.piece,
             })
         } else {
             // no ref; presume it's a path
+            let closed = from.closed.unwrap_or_default();
+            let mut nodes = Vec::with_capacity(from.nodes.len());
+            let mut tangents = Vec::new();
+            for (i, raw) in from.nodes.iter().enumerate() {
+                let spec = parse_node_token(&raw.token, i == 0 && !closed)
+                    .map_err(|e| format!("node {i} at ({}, {}): {e}", raw.pt.x, raw.pt.y))?;
+                if raw.has_hoi() {
+                    log_once_warn!(
+                        "{context}: higher-order interpolation (hoi) is not supported and was ignored"
+                    );
+                }
+                if spec.tangent {
+                    tangents.push(i);
+                }
+                nodes.push(Node {
+                    pt: raw.pt,
+                    node_type: spec.node_type,
+                });
+            }
+            for idx in tangents {
+                if !harmonize(&mut nodes, idx, closed) {
+                    log::debug!(
+                        "{context}: tangent node {idx} is not between two curves, keeping it in place"
+                    );
+                }
+            }
             Shape::Path(Path {
-                closed: from.closed.unwrap_or_default(),
-                nodes: from.nodes.clone(),
-                attributes: from.attributes,
+                closed,
+                nodes,
+                attributes,
             })
         };
-        Ok(shape)
+        Ok(Some(shape))
     }
 }
 
@@ -3161,7 +3763,22 @@ fn map_and_push_if_present<T, U>(dest: &mut Vec<T>, src: Vec<U>, map: fn(U) -> T
 }
 
 impl RawLayer {
-    fn build(self, format_version: FormatVersion) -> Result<Layer, Error> {
+    /// A description of the layer for messages: its name, if it has one, and id
+    fn describe(&self) -> String {
+        if self.name.is_empty() {
+            self.layer_id.clone()
+        } else {
+            format!("{} ({})", self.name, self.layer_id)
+        }
+    }
+
+    /// `axis_defaults` resolves v4 `-` intermediate layer coordinates
+    fn build(
+        self,
+        glyph_name: &str,
+        format_version: FormatVersion,
+        axis_defaults: &[OrderedFloat<f64>],
+    ) -> Result<Layer, Error> {
         // we do what glyphsLib does:
         // https://github.com/googlefonts/glyphsLib/blob/c4db6b981d577f4/Lib/glyphsLib/classes.py#L3662
         // which is apparently standard, in that if a field is missing it has
@@ -3169,14 +3786,26 @@ impl RawLayer {
         // all documented, outside of glyphsLib.
         const DEFAULT_LAYER_WIDTH: f64 = 600.;
         let mut shapes = Vec::new();
+        let layer = self.describe();
 
         // Glyphs v2 uses paths and components
         map_and_push_if_present(&mut shapes, self.paths, Shape::Path);
         map_and_push_if_present(&mut shapes, self.components, Shape::Component);
 
         // Glyphs v3 uses shapes for both
+        let context = format!("glyph '{glyph_name}' layer '{layer}'");
         for raw_shape in self.shapes {
-            shapes.push(raw_shape.try_into()?);
+            if let Some(shape) =
+                raw_shape
+                    .build(format_version, &context)
+                    .map_err(|issue| Error::BadLayer {
+                        glyph: glyph_name.into(),
+                        layer: layer.clone(),
+                        issue,
+                    })?
+            {
+                shapes.push(shape);
+            }
         }
 
         let anchors = self
@@ -3195,6 +3824,15 @@ impl RawLayer {
             .collect();
 
         let mut attributes = self.attributes;
+        for (i, coord) in attributes.coordinates.iter_mut().enumerate() {
+            if coord.is_nan() {
+                *coord = *axis_defaults.get(i).ok_or_else(|| Error::BadLayer {
+                    glyph: glyph_name.into(),
+                    layer: layer.clone(),
+                    issue: format!("coordinate {i} is '-' but there is no axis {i}"),
+                })?;
+            }
+        }
         // convert v2 bracket layers (based on name) into AxisRule attrs
         if let Some(axis_rule) =
             AxisRule::from_layer_name(&self.name).filter(|_| format_version.is_v2())
@@ -3298,25 +3936,70 @@ fn resolve_reverse_bracket_layers(layers: &mut [RawLayer]) {
 }
 
 impl RawGlyph {
+    /// Drop the layers that Glyphs 4 does not export.
+    ///
+    /// Those are layers marked inactive, and the master and alternate layers
+    /// of inactive masters. Intermediate layers carry their full location, so
+    /// those of an inactive master move to the default master instead.
+    fn remove_inactive_layers(&mut self, inactive_masters: &HashSet<String>, default_master: &str) {
+        let glyph = &self.glyphname;
+        self.layers.retain_mut(|layer| {
+            let is_master_layer = layer.associated_master_id.is_none()
+                || layer.associated_master_id.as_ref() == Some(&layer.layer_id);
+            let master_id = layer
+                .associated_master_id
+                .as_deref()
+                .unwrap_or(&layer.layer_id);
+            if inactive_masters.contains(master_id) {
+                if is_master_layer || layer.attributes.coordinates.is_empty() {
+                    return false;
+                }
+                layer.associated_master_id = Some(default_master.to_string());
+            }
+            if layer.active == Some(false) {
+                if is_master_layer {
+                    warn!(
+                        "glyph '{glyph}': master layer '{}' is marked inactive; using it anyway",
+                        layer.layer_id
+                    );
+                } else {
+                    debug!(
+                        "glyph '{glyph}': ignoring inactive layer '{}'",
+                        layer.describe()
+                    );
+                    return false;
+                }
+            }
+            true
+        });
+    }
+
     // we pass in the radix because it depends on the version, stored in the font struct
     fn build(
         mut self,
         format_version: FormatVersion,
         glyph_data: &GlyphData,
+        axis_defaults: &[OrderedFloat<f64>],
     ) -> Result<Glyph, Error> {
-        if format_version == FormatVersion::V3 {
+        if !self.axes.is_empty() {
+            return Err(Error::StructuralError(format!(
+                "glyph '{}' has Smart Glyph axes, which are not supported",
+                self.glyphname
+            )));
+        }
+        if !format_version.is_v2() {
             resolve_reverse_bracket_layers(&mut self.layers);
         }
         let mut instances = Vec::new();
         let mut bracket_layers = Vec::new();
         for mut layer in self.layers {
             if layer.is_bracket_layer(format_version) {
-                bracket_layers.push(layer.build(format_version)?);
+                bracket_layers.push(layer.build(&self.glyphname, format_version, axis_defaults)?);
             } else if !layer.is_draft() {
                 // it's possible for these to exist even if there's no
                 // associated master id, in which case we don't care
                 layer.attributes.axis_rules.clear();
-                instances.push(layer.build(format_version)?);
+                instances.push(layer.build(&self.glyphname, format_version, axis_defaults)?);
             }
         }
         // if category/subcategory were set in the source, we keep them;
@@ -3804,9 +4487,11 @@ impl TryFrom<RawFont> for Font {
     type Error = Error;
 
     fn try_from(mut from: RawFont) -> Result<Self, Self::Error> {
+        let mut inactive_masters = HashSet::new();
         if from.format_version.is_v2() {
             from.v2_to_v3()?;
         } else {
+            inactive_masters = from.v4_to_v3()?;
             // <https://github.com/googlefonts/fontc/issues/1029>
             from.v2_to_v3_names()?;
         }
@@ -3844,9 +4529,15 @@ impl TryFrom<RawFont> for Font {
 
         let glyph_order = make_glyph_order(&from.glyphs, custom_parameters.glyph_order.take());
 
+        let (axis_defaults, default_master_id) = from
+            .font_master
+            .get(default_master_idx)
+            .map(|m| (m.axes_values.clone(), m.id.clone()))
+            .unwrap_or_default();
         let mut glyphs = BTreeMap::new();
-        for raw_glyph in from.glyphs.into_iter() {
-            let mut glyph = raw_glyph.build(from.format_version, &glyph_data)?;
+        for mut raw_glyph in from.glyphs.into_iter() {
+            raw_glyph.remove_inactive_layers(&inactive_masters, &default_master_id);
+            let mut glyph = raw_glyph.build(from.format_version, &glyph_data, &axis_defaults)?;
             // v2 bracket layers can only reference a single axis position (on the
             // first axis in the font) so we add empty axis rules for any other
             // axes.
@@ -3859,6 +4550,18 @@ impl TryFrom<RawFont> for Font {
             glyphs.insert(glyph.name.clone(), glyph);
         }
 
+        if let Some(feature) = from
+            .classes
+            .iter()
+            .chain(&from.feature_prefixes)
+            .chain(&from.features)
+            .find(|f| f.file.is_some())
+        {
+            return Err(Error::StructuralError(format!(
+                "feature code for '{}' is in a file, which is only possible in a .glyphspackage",
+                feature.name().unwrap_or_default()
+            )));
+        }
         let mut features = Vec::new();
         for class in from.classes {
             features.push(class.class_to_feature()?);
@@ -4482,6 +5185,447 @@ mod tests {
         assert_eq!(font.format_version, FormatVersion::V3);
     }
 
+    fn glyphs4_dir() -> PathBuf {
+        testdata_dir().join("glyphs4")
+    }
+
+    #[test]
+    fn v4_format_version() {
+        let font = RawFont::load(&glyphs4_dir().join("WghtVar.glyphs")).unwrap();
+        assert_eq!(font.format_version, FormatVersion::V4);
+        let font = RawFont::load(&glyphs4_dir().join("WghtVar.glyphspackage")).unwrap();
+        assert_eq!(font.format_version, FormatVersion::V4);
+    }
+
+    #[test]
+    fn unknown_format_version() {
+        let err = RawFont::load_from_string("{.formatVersion = 5;}").unwrap_err();
+        assert!(err.to_string().contains("'5'"), "{err}");
+    }
+
+    /// Glyphs 4 ends feature files with a newline that the v3 code may lack,
+    /// so compare feature code without blank lines
+    fn trim_feature_code(font: &Font) -> Font {
+        let mut font = font.clone();
+        for feature in font.features.iter_mut() {
+            feature.content = feature
+                .content
+                .lines()
+                .filter(|line| !line.trim().is_empty())
+                .collect::<Vec<_>>()
+                .join("\n");
+        }
+        font
+    }
+
+    /// Each glyphs4 fixture is a conversion of a glyphs3 one, see
+    /// resources/scripts/glyphs3_to_glyphs4.py; they must load the same.
+    fn assert_load_v3_matches_load_v4(v3_name: &str, v4_name: &str) {
+        let _ = tracing_subscriber::fmt().with_test_writer().try_init();
+        let g3 = Font::load(&glyphs3_dir().join(v3_name)).unwrap();
+        let g4 = Font::load(&glyphs4_dir().join(v4_name)).unwrap();
+        assert_fonts_equal(
+            &trim_feature_code(&g3),
+            &trim_feature_code(&g4),
+            &format!("g3 vs g4: {v3_name} vs {v4_name}"),
+        );
+    }
+
+    #[rstest]
+    #[case::wght_var("WghtVar.glyphs", "WghtVar.glyphs")]
+    #[case::wght_var_package("WghtVar.glyphspackage", "WghtVar.glyphspackage")]
+    #[case::instances("WghtVar_Instances.glyphs", "WghtVar_Instances.glyphs")]
+    #[case::instances_package("WghtVar_Instances.glyphspackage", "WghtVar_Instances.glyphspackage")]
+    #[case::features_package(
+        "WghtVarWithStylisticSet.glyphs",
+        "WghtVarWithStylisticSet.glyphspackage"
+    )]
+    #[case::classes_and_prefixes_package("Oswald-AE-comb.glyphs", "Oswald-AE-comb.glyphspackage")]
+    #[case::intermediate_layer("IntermediateLayer.glyphs", "IntermediateLayer.glyphs")]
+    #[case::bracket_layer(
+        "LibreFranklin-bracketlayer.glyphs",
+        "LibreFranklin-bracketlayer.glyphs"
+    )]
+    #[case::palettes("COLRv0-2layers.glyphs", "COLRv0-2layers.glyphs")]
+    #[case::solid_colors("COLRv1-solid.glyphs", "COLRv1-solid.glyphs")]
+    #[case::gradients("COLRv1-gradient.glyphs", "COLRv1-gradient.glyphs")]
+    fn read_3_and_4(#[case] v3_name: &str, #[case] v4_name: &str) {
+        assert_load_v3_matches_load_v4(v3_name, v4_name);
+    }
+
+    #[test]
+    fn v4_package_reads_feature_files_and_kerning() {
+        let font = Font::load(&glyphs4_dir().join("Oswald-AE-comb.glyphspackage")).unwrap();
+        let pkg = glyphs4_dir().join("Oswald-AE-comb.glyphspackage");
+        assert!(pkg.join("features/@Uppercase.fea").is_file());
+        assert!(pkg.join("features/_Languagesystems.fea").is_file());
+        assert!(pkg.join("kerning.plist").is_file());
+        let fontinfo = std::fs::read_to_string(pkg.join("fontinfo.plist")).unwrap();
+        assert!(!fontinfo.contains("kerningLTR") && !fontinfo.contains("code ="));
+        assert!(font.features[0].content.contains("@Uppercase = [ A Aacute"));
+        assert!(
+            font.features[1]
+                .content
+                .contains("languagesystem DFLT dflt;")
+        );
+        assert!(!font.kerning_ltr.0.is_empty());
+    }
+
+    #[test]
+    fn v4_instance_name_from_style_names() {
+        let font = Font::load(&glyphs4_dir().join("WghtVar_Instances.glyphs")).unwrap();
+        assert_eq!(
+            font.instances
+                .iter()
+                .map(|i| i.name.as_str())
+                .collect::<Vec<_>>(),
+            ["Regular", "Bold"]
+        );
+    }
+
+    /// A minimal v4 font with two masters, m01 at wght=400 and m02 at 700,
+    /// and one glyph 'a' with the given layers.
+    fn v4_font(layers: &str, extra: &str) -> String {
+        format!(
+            r#"{{
+.formatVersion = 4;
+axes = (
+{{
+names = (
+{{
+language = DEU;
+value = Gewicht;
+}},
+{{
+language = dflt;
+value = Weight;
+}},
+);
+tag = wght;
+}},
+);
+fontMaster = (
+{{
+axesValues = (400,);
+id = m01;
+name = Regular;
+}},
+{{
+axesValues = (700,);
+id = m02;
+name = Bold;
+}},
+);
+glyphs = (
+{{
+glyphname = a;
+layers = (
+{layers}
+);
+}},
+);
+properties = (
+{{
+key = familyNames;
+values = (
+{{
+language = dflt;
+value = "Four Sans";
+}},
+);
+}},
+);
+unitsPerEm = 1000;
+{extra}
+}}"#
+        )
+    }
+
+    fn layer(id: &str, extra: &str, nodes: &str) -> String {
+        format!(
+            "{{\n{extra}\nlayerId = {id};\nshapes = (\n{{\nclosed = 1;\nnodes = (\n{nodes}\n);\n}},\n);\nwidth = 500;\n}},"
+        )
+    }
+
+    const SQUARE: &str = "(0,0,l),\n(100,0,l),\n(100,100,l),\n(0,100,l),";
+
+    fn two_master_font(m01_nodes: &str, extra_layers: &str, extra: &str) -> String {
+        let layers = format!(
+            "{}\n{}\n{extra_layers}",
+            layer("m01", "", m01_nodes),
+            layer("m02", "", SQUARE)
+        );
+        v4_font(&layers, extra)
+    }
+
+    #[test]
+    fn v4_family_and_axis_names() {
+        let font = Font::load_from_string(&two_master_font(SQUARE, "", "")).unwrap();
+        assert_eq!(font.axes[0].name, "Weight");
+        assert_eq!(
+            font.all_names.get("familyNames").unwrap()[0],
+            ("dflt".to_string(), "Four Sans".to_string())
+        );
+    }
+
+    #[test]
+    fn v4_node_modifiers() {
+        // smooth, orientation and lock modifiers are accepted, and only smooth matters
+        let nodes = "(0,0,lsRX),\n(100,0,lC),\n(100,100,lX),\n(0,100,lR),";
+        let font = Font::load_from_string(&two_master_font(nodes, "", "")).unwrap();
+        let Shape::Path(path) = &font.glyphs["a"].layers[0].shapes[0] else {
+            panic!("expected a path");
+        };
+        assert_eq!(
+            path.nodes.iter().map(|n| n.node_type).collect::<Vec<_>>(),
+            [
+                NodeType::LineSmooth,
+                NodeType::Line,
+                NodeType::Line,
+                NodeType::Line
+            ]
+        );
+        assert_eq!(
+            path.to_points(),
+            [(0., 0.), (100., 0.), (100., 100.), (0., 100.)].map(Point::from)
+        );
+    }
+
+    #[rstest]
+    #[case::quartic("u", "a quartic curve")]
+    #[case::hobby("h", "a Hobby curve")]
+    #[case::spiral("rs", "a Raph Levien spiral")]
+    #[case::mid_path_move("m", "a move that does not start an open path")]
+    #[case::smooth_offcurve("os", "unknown node type 'os'")]
+    #[case::garbage("z", "unknown node type 'z'")]
+    fn v4_uncompilable_node_types_name_glyph_and_layer(#[case] token: &str, #[case] what: &str) {
+        let nodes = format!("(0,0,l),\n(100,0,{token}),\n(100,100,l),\n(0,100,l),");
+        let err = Font::load_from_string(&two_master_font(&nodes, "", "")).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            matches!(&err, Error::BadLayer { glyph, layer, .. } if glyph == "a" && layer == "m01"),
+            "{msg}"
+        );
+        assert!(
+            msg.contains("node 1 at (100, 0)") && msg.contains(what),
+            "{msg}"
+        );
+    }
+
+    #[test]
+    fn v4_node_tuples() {
+        for (raw, has_attrs) in [
+            ("(1,2,l)", false),
+            ("(1,2,l,)", false),
+            ("(1,2,c,{hoi = {wght = {ip = (3,4);};};})", true),
+            ("(1,2,c,{name = hr00;},)", true),
+        ] {
+            let node = RawNode::parse_plist(raw).unwrap();
+            assert_eq!(node.pt, Point::new(1.0, 2.0), "{raw}");
+            assert_eq!(node.attrs.is_some(), has_attrs, "{raw}");
+        }
+        assert!(
+            RawNode::parse_plist("(1,2,c,{hoi = {};})")
+                .unwrap()
+                .has_hoi()
+        );
+        assert!(RawNode::parse_plist("(1,2,l").is_err());
+    }
+
+    #[test]
+    fn v4_move_starts_open_path() {
+        let layers = format!(
+            "{{\nlayerId = m01;\nshapes = (\n{{\nclosed = 0;\nnodes = (\n(0,0,m),\n(100,0,l),\n);\n}},\n);\nwidth = 500;\n}},\n{}",
+            layer("m02", "", SQUARE)
+        );
+        let font = Font::load_from_string(&v4_font(&layers, "")).unwrap();
+        let Shape::Path(path) = &font.glyphs["a"].layers[0].shapes[0] else {
+            panic!("expected a path");
+        };
+        assert_eq!(path.nodes[0].node_type, NodeType::Line);
+    }
+
+    #[test]
+    fn v4_tangent_node_is_harmonized() {
+        // A tangent node between two cubics whose outer handles sit 100 and
+        // 25 units from the line through the inner handles: G2 continuity puts
+        // it sqrt(100) / (sqrt(100) + sqrt(25)) = 2/3 of the way along.
+        let nodes = "(0,0,l),\n(0,100,o),\n(100,200,o),\n(200,200,ct),\n(300,200,o),\n(400,225,o),\n(400,0,c),";
+        let font = Font::load_from_string(&two_master_font(nodes, "", ""))
+            .unwrap_or_else(|e| panic!("{e}"));
+        let Shape::Path(path) = &font.glyphs["a"].layers[0].shapes[0] else {
+            panic!("expected a path");
+        };
+        assert_eq!(path.nodes[3].node_type, NodeType::CurveSmooth);
+        let expected = Point::new(100.0 + 200.0 * 2.0 / 3.0, 200.0);
+        assert!(
+            (path.nodes[3].pt - expected).hypot() < 1e-9,
+            "{:?}",
+            path.nodes[3].pt
+        );
+        // everything else stays put
+        assert_eq!(path.nodes[2].pt, Point::new(100.0, 200.0));
+        assert_eq!(path.nodes[4].pt, Point::new(300.0, 200.0));
+    }
+
+    #[test]
+    fn v4_tangent_node_next_to_a_line_stays() {
+        let nodes = "(0,0,lt),\n(100,0,l),\n(100,100,l),\n(0,100,l),";
+        let font = Font::load_from_string(&two_master_font(nodes, "", "")).unwrap();
+        let Shape::Path(path) = &font.glyphs["a"].layers[0].shapes[0] else {
+            panic!("expected a path");
+        };
+        assert_eq!(path.nodes[0].pt, Point::ZERO);
+        assert_eq!(path.nodes[0].node_type, NodeType::LineSmooth);
+    }
+
+    #[test]
+    fn v4_inactive_master_is_dropped() {
+        let source = two_master_font(SQUARE, "", "").replace("id = m02;", "active = 0;\nid = m02;");
+        let font = Font::load_from_string(&source).unwrap();
+        assert_eq!(
+            font.masters
+                .iter()
+                .map(|m| m.id.as_str())
+                .collect::<Vec<_>>(),
+            ["m01"]
+        );
+        assert_eq!(font.glyphs["a"].layers.len(), 1);
+    }
+
+    #[test]
+    fn v4_inactive_master_keeps_intermediate_layers() {
+        let brace = layer(
+            "brace",
+            "associatedMasterId = m02;\nattr = {\ncoordinates = (550);\n};",
+            SQUARE,
+        );
+        let source =
+            two_master_font(SQUARE, &brace, "").replace("id = m02;", "active = 0;\nid = m02;");
+        let font = Font::load_from_string(&source).unwrap();
+        let layers = &font.glyphs["a"].layers;
+        assert_eq!(layers.len(), 2);
+        assert_eq!(layers[1].associated_master_id.as_deref(), Some("m01"));
+    }
+
+    #[test]
+    fn v4_all_masters_inactive() {
+        let source = two_master_font(SQUARE, "", "")
+            .replace("id = m01;", "active = 0;\nid = m01;")
+            .replace("id = m02;", "active = 0;\nid = m02;");
+        assert!(Font::load_from_string(&source).is_err());
+    }
+
+    #[test]
+    fn v4_inactive_layers_are_dropped() {
+        let brace = layer(
+            "brace",
+            "active = 0;\nassociatedMasterId = m01;\nattr = {\ncoordinates = (550);\n};",
+            SQUARE,
+        );
+        let bracket = layer(
+            "bracket",
+            "active = 0;\nassociatedMasterId = m01;\nattr = {\naxisRules = ({min = 600;});\n};",
+            SQUARE,
+        );
+        let source = two_master_font(SQUARE, &format!("{brace}\n{bracket}"), "");
+        let font = Font::load_from_string(&source).unwrap();
+        let glyph = &font.glyphs["a"];
+        assert_eq!(glyph.layers.len(), 2);
+        assert!(glyph.bracket_layers.is_empty());
+    }
+
+    #[test]
+    fn v4_default_coordinate() {
+        // "-" is the default for that axis, i.e. the default master's location
+        let brace = layer(
+            "brace",
+            "associatedMasterId = m02;\nattr = {\ncoordinates = (\"-\");\n};",
+            SQUARE,
+        );
+        let source = two_master_font(SQUARE, &brace, "");
+        let font = Font::load_from_string(&source).unwrap();
+        assert_eq!(
+            font.glyphs["a"].layers[2].attributes.coordinates,
+            [OrderedFloat(400.0)]
+        );
+    }
+
+    #[test]
+    fn v4_contextual_kerning_is_ignored() {
+        let source = two_master_font(
+            SQUARE,
+            "",
+            "kerningContext = {\n\"a a\" = {\nm01 = -10;\n};\n};",
+        );
+        Font::load_from_string(&source).unwrap();
+    }
+
+    #[test]
+    fn v4_feature_file_outside_a_package() {
+        let source = two_master_font(
+            SQUARE,
+            "",
+            "features = (\n{\nfile = calt.fea;\ntag = calt;\n},\n);",
+        );
+        let err = Font::load_from_string(&source).unwrap_err();
+        assert!(err.to_string().contains("calt"), "{err}");
+    }
+
+    #[rstest]
+    #[case::hidden("attr = {\nhidden = 1;\n};", "hidden shapes")]
+    #[case::mask("attr = {\nmask = 1;\n};", "subtracting mask")]
+    #[case::palette_ref("attr = {\nfillColor = (p,2,1);\n};", "palette color references")]
+    #[case::conic(
+        "attr = {\ngradient = {\ncolors = (\n((1,0,0,1),0),\n((0,0,1,1),1),\n);\ntype = conic;\n};\n};",
+        "conic gradients"
+    )]
+    fn v4_unsupported_shape_attributes(#[case] attr: &str, #[case] issue: &str) {
+        let layers = format!(
+            "{{\nlayerId = m01;\nshapes = (\n{{\n{attr}\nclosed = 1;\nnodes = (\n{SQUARE}\n);\n}},\n);\nwidth = 500;\n}},\n{}",
+            layer("m02", "", SQUARE)
+        );
+        let err = Font::load_from_string(&v4_font(&layers, "")).unwrap_err();
+        assert!(matches!(err, Error::BadLayer { .. }), "{err}");
+        assert!(err.to_string().contains(issue), "{err}");
+    }
+
+    #[test]
+    fn v4_images_and_shape_groups_draw_nothing() {
+        let layers = format!(
+            "{{\nlayerId = m01;\nshapes = (\n{{\ngroupId = g1;\n}},\n{{\nimagePath = \"a.png\";\n}},\n{{\nattr = {{\ngroup = g1;\n}};\nclosed = 1;\nnodes = (\n{SQUARE}\n);\n}},\n);\nwidth = 500;\n}},\n{}",
+            layer("m02", "", SQUARE)
+        );
+        let font = Font::load_from_string(&v4_font(&layers, "")).unwrap();
+        assert_eq!(font.glyphs["a"].layers[0].shapes.len(), 1);
+    }
+
+    #[test]
+    fn v4_smart_glyph_axes() {
+        let source = two_master_font(SQUARE, "", "").replace(
+            "glyphname = a;",
+            "axes = (\n{\nname = Height;\ntag = hght;\n},\n);\nglyphname = a;",
+        );
+        let err = Font::load_from_string(&source).unwrap_err();
+        assert!(err.to_string().contains("Smart Glyph axes"), "{err}");
+    }
+
+    #[test]
+    fn v4_float_colors() {
+        let font = Font::load(&glyphs4_dir().join("COLRv1-solid.glyphs")).unwrap();
+        let colors: Vec<_> = font
+            .glyphs
+            .values()
+            .flat_map(|g| g.layers.iter())
+            .flat_map(|l| l.shapes.iter())
+            .filter_map(|s| s.attributes().fill_color)
+            .collect();
+        assert!(
+            colors.contains(&Color::rgba(177, 216, 243, 255)),
+            "{colors:?}"
+        );
+    }
+
     #[test]
     fn glyphs3_named_and_numeric_instance_classes() {
         let font = Font::load(&glyphs3_dir().join("InstanceClasses.glyphs")).unwrap();
@@ -4753,9 +5897,10 @@ mod tests {
 
     /// Parse a Glyphs 3 component plist fragment and return its transform.
     fn component_transform(shape_plist: &str) -> Affine {
-        let shape: Shape = RawShape::parse_plist(shape_plist)
+        let shape = RawShape::parse_plist(shape_plist)
             .unwrap()
-            .try_into()
+            .build(FormatVersion::V3, "test")
+            .unwrap()
             .unwrap();
         let Shape::Component(component) = shape else {
             panic!("{shape:?} should be a component");
@@ -4869,9 +6014,9 @@ slant = (10);
         "#,
         )
         .unwrap();
-        let result = Shape::try_from(raw);
+        let result = raw.build(FormatVersion::V3, "test");
         assert!(
-            matches!(&result, Err(Error::StructuralError(msg)) if msg.starts_with("Bad slant")),
+            matches!(&result, Err(msg) if msg.starts_with("Bad slant")),
             "{result:?}"
         );
     }
@@ -5781,7 +6926,9 @@ etc;
             ..Default::default()
         };
 
-        let cooked = raw.build(FormatVersion::V2, &GlyphData::default()).unwrap();
+        let cooked = raw
+            .build(FormatVersion::V2, &GlyphData::default(), &[])
+            .unwrap();
         assert_eq!((cooked.category, cooked.sub_category), (None, None));
     }
 
@@ -5798,7 +6945,9 @@ etc;
             ..Default::default()
         };
 
-        let cooked = raw.build(FormatVersion::V2, &GlyphData::default()).unwrap();
+        let cooked = raw
+            .build(FormatVersion::V2, &GlyphData::default(), &[])
+            .unwrap();
         assert_eq!(cooked.category, Some(Category::Letter));
         assert_eq!(cooked.sub_category, None); // NOT Some(Ligature)
     }
@@ -6602,6 +7751,7 @@ unitsPerEm = 1000;
                 name: "Weight".into(),
                 tag: "wght".into(),
                 hidden: None,
+                names: Vec::new(),
             }],
             font_master: vec![RawFontMaster {
                 custom_parameters: RawCustomParameters(vec![make_axis_location_params(&[
