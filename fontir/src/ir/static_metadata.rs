@@ -1193,7 +1193,7 @@ impl StaticMetadata {
 
     /// The named instances fvar lists, a subset of [`Self::named_instances`].
     ///
-    /// See [`fvar_instances`]: an instance outside the axes' ranges is not part of the
+    /// See the private `fvar_instances` function: an instance outside the axes' ranges is not part of the
     /// variable font. It stays in `named_instances` for callers that want every
     /// instance the source declared, such as building one as a static.
     pub fn fvar_instances(&self) -> impl Iterator<Item = &NamedInstance> {

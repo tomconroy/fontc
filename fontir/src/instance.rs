@@ -1150,7 +1150,8 @@ pub fn pin_static_metadata(
 /// equivalent in fontc's static metadata. Name records are
 /// [`pin_names`]'s and metrics are
 /// [`GlobalMetricsBuilder::build_pinned`](crate::ir::GlobalMetricsBuilder::build_pinned)'s;
-/// both run before this and read the same [`InstanceOverrides`].
+/// both run before this and read the same
+/// [`InstanceOverrides`](crate::ir::InstanceOverrides).
 ///
 /// Deliberately not here, because glyphsLib has no handler for them at all and
 /// so fontmake ignores them too: `xHeight`, `capHeight`, `italicAngle`,
@@ -1487,14 +1488,14 @@ fn pin_os2_classes(pinned: &mut StaticMetadata, axes: &Axes, user_pin: &UserLoca
 /// build, so this is `--instance` only.
 ///
 /// - **PANOSE** is merged across the masters rather than copied, see
-///   [`MiscMetadata::instance_panose`].
+///   [`MiscMetadata::instance_panose`](crate::ir::MiscMetadata::instance_panose).
 /// - **`fsType`** defaults to Glyphs.app's `[3]` (editable embedding) instead
 ///   of ufo2ft's `[2]` (preview and print). A `.glyphs` source already carries
 ///   `[3]` from glyphsLib, so this only moves UFO sources.
 /// - **`postscriptUnderlinePosition` / `Thickness`** default to Glyphs.app's
 ///   flat -100 and 50 instead of ufo2ft's `upem * -0.075` and `upem * 0.05` —
 ///   the same numbers at 1000 upem and different at any other. Those two are
-///   [`GlobalMetric`]s rather than static metadata, so they are handled where
+///   [`GlobalMetric`](crate::ir::GlobalMetric)s rather than static metadata, so they are handled where
 ///   the metrics are pinned, in [`GlobalMetricsBuilder::build_pinned`].
 ///
 /// <https://github.com/googlefonts/glyphsLib/blob/main/Lib/glyphsLib/builder/custom_params.py#L1161-L1181>

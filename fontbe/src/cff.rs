@@ -2,8 +2,10 @@
 //!
 //! This is the single-master table; a variable source gets a CFF2 from
 //! [`crate::cff2`] instead, built by the same work. Components must have been
-//! decomposed by fontir ([`Flags::CFF_OUTLINES`] implies
-//! [`Flags::DECOMPOSE_COMPONENTS`] when set via the CLI).
+//! decomposed by fontir
+//! ([`Flags::CFF_OUTLINES`](fontir::orchestration::Flags::CFF_OUTLINES) implies
+//! [`Flags::DECOMPOSE_COMPONENTS`](fontir::orchestration::Flags::DECOMPOSE_COMPONENTS)
+//! when set via the CLI).
 
 use std::collections::HashMap;
 
@@ -232,9 +234,11 @@ fn fallback_blue_scale(
     other_blues: &[OrderedFloat<f64>],
 ) -> f64 {
     let max_zone_height = blue_values
-        .chunks_exact(2)
-        .chain(other_blues.chunks_exact(2))
-        .map(|pair| (pair[1].into_inner() - pair[0].into_inner()).abs())
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .chain(other_blues.as_chunks::<2>().0)
+        .map(|[bottom, top]| (top.into_inner() - bottom.into_inner()).abs())
         .fold(0.0f64, f64::max);
     if max_zone_height != 0.0 {
         3.0 / (4.0 * max_zone_height)

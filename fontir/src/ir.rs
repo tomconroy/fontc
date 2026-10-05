@@ -754,7 +754,7 @@ impl GlobalMetricsBuilder {
     /// So this interpolates the builder's own unrounded values and rounds
     /// once, per attribute, exactly as fontMath's `MathInfo.extractInfo` does
     /// — which is to say **not at all** for the six metrics whose UFO
-    /// attribute has a `_numberFormatter` (see [`GlobalMetric::at_pin`]).
+    /// attribute has a `_numberFormatter` (see `GlobalMetric::at_pin`).
     /// `--round-instances` plays no part; the formatters run regardless.
     ///
     /// Two further fontMath rules follow from interpolating *raw fontinfo*

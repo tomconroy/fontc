@@ -148,7 +148,7 @@ pub struct Options {
     /// variable font.
     ///
     /// Resolved against the source's axes and named instances once the
-    /// frontend has run; see [`crate::instance`].
+    /// frontend has run; see the private `instance` module.
     pub instance: Option<InstanceSpec>,
 }
 
@@ -4629,7 +4629,9 @@ mod tests {
         let font = compile.font();
 
         assert_eq!(vec![(Tag::new(b"wght"), 200.0, 700.0, 700.0)], axes(&font),);
-        assert_eq!(700, font.os2().unwrap().us_weight_class());
+        // In design units with no exporting instance at the default, as in
+        // os2_weight_class_matches_default_wght: Glyphs 3.5 and 4.1.1 write 400
+        assert_eq!(400, font.os2().unwrap().us_weight_class());
     }
 
     #[test]

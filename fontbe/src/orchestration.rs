@@ -318,7 +318,7 @@ pub struct CffOutput {
     pub glyph_bounds: Vec<Option<[i32; 4]>>,
     /// The same boxes grown *outward* to integers, which is how fontTools
     /// recalculates head/hhea/vhea for a CFF font; `None` only for glyphs
-    /// that draw nothing. See [`crate::cff::outer_bounds`].
+    /// that draw nothing. See `crate::cff::outer_bounds`.
     pub glyph_outer_bounds: Vec<Option<[i32; 4]>>,
 }
 

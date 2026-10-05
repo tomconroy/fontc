@@ -2716,7 +2716,7 @@ pub struct Instance {
     /// "Style Linking > this instance is the X of", i.e. the family to link into.
     ///
     /// Empty or `Regular` means "work it out from the style name"; see
-    /// [`Instance::style_map_names`].
+    /// [`Instance::style_map_family_name`].
     pub link_style: Option<String>,
 }
 
