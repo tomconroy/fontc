@@ -1,6 +1,7 @@
 {
-.appVersion = "4107";
+.appVersion = "3343";
 .formatVersion = 4;
+date = "2026-10-05 15:23:07 +0000";
 fontMaster = (
 {
 id = m01;
@@ -19,7 +20,7 @@ layerId = m01;
 shapes = (
 {
 attr = {
-fillColor = (0.694118,0.847059,0.952941,1);
+fillColor = (0.694,0.847,0.953,1);
 };
 closed = 1;
 nodes = (
@@ -46,7 +47,7 @@ layerId = m01;
 shapes = (
 {
 attr = {
-fillColor = (0.164706,0.168627,0.172549,1);
+fillColor = (0.165,0.169,0.173,1);
 };
 closed = 1;
 nodes = (
@@ -74,6 +75,9 @@ value = "New Font";
 );
 },
 );
+settings = {
+colorSpace = "apple-rgb";
+};
 unitsPerEm = 1000;
 versionMajor = 1;
 versionMinor = 0;

@@ -1,5 +1,5 @@
 {
-.appVersion = "4107";
+.appVersion = "3219";
 .formatVersion = 4;
 axes = (
 {
@@ -7,6 +7,7 @@ name = Weight;
 tag = wght;
 },
 );
+date = "2026-10-05 15:23:17 +0000";
 fontMaster = (
 {
 axesValues = (
@@ -38,7 +39,6 @@ name = Regular;
 axesValues = (
 700,
 );
-iconName = Bold;
 id = "E09E0C54-128D-4FEA-B209-1B70BEFE300B";
 metricValues = (
 {
@@ -171,12 +171,10 @@ layers = (
 layerId = m01;
 shapes = (
 {
-alignment = -1;
 pos = (0,100);
 ref = hyphen;
 },
 {
-alignment = -1;
 ref = hyphen;
 },
 );
@@ -186,13 +184,11 @@ width = 600;
 layerId = "E09E0C54-128D-4FEA-B209-1B70BEFE300B";
 shapes = (
 {
-alignment = -1;
 pos = (10,100);
 ref = hyphen;
 scale = (1.15,1.25);
 },
 {
-alignment = -1;
 ref = hyphen;
 },
 );
@@ -207,7 +203,7 @@ instances = (
 axesValues = (
 400,
 );
-id = "EADED8FF-6F82-50B0-9858-7B7C051663E5";
+id = "5890E1E0-107F-4C6E-A352-1876274A1756";
 instanceInterpolations = {
 m01 = 1;
 };
@@ -227,7 +223,7 @@ value = Regular;
 axesValues = (
 700,
 );
-id = "063482FE-E823-513B-B992-2D39749870F0";
+id = "61D968CE-7AC2-4AA3-9312-3118D277AA34";
 instanceInterpolations = {
 "E09E0C54-128D-4FEA-B209-1B70BEFE300B" = 1;
 };
@@ -309,6 +305,9 @@ key = versionString;
 value = "New Value";
 },
 );
+settings = {
+colorSpace = "apple-rgb";
+};
 unitsPerEm = 1000;
 versionMajor = 42;
 versionMinor = 42;

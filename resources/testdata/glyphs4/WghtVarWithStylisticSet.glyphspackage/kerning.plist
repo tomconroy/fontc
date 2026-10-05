@@ -1,16 +1,5 @@
 {
 kerningLTR = {
-"E09E0C54-128D-4FEA-B209-1B70BEFE300B" = {
-bracketleft = {
-bracketright = -150;
-};
-exclam = {
-exclam = -100;
-};
-hyphen = {
-hyphen = -50;
-};
-};
 m01 = {
 "@MMK_L_bracketleft_R" = {
 exclam = -165;
@@ -25,6 +14,17 @@ hyphen = 20;
 };
 hyphen = {
 hyphen = -150;
+};
+};
+"E09E0C54-128D-4FEA-B209-1B70BEFE300B" = {
+bracketleft = {
+bracketright = -150;
+};
+exclam = {
+exclam = -100;
+};
+hyphen = {
+hyphen = -50;
 };
 };
 };

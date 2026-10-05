@@ -5269,12 +5269,29 @@ mod tests {
         font
     }
 
-    /// Each glyphs4 fixture is a conversion of a glyphs3 one, see
-    /// resources/scripts/glyphs3_to_glyphs4.py; they must load the same.
+    /// Each glyphs4 fixture is its glyphs3 twin saved as format 4 by Glyphs
+    /// 4.1.1; they must load the same, but for what that save changes.
     fn assert_load_v3_matches_load_v4(v3_name: &str, v4_name: &str) {
         let _ = tracing_subscriber::fmt().with_test_writer().try_init();
         let g3 = Font::load(&glyphs3_dir().join(v3_name)).unwrap();
-        let g4 = Font::load(&glyphs4_dir().join(v4_name)).unwrap();
+        let mut g4 = Font::load(&glyphs4_dir().join(v4_name)).unwrap();
+        // Glyphs records when it saved the file
+        assert!(g3.date.is_none() && g4.date.is_some());
+        g4.date = None;
+        // Glyphs 4 saves the made-up near-black palette colors of
+        // COLRv0-2layers, (1,2,3,4) etc., as grey with the same alpha; its own
+        // export of the two files differs the same way, in CPAL
+        if let (Some(p3), Some(p4)) = (
+            &g3.custom_parameters.color_palettes,
+            &mut g4.custom_parameters.color_palettes,
+        ) {
+            let alphas = |p: &Vec<Vec<Color>>| -> Vec<Vec<i64>> {
+                p.iter().map(|p| p.iter().map(|c| c.a).collect()).collect()
+            };
+            assert_eq!(alphas(p3), alphas(p4));
+            assert!(p4.iter().flatten().all(|c| c.r == c.g && c.g == c.b));
+            *p4 = p3.clone();
+        }
         assert_fonts_equal(
             &without_circle_radii(&trim_feature_code(&g3)),
             &without_circle_radii(&trim_feature_code(&g4)),

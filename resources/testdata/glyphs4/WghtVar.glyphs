@@ -1,14 +1,9 @@
 {
-.appVersion = "4107";
+.appVersion = "3219";
 .formatVersion = 4;
 axes = (
 {
-names = (
-{
-language = dflt;
-value = Weight;
-},
-);
+name = Weight;
 tag = wght;
 },
 );
@@ -22,6 +17,7 @@ name = "Has WWS Names";
 value = 1;
 },
 );
+date = "2026-10-05 15:23:26 +0000";
 fontMaster = (
 {
 axesValues = (
@@ -53,7 +49,6 @@ name = Regular;
 axesValues = (
 700,
 );
-iconName = Bold;
 id = "E09E0C54-128D-4FEA-B209-1B70BEFE300B";
 metricValues = (
 {
@@ -152,7 +147,9 @@ shapes = (
 {
 closed = 1;
 nodes = (
-(131,250,l,{name = hr00;}),
+(131,250,l,{
+name = hr00;
+}),
 (470,250,l),
 (470,330,l),
 (131,330,l),
@@ -278,12 +275,10 @@ layers = (
 layerId = m01;
 shapes = (
 {
-alignment = -1;
 pos = (0,100);
 ref = hyphen;
 },
 {
-alignment = -1;
 ref = hyphen;
 },
 );
@@ -293,13 +288,11 @@ width = 600;
 layerId = "E09E0C54-128D-4FEA-B209-1B70BEFE300B";
 shapes = (
 {
-alignment = -1;
 pos = (10,100);
 ref = hyphen;
 scale = (1.15,1.25);
 },
 {
-alignment = -1;
 ref = hyphen;
 },
 );
@@ -310,17 +303,6 @@ unicode = 61;
 },
 );
 kerningLTR = {
-"E09E0C54-128D-4FEA-B209-1B70BEFE300B" = {
-bracketleft = {
-bracketright = -150;
-};
-exclam = {
-exclam = -100;
-};
-hyphen = {
-hyphen = -50;
-};
-};
 m01 = {
 "@MMK_L_bracketleft_R" = {
 exclam = -165;
@@ -335,6 +317,17 @@ hyphen = 20;
 };
 hyphen = {
 hyphen = -150;
+};
+};
+"E09E0C54-128D-4FEA-B209-1B70BEFE300B" = {
+bracketleft = {
+bracketright = -150;
+};
+exclam = {
+exclam = -100;
+};
+hyphen = {
+hyphen = -50;
 };
 };
 };
@@ -400,6 +393,9 @@ key = versionString;
 value = "New Value";
 },
 );
+settings = {
+colorSpace = "apple-rgb";
+};
 unitsPerEm = 1000;
 versionMajor = 42;
 versionMinor = 42;

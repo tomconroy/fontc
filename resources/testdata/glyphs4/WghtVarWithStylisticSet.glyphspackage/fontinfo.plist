@@ -1,5 +1,5 @@
 {
-.appVersion = "4107";
+.appVersion = "3260";
 .formatVersion = 4;
 axes = (
 {
@@ -17,6 +17,7 @@ name = "Has WWS Names";
 value = 1;
 },
 );
+date = "2026-10-05 15:23:33 +0000";
 features = (
 {
 file = ss01.fea;
@@ -70,7 +71,6 @@ name = Regular;
 axesValues = (
 700,
 );
-iconName = Bold;
 id = "E09E0C54-128D-4FEA-B209-1B70BEFE300B";
 metricValues = (
 {
@@ -153,6 +153,9 @@ key = versionString;
 value = "Version 1.234";
 },
 );
+settings = {
+colorSpace = "apple-rgb";
+};
 unitsPerEm = 1000;
 versionMajor = 42;
 versionMinor = 42;

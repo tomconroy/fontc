@@ -1,5 +1,5 @@
 {
-.appVersion = "4107";
+.appVersion = "3219";
 .formatVersion = 4;
 axes = (
 {
@@ -7,6 +7,7 @@ name = Weight;
 tag = wght;
 },
 );
+date = "2026-10-05 15:23:21 +0000";
 fontMaster = (
 {
 axesValues = (
@@ -38,7 +39,6 @@ name = Regular;
 axesValues = (
 700,
 );
-iconName = Bold;
 id = "E09E0C54-128D-4FEA-B209-1B70BEFE300B";
 metricValues = (
 {
@@ -64,7 +64,7 @@ instances = (
 axesValues = (
 400,
 );
-id = "EADED8FF-6F82-50B0-9858-7B7C051663E5";
+id = "7465F5FF-AD1E-4C4B-9007-F769138817BB";
 instanceInterpolations = {
 m01 = 1;
 };
@@ -84,7 +84,7 @@ value = Regular;
 axesValues = (
 700,
 );
-id = "063482FE-E823-513B-B992-2D39749870F0";
+id = "70A79D7F-6F44-4C49-A057-17D032CD143A";
 instanceInterpolations = {
 "E09E0C54-128D-4FEA-B209-1B70BEFE300B" = 1;
 };
@@ -166,6 +166,9 @@ key = versionString;
 value = "New Value";
 },
 );
+settings = {
+colorSpace = "apple-rgb";
+};
 unitsPerEm = 1000;
 versionMajor = 42;
 versionMinor = 42;
