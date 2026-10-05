@@ -1115,11 +1115,15 @@ pub fn pin_static_metadata(
     // default_location field must survive untouched
     let mut pinned = static_metadata.clone();
     pinned.axes = Axes::default();
+    pinned.axis_mappings = Vec::new();
     pinned.named_instances = Vec::new();
     pinned.variation_model = VariationModel::new(HashSet::from([key]), Vec::new());
     pinned.number_values = number_values;
     pinned.postscript = postscript;
     pinned.variations = None;
+    // a static instance has no design axes to describe, nor an avar to map them
+    pinned.misc.stat_axes = Vec::new();
+    pinned.misc.elided_fallback_name = None;
 
     if let Some(instance) = instance {
         pinned.names = pin_names(static_metadata, instance);

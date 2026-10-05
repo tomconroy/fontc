@@ -681,26 +681,42 @@ mod tests {
 
     // A point axis is not in the variation model, so it must not stop us from
     // recognizing the default master's FEA.
+    //
+    // fontmake still writes the point axis to fvar (see
+    // `point_axis_the_source_asked_for_reaches_the_font`), so the variation store's regions span it
+    // too and GDEF differs by that one region axis; GPOS is unchanged.
     #[test]
     fn merged_fea_with_point_axis() {
         let point_axis = TestCompile::compile_source("variable_fea/VarFeaPointAxis.designspace");
         let no_point_axis = TestCompile::compile_source("variable_fea/VarFea.designspace");
 
-        for tag in [Tag::new(b"GPOS"), Tag::new(b"GDEF")] {
-            let point_axis = point_axis
+        let region_axis_count = |result: &TestCompile| {
+            result
                 .font()
-                .table_data(tag)
-                .map(|d| d.as_bytes().to_vec());
-            let no_point_axis = no_point_axis
+                .gdef()
+                .unwrap()
+                .item_var_store()
+                .expect("merged GPOS needs an ItemVariationStore")
+                .unwrap()
+                .variation_region_list()
+                .unwrap()
+                .axis_count()
+        };
+        assert_eq!(region_axis_count(&no_point_axis), 1);
+        assert_eq!(region_axis_count(&point_axis), 2);
+
+        let gpos = |result: &TestCompile| {
+            result
                 .font()
-                .table_data(tag)
-                .map(|d| d.as_bytes().to_vec());
-            assert!(point_axis.is_some(), "{tag} should be present");
-            assert_eq!(
-                point_axis, no_point_axis,
-                "{tag} differs from the compile without a point axis"
-            );
-        }
+                .table_data(Tag::new(b"GPOS"))
+                .map(|d| d.as_bytes().to_vec())
+        };
+        assert!(gpos(&point_axis).is_some(), "GPOS should be present");
+        assert_eq!(
+            gpos(&point_axis),
+            gpos(&no_point_axis),
+            "GPOS differs from the compile without a point axis"
+        );
     }
 
     #[test]

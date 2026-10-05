@@ -18,8 +18,7 @@ use fea_rs::{
     DiagnosticSet, GlyphMap, Opts, ParseTree,
     compile::{
         Compilation, FeatureBuilder, FeatureProvider, GlyphPredicateAttr, NopFeatureProvider,
-        PendingCompilation,
-        PendingLookup, VariationInfo, error::CompilerError,
+        PendingCompilation, PendingLookup, VariationInfo, error::CompilerError,
     },
     parse::{FileSystemResolver, SourceLoadError, SourceResolver},
     typed::{AstNode, LanguageSystem},

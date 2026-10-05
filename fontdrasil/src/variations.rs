@@ -2592,10 +2592,8 @@ mod tests {
     /// ```
     #[test]
     fn round_ties_even_within_a_tolerance() {
-        let model = VariationModel::new(
-            HashSet::from([loc1(0.0), loc1(1.0)]),
-            axis_order(&["wght"]),
-        );
+        let model =
+            VariationModel::new(HashSet::from([loc1(0.0), loc1(1.0)]), axis_order(&["wght"]));
         let tolerance = RoundingBehaviour::RoundTiesEvenWithin(OrderedFloat(0.01));
         assert_eq!(
             model.deltas_for_masters(&[0.0, 213.55999999999995], tolerance),

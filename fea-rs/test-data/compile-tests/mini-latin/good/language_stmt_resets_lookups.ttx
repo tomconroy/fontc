@@ -30,10 +30,11 @@
       <FeatureRecord index="0">
         <FeatureTag value="test"/>
         <Feature>
-          <!-- LookupCount=3 -->
+          <!-- LookupCount=4 -->
           <LookupListIndex index="0" value="0"/>
-          <LookupListIndex index="1" value="2"/>
-          <LookupListIndex index="2" value="3"/>
+          <LookupListIndex index="1" value="1"/>
+          <LookupListIndex index="2" value="2"/>
+          <LookupListIndex index="3" value="3"/>
         </Feature>
       </FeatureRecord>
       <FeatureRecord index="1">

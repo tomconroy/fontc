@@ -1493,8 +1493,8 @@ mod tests {
         let mut outer = TestGlyph::new("outer");
         outer.add_component("mid", mid_to_outer);
 
-        let context = Context::new_root(Flags::DECOMPOSE_COMPONENTS)
-            .copy_for_work(Access::All, Access::All);
+        let context =
+            Context::new_root(Flags::DECOMPOSE_COMPONENTS).copy_for_work(Access::All, Access::All);
         context
             .static_metadata
             .set(test_context().static_metadata.get().as_ref().clone());
@@ -1508,7 +1508,9 @@ mod tests {
             glyph_order.insert(name.into());
         }
 
-        apply_optional_transformations(&context, &glyph_order).unwrap();
+        context.preliminary_glyph_order.set(glyph_order);
+
+        decompose_components(&context).unwrap();
 
         let outer = context.get_glyph("outer");
         let corner = kurbo::Point::new(109.0, 157.0);

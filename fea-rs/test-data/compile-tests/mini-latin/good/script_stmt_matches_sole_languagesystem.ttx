@@ -4,9 +4,9 @@
   <GSUB>
     <Version value="0x00010000"/>
     <ScriptList>
-      <!-- ScriptCount=2 -->
+      <!-- ScriptCount=1 -->
       <ScriptRecord index="0">
-        <ScriptTag value="DFLT"/>
+        <ScriptTag value="latn"/>
         <Script>
           <DefaultLangSys>
             <ReqFeatureIndex value="65535"/>
@@ -16,33 +16,16 @@
           <!-- LangSysCount=0 -->
         </Script>
       </ScriptRecord>
-      <ScriptRecord index="1">
-        <ScriptTag value="latn"/>
-        <Script>
-          <DefaultLangSys>
-            <ReqFeatureIndex value="65535"/>
-            <!-- FeatureCount=1 -->
-            <FeatureIndex index="0" value="1"/>
-          </DefaultLangSys>
-          <!-- LangSysCount=0 -->
-        </Script>
-      </ScriptRecord>
     </ScriptList>
     <FeatureList>
-      <!-- FeatureCount=2 -->
+      <!-- FeatureCount=1 -->
       <FeatureRecord index="0">
         <FeatureTag value="test"/>
         <Feature>
-          <!-- LookupCount=1 -->
+          <!-- LookupCount=3 -->
           <LookupListIndex index="0" value="0"/>
-        </Feature>
-      </FeatureRecord>
-      <FeatureRecord index="1">
-        <FeatureTag value="test"/>
-        <Feature>
-          <!-- LookupCount=2 -->
-          <LookupListIndex index="0" value="1"/>
-          <LookupListIndex index="1" value="2"/>
+          <LookupListIndex index="1" value="1"/>
+          <LookupListIndex index="2" value="2"/>
         </Feature>
       </FeatureRecord>
     </FeatureList>

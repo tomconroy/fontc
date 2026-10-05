@@ -1,16 +1,13 @@
-# fonttools treats a 'script' statement as a no-op when the currently active
-# language systems are exactly '<script> dflt'; at the top of a feature block
-# the active systems are the file's default language systems.
+# fonttools (since 4.66) seeds the current script and language from the
+# first declared language system, so in a file whose only 'languagesystem'
+# statement is 'languagesystem latn dflt', a leading 'script latn' names the
+# system that is already current: it keeps the lookupflag, but still narrows
+# the rules that follow to latn/dflt. Every rule here lands under latn.
+# (fonttools 4.62 instead left the first rule under DFLT/dflt.)
 #
-# So in a file whose only 'languagesystem' statement is 'languagesystem latn
-# dflt', the leading 'script latn' below does nothing at all: the current script
-# stays 'DFLT', and 'sub A by B' is registered under DFLT/dflt. Only the rules
-# following the *second* 'script latn' land under latn. (The third 'script latn'
-# is a genuine no-op: latn/dflt is already active.)
-#
-# This is what fontmake produces for sources like Chathura, whose Glyphs feature
-# prefix declares a single 'languagesystem telu dflt' and whose feature blocks
-# each open with 'script telu; language dflt;'.
+# Chathura is a source like this: its Glyphs feature prefix declares a single
+# 'languagesystem telu dflt' and its feature blocks each open with
+# 'script telu; language dflt;'.
 languagesystem latn dflt;
 
 feature test {
