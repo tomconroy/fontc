@@ -1,0 +1,83 @@
+{
+glyphname = Atilde;
+kernLeft = A;
+kernRight = A;
+layers = (
+{
+layerId = "FCD7E481-103E-4A6C-AD70-01DA443B2AD0";
+shapes = (
+{
+ref = A;
+},
+{
+pos = (234,232);
+ref = tildecomb;
+},
+);
+width = 468;
+},
+{
+associatedMasterId = "FCD7E481-103E-4A6C-AD70-01DA443B2AD0";
+layerId = "6EB6D599-2614-4B46-9167-8EBE8B68E9E7";
+name = b;
+width = 445;
+},
+{
+layerId = "8AC5A1D3-32A8-4416-86FC-94176A419B8F";
+shapes = (
+{
+ref = A;
+},
+{
+pos = (246,232);
+ref = tildecomb;
+},
+);
+width = 492;
+},
+{
+layerId = "F66B25F0-8957-42F3-9BF7-6C5DDCB0258B";
+shapes = (
+{
+ref = A;
+},
+{
+pos = (276,232);
+ref = tildecomb;
+},
+);
+width = 551;
+},
+);
+unicode = 195;
+userData = {
+com.fontlab.hintData = {
+vhints = (
+{
+position = 232;
+width = 171;
+},
+{
+position = 734;
+width = 155;
+},
+);
+};
+com.typemytype.robofont.layerData = {
+b = {
+anchors = (
+);
+components = (
+);
+contours = (
+);
+lib = {
+};
+name = Atilde;
+unicodes = (
+);
+width = 911;
+};
+};
+};
+}

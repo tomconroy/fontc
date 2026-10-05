@@ -1,0 +1,47 @@
+{
+glyphname = Amacron;
+kernLeft = A;
+kernRight = A;
+layers = (
+{
+layerId = "FCD7E481-103E-4A6C-AD70-01DA443B2AD0";
+shapes = (
+{
+ref = A;
+},
+{
+pos = (234,232);
+ref = macroncomb;
+},
+);
+width = 468;
+},
+{
+layerId = "8AC5A1D3-32A8-4416-86FC-94176A419B8F";
+shapes = (
+{
+ref = A;
+},
+{
+pos = (246,232);
+ref = macroncomb;
+},
+);
+width = 492;
+},
+{
+layerId = "F66B25F0-8957-42F3-9BF7-6C5DDCB0258B";
+shapes = (
+{
+ref = A;
+},
+{
+pos = (276,232);
+ref = macroncomb;
+},
+);
+width = 551;
+},
+);
+unicode = 256;
+}

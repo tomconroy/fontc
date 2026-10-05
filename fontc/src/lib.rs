@@ -881,6 +881,68 @@ mod tests {
         assert!(!result.contains_glyph("skip_me"))
     }
 
+    /// Each glyphs4 fixture is its glyphs3 twin saved as format 4 by Glyphs
+    /// 4.1.1, and must compile to the same font.
+    #[rstest]
+    #[case::wght_var("WghtVar.glyphs", "WghtVar.glyphs")]
+    #[case::wght_var_package("WghtVar.glyphspackage", "WghtVar.glyphspackage")]
+    #[case::instances("WghtVar_Instances.glyphs", "WghtVar_Instances.glyphs")]
+    #[case::instances_package("WghtVar_Instances.glyphspackage", "WghtVar_Instances.glyphspackage")]
+    #[case::features_package(
+        "WghtVarWithStylisticSet.glyphs",
+        "WghtVarWithStylisticSet.glyphspackage"
+    )]
+    #[case::classes_and_prefixes_package("Oswald-AE-comb.glyphs", "Oswald-AE-comb.glyphspackage")]
+    #[case::intermediate_layer("IntermediateLayer.glyphs", "IntermediateLayer.glyphs")]
+    #[case::bracket_layer(
+        "LibreFranklin-bracketlayer.glyphs",
+        "LibreFranklin-bracketlayer.glyphs"
+    )]
+    #[case::palettes("COLRv0-2layers.glyphs", "COLRv0-2layers.glyphs")]
+    #[case::solid_colors("COLRv1-solid.glyphs", "COLRv1-solid.glyphs")]
+    #[case::gradients("COLRv1-gradient.glyphs", "COLRv1-gradient.glyphs")]
+    fn glyphs4_compiles_like_glyphs3(#[case] v3_name: &str, #[case] v4_name: &str) {
+        let v3 = TestCompile::compile_source(&format!("glyphs3/{v3_name}"));
+        let v4 = TestCompile::compile_source(&format!("glyphs4/{v4_name}"));
+        let v3_font = v3.font();
+        let v4_font = v4.font();
+        let tags = |font: &FontRef| {
+            font.table_directory
+                .table_records()
+                .iter()
+                .map(|r| r.tag())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(tags(&v3_font), tags(&v4_font));
+        for tag in tags(&v3_font) {
+            let mut v3_data = v3_font.table_data(tag).unwrap().as_bytes().to_vec();
+            let mut v4_data = v4_font.table_data(tag).unwrap().as_bytes().to_vec();
+            if tag == Tag::new(b"head") {
+                // checksumAdjustment and modified are allowed to differ, and
+                // so is created: it comes from the date Glyphs 4 records when
+                // it saves, and the glyphs3 twins have none
+                for data in [&mut v3_data, &mut v4_data] {
+                    data[8..12].fill(0);
+                    data[20..36].fill(0);
+                }
+            }
+            if tag == Tag::new(b"CPAL") && v4_name == "COLRv0-2layers.glyphs" {
+                // Glyphs 4 saves this fixture's made-up near-black palette
+                // colors as grey with the same alpha, so compare only alpha.
+                // Its own export of the two files differs the same way.
+                for data in [&mut v3_data, &mut v4_data] {
+                    let num_records = u16::from_be_bytes([data[6], data[7]]) as usize;
+                    let offset = u32::from_be_bytes(data[8..12].try_into().unwrap()) as usize;
+                    for record in data[offset..offset + 4 * num_records].chunks_mut(4) {
+                        // blue, green, red, alpha
+                        record[..3].fill(0);
+                    }
+                }
+            }
+            assert!(v3_data == v4_data, "'{tag}' differs for {v4_name}");
+        }
+    }
+
     #[test]
     fn missing_component_does_not_decompose_siblings() {
         // 'A' references 'B' (present) and 'F' (missing). A missing component
@@ -5506,6 +5568,43 @@ mod tests {
             grad.radius1().to_u16(),
         );
         assert_eq!(values, ((303, 250), 0, (303, 250), 346), "p0, r0, p1, r1");
+    }
+
+    /// A Glyphs 4 radial gradient runs from a circle at 'start' to one at
+    /// 'end', with radii relative to the bbox: multiples of sqrt(width * height)
+    #[test]
+    fn colr_gradient_glyphs4_radial() {
+        let source =
+            std::fs::read_to_string(testdata_dir().join("glyphs4/COLRv1-gradient.glyphs")).unwrap();
+        // Glyph K, bbox (63, 0) to (542, 500)
+        let k_gradient = "angle = 0;\nend = (0.5,0.5);\nendRadius = 0.70743;\nstart = (0.5,0.5);\n";
+        assert_eq!(source.matches(k_gradient).count(), 1);
+        let source = source.replace(
+            k_gradient,
+            "angle = 30;\nend = (0.6,0.7);\nendRadius = 0.6;\nstart = (0.3,0.3);\nstartRadius = 0.1;\n",
+        );
+        let temp_dir = tempdir().unwrap();
+        let path = temp_dir.path().join("COLRv1-radial.glyphs");
+        std::fs::write(&path, source).unwrap();
+        let result = TestCompile::compile_source(path.to_str().unwrap());
+        let colr = result.font().colr().expect("COLR");
+
+        let Paint::RadialGradient(grad) = root_paint_glyph(&result, &colr, "K")
+            .paint()
+            .expect("Valid paint")
+        else {
+            panic!("Expected RadialGradient");
+        };
+        let values = (
+            (grad.x0().to_i16(), grad.y0().to_i16()),
+            grad.radius0().to_u16(),
+            (grad.x1().to_i16(), grad.y1().to_i16()),
+            grad.radius1().to_u16(),
+        );
+        // What Glyphs 4.1.1 exports for this gradient; it ignores the angle.
+        //   p0 = (63 + 479 * 0.3, 500 * 0.3), r0 = 0.1 * sqrt(479 * 500)
+        //   p1 = (63 + 479 * 0.6, 500 * 0.7), r1 = 0.6 * sqrt(479 * 500)
+        assert_eq!(values, ((207, 150), 49, (350, 350), 294), "p0, r0, p1, r1");
     }
 
     #[test]

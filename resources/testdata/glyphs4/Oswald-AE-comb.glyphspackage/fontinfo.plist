@@ -1,0 +1,783 @@
+{
+.appVersion = "3223";
+.formatVersion = 4;
+axes = (
+{
+name = Weight;
+tag = wght;
+},
+);
+classes = (
+{
+automatic = 1;
+file = "@Uppercase.fea";
+name = Uppercase;
+},
+);
+customParameters = (
+{
+name = fsType;
+value = (
+);
+},
+{
+name = "Use Typo Metrics";
+value = 1;
+},
+{
+name = "Write lastChange";
+value = 0;
+},
+{
+name = "Axis Mappings";
+value = {
+wght = {
+200 = 200;
+300 = 275;
+400 = 400;
+500 = 560;
+600 = 644;
+700 = 710;
+};
+};
+},
+);
+date = "2026-10-05 15:23:14 +0000";
+featurePrefixes = (
+{
+automatic = 1;
+file = _Languagesystems.fea;
+name = Languagesystems;
+},
+);
+fontMaster = (
+{
+axesValues = (
+200,
+);
+customParameters = (
+{
+name = typoAscender;
+value = 1193;
+},
+{
+name = typoDescender;
+value = -289;
+},
+{
+name = typoLineGap;
+value = 0;
+},
+{
+name = winAscent;
+value = 1325;
+},
+{
+name = winDescent;
+value = 377;
+},
+{
+name = hheaAscender;
+value = 1193;
+},
+{
+name = hheaDescender;
+value = -289;
+},
+{
+name = hheaLineGap;
+value = 0;
+},
+);
+guides = (
+{
+pos = (261,-94);
+},
+{
+pos = (-30,-60);
+},
+);
+iconName = Light;
+id = "FCD7E481-103E-4A6C-AD70-01DA443B2AD0";
+metricValues = (
+{
+over = 9;
+pos = 810;
+},
+{
+over = 9;
+pos = 810;
+},
+{
+over = 9;
+pos = 578;
+},
+{
+over = -11;
+},
+{
+over = -7;
+pos = -190;
+},
+{
+},
+);
+name = ExtraLight;
+userData = {
+GSCornerRadius = 50;
+};
+visible = 1;
+},
+{
+axesValues = (
+400,
+);
+customParameters = (
+{
+name = typoAscender;
+value = 1193;
+},
+{
+name = typoDescender;
+value = -289;
+},
+{
+name = typoLineGap;
+value = 0;
+},
+{
+name = winAscent;
+value = 1325;
+},
+{
+name = winDescent;
+value = 377;
+},
+{
+name = hheaAscender;
+value = 1193;
+},
+{
+name = hheaDescender;
+value = -289;
+},
+{
+name = hheaLineGap;
+value = 0;
+},
+);
+guides = (
+{
+pos = (-210,-77);
+},
+{
+pos = (263,898);
+},
+{
+pos = (-580,888);
+},
+{
+pos = (-580,433);
+},
+{
+pos = (445,-16);
+},
+);
+id = "8AC5A1D3-32A8-4416-86FC-94176A419B8F";
+metricValues = (
+{
+over = 7;
+pos = 810;
+},
+{
+over = 7;
+pos = 810;
+},
+{
+over = 8;
+pos = 578;
+},
+{
+over = -9;
+},
+{
+over = -16;
+pos = -190;
+},
+{
+},
+);
+name = Regular;
+userData = {
+GSCornerRadius = 15;
+};
+},
+{
+axesValues = (
+710,
+);
+customParameters = (
+{
+name = typoAscender;
+value = 1193;
+},
+{
+name = typoDescender;
+value = -289;
+},
+{
+name = typoLineGap;
+value = 0;
+},
+{
+name = winAscent;
+value = 1325;
+},
+{
+name = winDescent;
+value = 377;
+},
+{
+name = hheaAscender;
+value = 1193;
+},
+{
+name = hheaDescender;
+value = -289;
+},
+{
+name = hheaLineGap;
+value = 0;
+},
+);
+guides = (
+{
+pos = (-203,923);
+},
+{
+pos = (-200,-119);
+},
+{
+pos = (-234,715);
+},
+{
+pos = (336,682);
+},
+{
+pos = (422,1007);
+},
+{
+pos = (-74,-72);
+},
+);
+id = "F66B25F0-8957-42F3-9BF7-6C5DDCB0258B";
+metricValues = (
+{
+over = 11;
+pos = 810;
+},
+{
+over = 11;
+pos = 810;
+},
+{
+over = 10;
+pos = 578;
+},
+{
+over = -12;
+},
+{
+over = -16;
+pos = -190;
+},
+{
+},
+);
+name = Bold;
+},
+);
+instances = (
+{
+axesValues = (
+200,
+);
+customParameters = (
+{
+name = "Remove Glyphs";
+value = (
+"Iishorttail-cy",
+"Fita-cy",
+"Izhitsa-cy",
+"Ghemiddlehook-cy",
+"Zedescender-cy",
+"Kaverticalstroke-cy",
+"Kastroke-cy",
+"Kabashkir-cy",
+"Enghe-cy",
+"Pemiddlehook-cy",
+"Pedescender-cy",
+"Haabkhasian-cy",
+"Esdescender-cy",
+"Tedescender-cy",
+"Hadescender-cy",
+"Tetse-cy",
+"Chedescender-cy",
+"Cheverticalstroke-cy",
+"Shhadescender-cy",
+"Cheabkhasian-cy",
+"Chedescenderabkhasian-cy",
+"Palochka-cy",
+"Zhebreve-cy",
+"Kahook-cy",
+"Eltail-cy",
+"Enhook-cy",
+"Chekhakassian-cy",
+"Emtail-cy",
+"Abreve-cy",
+"Adieresis-cy",
+"Aie-cy",
+"Iebreve-cy",
+"Schwadieresis-cy",
+"Zhedieresis-cy",
+"Zedieresis-cy",
+"Dzeabkhasian-cy",
+"Imacron-cy",
+"Idieresis-cy",
+"Odieresis-cy",
+"Obarreddieresis-cy",
+"Edieresis-cy",
+"Umacron-cy",
+"Udieresis-cy",
+"Uhungarumlaut-cy",
+"Chedieresis-cy",
+"Gedescender-cy",
+"Yerudieresis-cy",
+"Gestrokehook-cy",
+"Hahook-cy",
+"Hastroke-cy",
+"Reversedze-cy",
+"Elhook-cy",
+"We-cy",
+"Semisoftsign-cy",
+"Ertick-cy",
+"EnLeftHook-cy",
+"Eldescender-cy",
+"iishorttail-cy",
+"fita-cy",
+"izhitsa-cy",
+"ghemiddlehook-cy",
+"zedescender-cy",
+"kaverticalstroke-cy",
+"kastroke-cy",
+"kabashkir-cy",
+"enghe-cy",
+"pedescender-cy",
+"pemiddlehook-cy",
+"haabkhasian-cy",
+"esdescender-cy",
+"tedescender-cy",
+"hadescender-cy",
+"tetse-cy",
+"chedescender-cy",
+"cheverticalstroke-cy",
+"shhadescender-cy",
+"cheabkhasian-cy",
+"chedescenderabkhasian-cy",
+"palochka-cy",
+"zhebreve-cy",
+"kahook-cy",
+"eltail-cy",
+"enhook-cy",
+"chekhakassian-cy",
+"emtail-cy",
+"abreve-cy",
+"adieresis-cy",
+"aie-cy",
+"iebreve-cy",
+"schwadieresis-cy",
+"zhedieresis-cy",
+"zedieresis-cy",
+"dzeabkhasian-cy",
+"imacron-cy",
+"idieresis-cy",
+"odieresis-cy",
+"obarreddieresis-cy",
+"edieresis-cy",
+"umacron-cy",
+"udieresis-cy",
+"uhungarumlaut-cy",
+"chedieresis-cy",
+"gedescender-cy",
+"yerudieresis-cy",
+"gestrokehook-cy",
+"hahook-cy",
+"hastroke-cy",
+"reversedze-cy",
+"elhook-cy",
+"we-cy",
+"semisoftsign-cy",
+"ertick-cy",
+"eldescender-cy",
+hryvnia,
+tenge,
+tugrik,
+);
+},
+);
+id = "13739A0B-F713-49A2-9AD2-A2215CE8D6D4";
+instanceInterpolations = {
+"FCD7E481-103E-4A6C-AD70-01DA443B2AD0" = 1;
+};
+properties = (
+{
+key = styleNames;
+values = (
+{
+language = dflt;
+value = ExtraLight;
+},
+);
+},
+);
+weightClass = 200;
+},
+{
+axesValues = (
+275,
+);
+id = "D062175C-6194-455C-9905-D66CAA10E835";
+instanceInterpolations = {
+"8AC5A1D3-32A8-4416-86FC-94176A419B8F" = 0.375;
+"FCD7E481-103E-4A6C-AD70-01DA443B2AD0" = 0.625;
+};
+properties = (
+{
+key = styleNames;
+values = (
+{
+language = dflt;
+value = Light;
+},
+);
+},
+);
+weightClass = 300;
+},
+{
+axesValues = (
+400,
+);
+id = "EBEB2D2F-4F56-438B-8237-ACC2D631D666";
+instanceInterpolations = {
+"8AC5A1D3-32A8-4416-86FC-94176A419B8F" = 1;
+};
+properties = (
+{
+key = styleNames;
+values = (
+{
+language = dflt;
+value = Regular;
+},
+);
+},
+);
+},
+{
+axesValues = (
+560,
+);
+id = "C7E0DF6A-42A8-4A45-83D3-3B64B09B47DF";
+instanceInterpolations = {
+"8AC5A1D3-32A8-4416-86FC-94176A419B8F" = 0.48387;
+"F66B25F0-8957-42F3-9BF7-6C5DDCB0258B" = 0.51613;
+};
+properties = (
+{
+key = styleNames;
+values = (
+{
+language = dflt;
+value = Medium;
+},
+);
+},
+);
+weightClass = 500;
+},
+{
+axesValues = (
+644,
+);
+id = "A054C556-ADF0-4E0A-87FC-D23EB957C936";
+instanceInterpolations = {
+"8AC5A1D3-32A8-4416-86FC-94176A419B8F" = 0.2129;
+"F66B25F0-8957-42F3-9BF7-6C5DDCB0258B" = 0.7871;
+};
+properties = (
+{
+key = styleNames;
+values = (
+{
+language = dflt;
+value = SemiBold;
+},
+);
+},
+);
+weightClass = 600;
+},
+{
+axesValues = (
+710,
+);
+id = "FDC82F13-88C8-4C1F-925A-4E18314CE14F";
+instanceInterpolations = {
+"F66B25F0-8957-42F3-9BF7-6C5DDCB0258B" = 1;
+};
+isBold = 1;
+properties = (
+{
+key = styleNames;
+values = (
+{
+language = dflt;
+value = Bold;
+},
+);
+},
+);
+weightClass = 700;
+},
+);
+metrics = (
+{
+type = ascender;
+},
+{
+type = "cap height";
+},
+{
+type = "x-height";
+},
+{
+type = baseline;
+},
+{
+type = descender;
+},
+{
+type = "italic angle";
+},
+);
+properties = (
+{
+key = copyrights;
+values = (
+{
+language = dflt;
+value = "Copyright 2016 The Oswald Project Authors (https://github.com/googlefonts/OswaldFont)";
+},
+);
+},
+{
+key = designers;
+values = (
+{
+language = dflt;
+value = "Vernon Adams";
+},
+);
+},
+{
+key = designerURL;
+value = "http://www.sansoxygen.com";
+},
+{
+key = familyNames;
+values = (
+{
+language = dflt;
+value = Oswald;
+},
+);
+},
+{
+key = licenses;
+values = (
+{
+language = dflt;
+value = "This Font Software is licensed under the SIL Open Font License, Version 1.1. This license is available with a FAQ at: https://scripts.sil.org/OFL";
+},
+);
+},
+{
+key = licenseURL;
+value = "https://scripts.sil.org/OFL";
+},
+{
+key = manufacturers;
+values = (
+{
+language = dflt;
+value = "Vernon Adams";
+},
+);
+},
+{
+key = manufacturerURL;
+value = "http://www.sansoxygen.com";
+},
+{
+key = vendorID;
+value = newt;
+},
+);
+settings = {
+colorSpace = "apple-rgb";
+};
+unitsPerEm = 1000;
+userData = {
+com.superpolator.editor.generateInfo = "Generated with LTR Superpolator version 120823_1018_beta_";
+com.typemytype.robofont.b.layerStrokeColor = (1,0.75,0,0.7);
+com.typemytype.robofont.compileSettings.autohint = 1;
+com.typemytype.robofont.compileSettings.checkOutlines = 1;
+com.typemytype.robofont.compileSettings.decompose = 1;
+com.typemytype.robofont.compileSettings.generateFormat = 0;
+com.typemytype.robofont.compileSettings.releaseMode = 0;
+com.typemytype.robofont.foreground.layerStrokeColor = (0.5,0,0.5,0.7);
+com.typemytype.robofont.italicSlantOffset = 0;
+com.typemytype.robofont.layerOrder = (
+b,
+);
+com.typemytype.robofont.segmentType = curve;
+com.typemytype.robofont.shouldAddPointsInSplineConversion = 1;
+com.typemytype.robofont.sort = (
+{
+ascending = "Latin-1";
+type = characterSet;
+},
+);
+com.typesupply.MetricsMachine4.groupColors = {
+"@MMK_L_A" = (1,0,0,0.25);
+"@MMK_L_B" = (1,0.5,0,0.25);
+"@MMK_L_C" = (1,1,0,0.25);
+"@MMK_L_D" = (0,1,0,0.25);
+"@MMK_L_E" = (0,1,1,0.25);
+"@MMK_L_F" = (0,0.5,1,0.25);
+"@MMK_L_G" = (0,0,1,0.25);
+"@MMK_L_H" = (0.5,0,1,0.25);
+"@MMK_L_I" = (1,0,1,0.25);
+"@MMK_L_J" = (1,0,0.5,0.25);
+"@MMK_L_K" = (1,0,0,0.25);
+"@MMK_L_L" = (1,0.5,0,0.25);
+"@MMK_L_M" = (1,1,0,0.25);
+"@MMK_L_N" = (0,1,0,0.25);
+"@MMK_L_O" = (0,1,1,0.25);
+"@MMK_L_P" = (0,0.5,1,0.25);
+"@MMK_L_R" = (0,0,1,0.25);
+"@MMK_L_S" = (0.5,0,1,0.25);
+"@MMK_L_T" = (1,0,1,0.25);
+"@MMK_L_U" = (1,0,0.5,0.25);
+"@MMK_L_W" = (1,0,0,0.25);
+"@MMK_L_Y" = (1,0.5,0,0.25);
+"@MMK_L_Z" = (1,1,0,0.25);
+"@MMK_L_a" = (0,1,0,0.25);
+"@MMK_L_afii10020" = (0,1,1,0.25);
+"@MMK_L_afii10022" = (0,0.5,1,0.25);
+"@MMK_L_afii10026" = (0,0,1,0.25);
+"@MMK_L_afii10028" = (0.5,0,1,0.25);
+"@MMK_L_afii10037" = (1,0,1,0.25);
+"@MMK_L_afii10055" = (1,0,0.5,0.25);
+"@MMK_L_afii10068" = (1,0,0,0.25);
+"@MMK_L_afii10070" = (1,0.5,0,0.25);
+"@MMK_L_afii10074" = (1,1,0,0.25);
+"@MMK_L_afii10076" = (0,1,0,0.25);
+"@MMK_L_afii10085" = (0,1,1,0.25);
+"@MMK_L_afii10103" = (0,0.5,1,0.25);
+"@MMK_L_b" = (0,0,1,0.25);
+"@MMK_L_c" = (0.5,0,1,0.25);
+"@MMK_L_d" = (1,0,1,0.25);
+"@MMK_L_e" = (1,0,0.5,0.25);
+"@MMK_L_f" = (1,0,0,0.25);
+"@MMK_L_g" = (1,0.5,0,0.25);
+"@MMK_L_h" = (1,1,0,0.25);
+"@MMK_L_i" = (0,1,0,0.25);
+"@MMK_L_j" = (0,1,1,0.25);
+"@MMK_L_k" = (0,0.5,1,0.25);
+"@MMK_L_l" = (0,0,1,0.25);
+"@MMK_L_m" = (0.5,0,1,0.25);
+"@MMK_L_n" = (1,0,1,0.25);
+"@MMK_L_o" = (1,0,0.5,0.25);
+"@MMK_L_p" = (1,0,0,0.25);
+"@MMK_L_r" = (1,0.5,0,0.25);
+"@MMK_L_s" = (1,1,0,0.25);
+"@MMK_L_t" = (0,1,0,0.25);
+"@MMK_L_u" = (0,1,1,0.25);
+"@MMK_L_w" = (0,0.5,1,0.25);
+"@MMK_L_y" = (0,0,1,0.25);
+"@MMK_L_z" = (0.5,0,1,0.25);
+"@MMK_R_A" = (1,0,0,0.25);
+"@MMK_R_B" = (1,0.5,0,0.25);
+"@MMK_R_C" = (1,1,0,0.25);
+"@MMK_R_D" = (0,1,0,0.25);
+"@MMK_R_E" = (0,1,1,0.25);
+"@MMK_R_F" = (0,0.5,1,0.25);
+"@MMK_R_G" = (0,0,1,0.25);
+"@MMK_R_H" = (0.5,0,1,0.25);
+"@MMK_R_I" = (1,0,1,0.25);
+"@MMK_R_J" = (1,0,0.5,0.25);
+"@MMK_R_K" = (1,0,0,0.25);
+"@MMK_R_L" = (1,0.5,0,0.25);
+"@MMK_R_M" = (1,1,0,0.25);
+"@MMK_R_N" = (0,1,0,0.25);
+"@MMK_R_O" = (0,1,1,0.25);
+"@MMK_R_P" = (0,0.5,1,0.25);
+"@MMK_R_R" = (0,0,1,0.25);
+"@MMK_R_S" = (0.5,0,1,0.25);
+"@MMK_R_T" = (1,0,1,0.25);
+"@MMK_R_U" = (1,0,0.5,0.25);
+"@MMK_R_W" = (1,0,0,0.25);
+"@MMK_R_Y" = (1,0.5,0,0.25);
+"@MMK_R_Z" = (1,1,0,0.25);
+"@MMK_R_a" = (0,1,0,0.25);
+"@MMK_R_afii10020" = (0,1,1,0.25);
+"@MMK_R_afii10022" = (0,0.5,1,0.25);
+"@MMK_R_afii10026" = (0,0,1,0.25);
+"@MMK_R_afii10028" = (0.5,0,1,0.25);
+"@MMK_R_afii10037" = (1,0,1,0.25);
+"@MMK_R_afii10055" = (1,0,0.5,0.25);
+"@MMK_R_afii10068" = (1,0,0,0.25);
+"@MMK_R_afii10070" = (1,0.5,0,0.25);
+"@MMK_R_afii10074" = (1,1,0,0.25);
+"@MMK_R_afii10076" = (0,1,0,0.25);
+"@MMK_R_afii10085" = (0,1,1,0.25);
+"@MMK_R_afii10103" = (0,0.5,1,0.25);
+"@MMK_R_b" = (0,0,1,0.25);
+"@MMK_R_c" = (0.5,0,1,0.25);
+"@MMK_R_d" = (1,0,1,0.25);
+"@MMK_R_e" = (1,0,0.5,0.25);
+"@MMK_R_f" = (1,0,0,0.25);
+"@MMK_R_g" = (1,0.5,0,0.25);
+"@MMK_R_h" = (1,1,0,0.25);
+"@MMK_R_i" = (0,1,0,0.25);
+"@MMK_R_j" = (0,1,1,0.25);
+"@MMK_R_k" = (0,0.5,1,0.25);
+"@MMK_R_l" = (0,0,1,0.25);
+"@MMK_R_m" = (0.5,0,1,0.25);
+"@MMK_R_n" = (1,0,1,0.25);
+"@MMK_R_o" = (1,0,0.5,0.25);
+"@MMK_R_p" = (1,0,0,0.25);
+"@MMK_R_r" = (1,0.5,0,0.25);
+"@MMK_R_s" = (1,1,0,0.25);
+"@MMK_R_t" = (0,1,0,0.25);
+"@MMK_R_u" = (0,1,1,0.25);
+"@MMK_R_w" = (0,0.5,1,0.25);
+"@MMK_R_y" = (0,0,1,0.25);
+"@MMK_R_z" = (0.5,0,1,0.25);
+};
+};
+versionMajor = 4;
+versionMinor = 103;
+}

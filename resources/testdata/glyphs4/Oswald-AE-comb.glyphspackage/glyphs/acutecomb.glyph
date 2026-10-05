@@ -1,0 +1,91 @@
+{
+glyphname = acutecomb;
+layers = (
+{
+anchors = (
+{
+name = _top;
+pos = (0,578);
+},
+{
+name = top;
+pos = (0,810);
+},
+);
+layerId = "FCD7E481-103E-4A6C-AD70-01DA443B2AD0";
+shapes = (
+{
+closed = 1;
+nodes = (
+(15,626,l),
+(105,820,l),
+(51,820,l),
+(-13,626,l),
+);
+},
+);
+width = 0;
+},
+{
+anchors = (
+{
+name = _top;
+pos = (0,578);
+},
+{
+name = top;
+pos = (0,810);
+},
+);
+layerId = "8AC5A1D3-32A8-4416-86FC-94176A419B8F";
+shapes = (
+{
+closed = 1;
+nodes = (
+(26,626,l),
+(138,824,l),
+(31,824,l),
+(-28,626,l),
+);
+},
+);
+width = 0;
+},
+{
+anchors = (
+{
+name = _top;
+pos = (0,578);
+},
+{
+name = top;
+pos = (0,810);
+},
+);
+layerId = "F66B25F0-8957-42F3-9BF7-6C5DDCB0258B";
+shapes = (
+{
+closed = 1;
+nodes = (
+(49,642,l),
+(175,843,l),
+(9,843,l),
+(-54,642,l),
+);
+},
+);
+width = 0;
+},
+);
+unicode = 769;
+userData = {
+com.fontlab.hintData = {
+hhints = (
+{
+position = 1243;
+width = 415;
+},
+);
+};
+};
+}
