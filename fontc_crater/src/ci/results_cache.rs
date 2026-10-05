@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 
 use crate::{
     RunResult, Target,
-    args::Flavor,
+    args::{Flavor, mode_name},
     ttx_diff_runner::{DiffError, DiffOutput},
 };
 
@@ -90,13 +90,14 @@ impl ResultsCache {
     /// argument is the directory that will contain the cache dir.
     ///
     /// By convention this is the same directory where we checkout git repos.
-    /// The ttf cache lives where it always did; other flavors get a sibling
-    /// subdirectory, since the cached ttx/markkern files are named the same
-    /// but their contents differ per flavor.
-    pub fn in_dir(path: &Path, flavor: Flavor) -> Self {
+    /// The variable ttf cache lives where it always did; every other
+    /// combination of flavor and instance gets a sibling subdirectory, since
+    /// the cached ttx/markkern files are named the same but their contents
+    /// differ per mode.
+    pub fn in_dir(path: &Path, flavor: Flavor, instance: Option<&str>) -> Self {
         let mut base_results_cache_dir = path.join(CACHE_DIR_NAME);
-        if flavor != Flavor::Ttf {
-            base_results_cache_dir.push(flavor.to_string());
+        if let Some(mode) = mode_name(flavor, instance) {
+            base_results_cache_dir.push(mode);
         }
         Self {
             base_results_cache_dir,
@@ -234,7 +235,7 @@ mod tests {
     #[test]
     fn result_round_trip() {
         let tempdir = tempfile::tempdir().unwrap();
-        let cache = ResultsCache::in_dir(tempdir.path(), Flavor::Ttf);
+        let cache = ResultsCache::in_dir(tempdir.path(), Flavor::Ttf, None);
         let target = test_target();
         assert!(cache.load_result(&target).is_none());
 
@@ -258,7 +259,7 @@ mod tests {
     #[test]
     fn compile_failures_are_cached() {
         let tempdir = tempfile::tempdir().unwrap();
-        let cache = ResultsCache::in_dir(tempdir.path(), Flavor::Ttf);
+        let cache = ResultsCache::in_dir(tempdir.path(), Flavor::Ttf, None);
         let target = test_target();
         cache.save_result(
             &target,
@@ -283,7 +284,7 @@ mod tests {
     #[test]
     fn runtime_failures_are_not_cached() {
         let tempdir = tempfile::tempdir().unwrap();
-        let cache = ResultsCache::in_dir(tempdir.path(), Flavor::Ttf);
+        let cache = ResultsCache::in_dir(tempdir.path(), Flavor::Ttf, None);
         let target = test_target();
         cache.save_result(
             &target,
@@ -312,7 +313,7 @@ mod tests {
     #[test]
     fn font_alone_is_enough_to_cache() {
         let tempdir = tempfile::tempdir().unwrap();
-        let cache = ResultsCache::in_dir(tempdir.path(), Flavor::Ttf);
+        let cache = ResultsCache::in_dir(tempdir.path(), Flavor::Ttf, None);
         let target = test_target();
         let build_dir = tempdir.path().join("build");
         write_files(&build_dir, &[FONT_FILE]);
@@ -329,7 +330,7 @@ mod tests {
     #[test]
     fn derived_files_are_added_to_an_existing_entry() {
         let tempdir = tempfile::tempdir().unwrap();
-        let cache = ResultsCache::in_dir(tempdir.path(), Flavor::Ttf);
+        let cache = ResultsCache::in_dir(tempdir.path(), Flavor::Ttf, None);
         let target = test_target();
         let build_dir = tempdir.path().join("build");
         write_files(&build_dir, &[FONT_FILE]);
@@ -352,7 +353,7 @@ mod tests {
     #[test]
     fn nothing_is_cached_without_the_font() {
         let tempdir = tempfile::tempdir().unwrap();
-        let cache = ResultsCache::in_dir(tempdir.path(), Flavor::Ttf);
+        let cache = ResultsCache::in_dir(tempdir.path(), Flavor::Ttf, None);
         let target = test_target();
         let build_dir = tempdir.path().join("build");
         write_files(&build_dir, &DERIVED_FILES);
@@ -368,7 +369,7 @@ mod tests {
     #[test]
     fn failure_is_cached_in_place_of_the_font() {
         let tempdir = tempfile::tempdir().unwrap();
-        let cache = ResultsCache::in_dir(tempdir.path(), Flavor::Ttf);
+        let cache = ResultsCache::in_dir(tempdir.path(), Flavor::Ttf, None);
         let target = test_target();
         let build_dir = tempdir.path().join("build");
         write_files(&build_dir, &[FAILURE_FILE]);
@@ -385,7 +386,7 @@ mod tests {
     #[test]
     fn font_takes_precedence_over_failure() {
         let tempdir = tempfile::tempdir().unwrap();
-        let cache = ResultsCache::in_dir(tempdir.path(), Flavor::Ttf);
+        let cache = ResultsCache::in_dir(tempdir.path(), Flavor::Ttf, None);
         let target = test_target();
         write_files(
             &target.cache_dir(&cache.base_results_cache_dir),
@@ -403,7 +404,7 @@ mod tests {
     #[test]
     fn delete_all_clears_results() {
         let tempdir = tempfile::tempdir().unwrap();
-        let cache = ResultsCache::in_dir(tempdir.path(), Flavor::Ttf);
+        let cache = ResultsCache::in_dir(tempdir.path(), Flavor::Ttf, None);
         let target = test_target();
         cache.save_result(
             &target,
@@ -413,5 +414,28 @@ mod tests {
         assert!(cache.load_result(&target).is_some());
         cache.delete_all();
         assert!(cache.load_result(&target).is_none());
+    }
+
+    #[test]
+    fn each_mode_caches_separately() {
+        let root = Path::new("/cache");
+        let dir = |flavor, instance| {
+            ResultsCache::in_dir(root, flavor, instance)
+                .base_results_cache_dir
+                .to_str()
+                .unwrap()
+                .to_owned()
+        };
+        // the pre-existing variable ttf cache stays exactly where it was
+        assert_eq!(dir(Flavor::Ttf, None), "/cache/crater_cached_results");
+        assert_eq!(dir(Flavor::Otf, None), "/cache/crater_cached_results/otf");
+        assert_eq!(
+            dir(Flavor::Ttf, Some("@default")),
+            "/cache/crater_cached_results/instance@default"
+        );
+        assert_eq!(
+            dir(Flavor::Otf, Some("@default")),
+            "/cache/crater_cached_results/otf-instance@default"
+        );
     }
 }
