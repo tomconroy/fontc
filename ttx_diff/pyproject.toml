@@ -41,6 +41,9 @@ test = [
     "pytest>=7.0",
     "pytest-cov",
 ]
+glyphsapp = [
+    "uharfbuzz",
+]
 dev = [
     "pytest>=7.0",
     "pytest-cov",
@@ -54,6 +57,7 @@ Issues = "https://github.com/googlefonts/fontc/issues"
 
 [project.scripts]
 ttx-diff = "ttx_diff.cli:main"
+glyphsapp-diff = "ttx_diff.glyphsapp:cli"
 
 [tool.setuptools]
 package-dir = {"" = "src"}

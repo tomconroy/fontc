@@ -96,6 +96,48 @@ Compare using gftools build pipeline:
 ttx-diff --compare gftools --config config.yaml path/to/source.glyphs
 ```
 
+## Comparing against Glyphs.app
+
+`glyphsapp-diff` (`python -m ttx_diff.glyphsapp`) compares fontc against the
+font Glyphs.app itself exports, the ground truth for how a `.glyphs` source
+should read. It needs **macOS, an installed and licensed Glyphs.app, and
+[glyphs-cli](https://pypi.org/project/glyphs-cli/)**, which runs the app's
+exporter headlessly (the app doesn't have to be running).
+`pip install -e .[glyphsapp]` adds `uharfbuzz` for the behaviour check.
+
+A side is `fontc` or `glyphsapp:<build>` (`glyphsapp:4108`, or `glyphsapp:3`
+for the newest Glyphs 3). Each side can read its own source, so it also
+compares two Glyphs versions, or two formats of one design:
+
+```bash
+# variable TTF: fontc's default build vs Glyphs' variable instance
+# (synthesized with `glyphs run` if the source has none)
+glyphsapp-diff --mode variable --reference glyphsapp:4108 Font.glyphs
+
+# static TTF: `fontc --instance Bold` vs Glyphs' export of Bold
+glyphsapp-diff --mode static-tt --instance Bold --reference glyphsapp:4108 Font.glyphs
+
+# static CFF: `fontc --instance NAME --flavor otf`, for every exported instance
+glyphsapp-diff --mode static-cff --instance all --reference glyphsapp:4108 Font.glyphs
+
+# Glyphs 4 on a format 4 source vs Glyphs 3 on its format 3 twin
+glyphsapp-diff --mode variable --compiler glyphsapp:4108 --reference glyphsapp:3532 \
+  --reference_source v3/Font.glyphs v4/Font.glyphs
+```
+
+It reports each table as identical or different, with a unified diff written
+next to the normalized dumps. It uses ttx_diff's normalizations plus a few for
+Glyphs: timestamps, name IDs 3 and 5 and Glyphs' stub `DSIG` are ignored, and
+CFF is desubroutinized. Glyphs exports without autohinting, overlap removal or
+subroutines, the way fontc builds, and with third-party plug-ins disabled.
+
+Because the two compilers legitimately pack tables differently, it also checks
+behaviour: harfbuzz shapes every character, every pair and each non-default
+feature, comparing glyph names, advances and offsets; and each glyph's advance
+and outline bounds are compared. A variable font is checked at its default,
+every named instance and every master location (instantiated with fontTools'
+instancer). Builds are cached in `--outdir`; `--rebuild` forces them.
+
 ## Development
 
 Running tests
