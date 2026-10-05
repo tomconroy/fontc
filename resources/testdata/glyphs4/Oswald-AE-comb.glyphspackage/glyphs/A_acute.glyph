@@ -1,0 +1,85 @@
+{
+glyphname = Aacute;
+kernLeft = A;
+kernRight = A;
+layers = (
+{
+layerId = "FCD7E481-103E-4A6C-AD70-01DA443B2AD0";
+shapes = (
+{
+alignment = -1;
+ref = A;
+},
+{
+alignment = -1;
+pos = (234,232);
+ref = acutecomb;
+},
+);
+width = 468;
+},
+{
+associatedMasterId = "FCD7E481-103E-4A6C-AD70-01DA443B2AD0";
+layerId = "01A9BCAF-378C-48E0-8F53-7DF3B96414DB";
+name = b;
+width = 445;
+},
+{
+layerId = "8AC5A1D3-32A8-4416-86FC-94176A419B8F";
+shapes = (
+{
+alignment = -1;
+ref = A;
+},
+{
+alignment = -1;
+pos = (246,232);
+ref = acutecomb;
+},
+);
+width = 492;
+},
+{
+layerId = "F66B25F0-8957-42F3-9BF7-6C5DDCB0258B";
+shapes = (
+{
+alignment = -1;
+ref = A;
+},
+{
+alignment = -1;
+pos = (276,232);
+ref = acutecomb;
+},
+);
+width = 551;
+},
+);
+unicode = 193;
+userData = {
+com.fontlab.hintData = {
+hhints = (
+{
+position = 1806;
+width = 415;
+},
+);
+};
+com.typemytype.robofont.layerData = {
+b = {
+anchors = (
+);
+components = (
+);
+contours = (
+);
+lib = {
+};
+name = Aacute;
+unicodes = (
+);
+width = 911;
+};
+};
+};
+}

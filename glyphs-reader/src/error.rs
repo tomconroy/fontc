@@ -34,6 +34,12 @@ pub enum Error {
         component: SmolStr,
         issue: BadSmartComponent,
     },
+    #[error("Glyph '{glyph}' layer '{layer}': {issue}")]
+    BadLayer {
+        glyph: SmolStr,
+        layer: String,
+        issue: String,
+    },
     #[error("Bad corner component for glyph '{glyph}': {issue}")]
     BadCornerComponent {
         glyph: SmolStr,
