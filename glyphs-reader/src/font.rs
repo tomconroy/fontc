@@ -2769,6 +2769,10 @@ impl RawInstance {
     fn is_active(&self) -> bool {
         self.exports.unwrap_or(1) != 0 && self.active.unwrap_or(1) != 0
     }
+
+    fn is_variable(&self) -> bool {
+        self.type_.as_deref().map(InstanceType::from) == Some(InstanceType::Variable)
+    }
 }
 
 trait GlyphsV2OrderedAxes {
@@ -3680,14 +3684,35 @@ fn parse_codepoint_str(s: &str, radix: u32) -> Vec<u32> {
 fn default_master_idx(raw_font: &mut RawFont) -> usize {
     // Prefer an explicit origin
     // https://github.com/googlefonts/fontmake-rs/issues/44
-    if let Some(master_idx) = raw_font
+    let font_origin = raw_font
         .custom_parameters
-        .take_string("Variable Font Origin")
+        .take_string("Variable Font Origin");
+    // Glyphs 3 saves the origin on the variable font instance, where it overrides
+    // the font-level one. Glyphs exports one font per variable instance; we build
+    // a single one, so the first active variable instance decides.
+    let mut instance_origin = None;
+    for instance in raw_font.instances.iter_mut().filter(|i| i.is_variable()) {
+        let origin = instance
+            .custom_parameters
+            .take_string("Variable Font Origin");
+        if instance.is_active() && instance_origin.is_none() {
+            instance_origin = Some(origin);
+        }
+    }
+    // Glyphs accepts a master id or, failing that, a master name
+    if let Some(master_idx) = instance_origin
+        .flatten()
+        .or(font_origin)
         .and_then(|origin| {
-            raw_font
-                .font_master
+            let masters = &raw_font.font_master;
+            masters
                 .iter()
                 .position(|master| master.id == origin)
+                .or_else(|| {
+                    masters
+                        .iter()
+                        .position(|master| master.name.as_deref() == Some(origin.as_str()))
+                })
         })
     {
         return master_idx;
@@ -5252,18 +5277,20 @@ impl TryFrom<RawFont> for Font {
         let classes_name_user_locations =
             from.format_version.is_v2() && !masters_have_axis_locations;
 
+        // parameters like "Axis Location", "Axis Mappings" and "Variable Font Origin" are
+        // handled separately from to_custom_params() and need to be taken before the latter
+        // is called, to avoid spurious "unknown custom parameter" warnings
+        // https://github.com/googlefonts/fontc/issues/1682
+        // Variable instances can carry "Variable Font Origin" too, so this comes first.
+        let default_master_idx = default_master_idx(&mut from);
+
         let instances: Vec<_> = from
             .instances
             .iter_mut()
             .map(|ri| Instance::new(&from.axes, ri, classes_name_user_locations))
             .collect::<Result<Vec<_>, Error>>()?;
 
-        // parameters like "Axis Location", "Axis Mappings" and "Variable Font Origin" are
-        // handled separately from to_custom_params() and need to be taken before the latter
-        // is called, to avoid spurious "unknown custom parameter" warnings
-        // https://github.com/googlefonts/fontc/issues/1682
         let axis_mappings = UserToDesignMapping::new(&mut from, &instances);
-        let default_master_idx = default_master_idx(&mut from);
 
         let mut custom_parameters = from.custom_parameters.to_custom_params(ParamOwner::Font)?;
 
@@ -7180,6 +7207,47 @@ slant = (10);
         // string as an integer.
         let font = Font::load(&glyphs3_dir().join("CustomOrigin.glyphs")).unwrap();
         assert_eq!(1, font.default_master_idx);
+    }
+
+    // Glyphs 3 saves 'Variable Font Origin' on the variable font instance, where it
+    // overrides the font-level parameter, in either file format
+    #[rstest]
+    #[case::instance_only(glyphs3_dir().join("WghtVar_3master_InstanceOrigin.glyphs"), 2)]
+    #[case::instance_overrides_font(
+        glyphs3_dir().join("WghtVar_3master_FontAndInstanceOrigin.glyphs"),
+        2
+    )]
+    #[case::glyphs2(glyphs2_dir().join("WghtVar_InstanceOrigin.glyphs"), 1)]
+    fn vf_origin_on_variable_instance(#[case] path: PathBuf, #[case] expected: usize) {
+        let font = Font::load(&path).unwrap();
+        assert_eq!(expected, font.default_master_idx);
+    }
+
+    #[test]
+    fn vf_origin_on_inactive_variable_instance_is_ignored() {
+        let path = glyphs3_dir().join("WghtVar_3master_FontAndInstanceOrigin.glyphs");
+        let raw = std::fs::read_to_string(path).unwrap();
+        let raw = raw.replace(
+            "name = Regular;\ntype = variable;",
+            "exports = 0;\nname = Regular;\ntype = variable;",
+        );
+        let font = Font::load_from_string(&raw).unwrap();
+        // the font-level origin, Thin
+        assert_eq!(1, font.default_master_idx);
+    }
+
+    #[test]
+    fn vf_origin_master_name() {
+        // Glyphs also accepts a master name, when no master has that id
+        let path = glyphs3_dir().join("WghtVar_3master_InstanceOrigin.glyphs");
+        let raw = std::fs::read_to_string(path).unwrap();
+        let by_name = raw.replace(
+            "value = \"E09E0C54-128D-4FEA-B209-1B70BEFE300B\";",
+            "value = Bold;",
+        );
+        assert_ne!(raw, by_name);
+        let font = Font::load_from_string(&by_name).unwrap();
+        assert_eq!(2, font.default_master_idx);
     }
 
     #[rstest]

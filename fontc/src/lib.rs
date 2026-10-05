@@ -4623,6 +4623,16 @@ mod tests {
     }
 
     #[test]
+    fn default_master_from_variable_instance_origin() {
+        // 'Variable Font Origin' (Bold) is only on the variable font instance
+        let compile = TestCompile::compile_source("glyphs3/WghtVar_3master_InstanceOrigin.glyphs");
+        let font = compile.font();
+
+        assert_eq!(vec![(Tag::new(b"wght"), 200.0, 700.0, 700.0)], axes(&font),);
+        assert_eq!(700, font.os2().unwrap().us_weight_class());
+    }
+
+    #[test]
     fn os2_width_class_matches_default_wdth_glyphs2() {
         let compile = TestCompile::compile_source("glyphs2/WdthVar.glyphs");
         let font = compile.font();
