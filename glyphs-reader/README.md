@@ -4,7 +4,7 @@
 [![Docs.rs](https://docs.rs/glyphs-reader/badge.svg)](https://docs.rs/glyphs-reader)
 [![MIT/Apache 2.0](https://img.shields.io/badge/license-MIT%2FApache-blue.svg)](#license)
 
-This crate is a lightweight library for reading Glyphs 2 and Glyphs 3 font files, with support for writing the underlying Property List (`Plist`) format.
+This crate is a lightweight library for reading Glyphs 2, 3 and 4 font files, with support for writing the underlying Property List (`Plist`) format.
 
 It is part of [`fontc`], a font compiler.
 
