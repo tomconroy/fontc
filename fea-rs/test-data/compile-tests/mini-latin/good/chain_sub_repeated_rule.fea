@@ -1,0 +1,17 @@
+# reduced from the calt feature of ClimateCrisis (googlefonts/fontc#1849),
+# which repeats one of its rules verbatim.
+#
+# Consecutive rules that share prefix, suffix and lookups are merged into a
+# single rule with a wider input position, but the merge must drop duplicate
+# glyphs (as fonttools does, by merging into a set): a repeated rule that
+# leaves 'i' in the input position twice would make the input look like a
+# multi-glyph class, and that would disqualify the whole lookup from format 1,
+# which is by far the smallest encoding here.
+feature calt {
+    sub a a' by A;
+    sub b b' by B;
+    sub c c' by C;
+    sub i i' by I;
+    sub i i' by I;
+    sub l l' by L;
+} calt;
