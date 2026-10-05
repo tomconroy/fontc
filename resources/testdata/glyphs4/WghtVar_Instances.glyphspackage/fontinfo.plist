@@ -1,0 +1,172 @@
+{
+.appVersion = "4107";
+.formatVersion = 4;
+axes = (
+{
+name = Weight;
+tag = wght;
+},
+);
+fontMaster = (
+{
+axesValues = (
+400,
+);
+id = m01;
+metricValues = (
+{
+over = 16;
+pos = 737;
+},
+{
+over = -16;
+},
+{
+over = -16;
+pos = -42;
+},
+{
+pos = 702;
+},
+{
+pos = 501;
+},
+);
+name = Regular;
+},
+{
+axesValues = (
+700,
+);
+iconName = Bold;
+id = "E09E0C54-128D-4FEA-B209-1B70BEFE300B";
+metricValues = (
+{
+pos = 800;
+},
+{
+},
+{
+pos = -200;
+},
+{
+pos = 700;
+},
+{
+pos = 500;
+},
+);
+name = Bold;
+},
+);
+instances = (
+{
+axesValues = (
+400,
+);
+id = "EADED8FF-6F82-50B0-9858-7B7C051663E5";
+instanceInterpolations = {
+m01 = 1;
+};
+properties = (
+{
+key = styleNames;
+values = (
+{
+language = dflt;
+value = Regular;
+},
+);
+},
+);
+},
+{
+axesValues = (
+700,
+);
+id = "063482FE-E823-513B-B992-2D39749870F0";
+instanceInterpolations = {
+"E09E0C54-128D-4FEA-B209-1B70BEFE300B" = 1;
+};
+isBold = 1;
+linkStyle = Regular;
+properties = (
+{
+key = styleNames;
+values = (
+{
+language = dflt;
+value = Bold;
+},
+);
+},
+);
+weightClass = 700;
+},
+);
+metrics = (
+{
+type = ascender;
+},
+{
+type = baseline;
+},
+{
+type = descender;
+},
+{
+type = "cap height";
+},
+{
+type = "x-height";
+},
+);
+properties = (
+{
+key = copyrights;
+values = (
+{
+language = dflt;
+value = "Copy!";
+},
+);
+},
+{
+key = descriptions;
+values = (
+{
+language = dflt;
+value = "The greatest weight var";
+},
+{
+language = ESP;
+value = "The greatest Spanish weight var";
+},
+);
+},
+{
+key = familyNames;
+values = (
+{
+language = dflt;
+value = WghtVar;
+},
+{
+language = ESP;
+value = SpanishWghtVar;
+},
+);
+},
+{
+key = licenseURL;
+value = "https://example.com/my/font/license";
+},
+{
+key = versionString;
+value = "New Value";
+},
+);
+unitsPerEm = 1000;
+versionMajor = 42;
+versionMinor = 42;
+}

@@ -1,0 +1,119 @@
+{
+glyphname = macroncomb;
+layers = (
+{
+anchors = (
+{
+name = _top;
+pos = (0,578);
+},
+{
+name = top;
+pos = (0,810);
+},
+);
+layerId = "FCD7E481-103E-4A6C-AD70-01DA443B2AD0";
+shapes = (
+{
+closed = 1;
+nodes = (
+(86,700,l),
+(86,740,l),
+(-86,740,l),
+(-86,700,l),
+);
+},
+);
+width = 0;
+},
+{
+associatedMasterId = "FCD7E481-103E-4A6C-AD70-01DA443B2AD0";
+layerId = "3786F0BD-2586-4AD4-891B-63B8B4913530";
+name = b;
+width = 136;
+},
+{
+anchors = (
+{
+name = _top;
+pos = (0,578);
+},
+{
+name = top;
+pos = (0,810);
+},
+);
+layerId = "8AC5A1D3-32A8-4416-86FC-94176A419B8F";
+shapes = (
+{
+closed = 1;
+nodes = (
+(96,685,l),
+(96,750,l),
+(-96,750,l),
+(-96,685,l),
+);
+},
+);
+width = 0;
+},
+{
+anchors = (
+{
+name = _top;
+pos = (0,578);
+},
+{
+name = top;
+pos = (0,810);
+},
+);
+layerId = "F66B25F0-8957-42F3-9BF7-6C5DDCB0258B";
+shapes = (
+{
+closed = 1;
+nodes = (
+(138,666,l),
+(138,743,l),
+(-138,743,l),
+(-138,666,l),
+);
+},
+);
+width = 0;
+},
+);
+unicode = 772;
+userData = {
+com.fontlab.hintData = {
+hhints = (
+{
+position = 1495;
+width = 163;
+},
+);
+vhints = (
+{
+position = -138;
+width = 562;
+},
+);
+};
+com.typemytype.robofont.layerData = {
+b = {
+anchors = (
+);
+components = (
+);
+contours = (
+);
+lib = {
+};
+name = uni0304;
+unicodes = (
+);
+width = 278;
+};
+};
+};
+}

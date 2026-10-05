@@ -1,0 +1,43 @@
+{
+glyphname = nbspace;
+layers = (
+{
+layerId = "FCD7E481-103E-4A6C-AD70-01DA443B2AD0";
+width = 189;
+},
+{
+associatedMasterId = "FCD7E481-103E-4A6C-AD70-01DA443B2AD0";
+layerId = "4CF54DE8-12B7-4FD9-86A8-65362EEF6EBA";
+name = b;
+width = 266;
+},
+{
+layerId = "8AC5A1D3-32A8-4416-86FC-94176A419B8F";
+width = 229;
+},
+{
+layerId = "F66B25F0-8957-42F3-9BF7-6C5DDCB0258B";
+width = 256.125;
+},
+);
+metricWidth = space;
+unicode = 160;
+userData = {
+com.typemytype.robofont.layerData = {
+b = {
+anchors = (
+);
+components = (
+);
+contours = (
+);
+lib = {
+};
+name = uni00A0;
+unicodes = (
+);
+width = 544;
+};
+};
+};
+}
