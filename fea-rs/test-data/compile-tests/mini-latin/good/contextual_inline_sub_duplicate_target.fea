@@ -1,0 +1,15 @@
+# fonttools zips an inline single substitution's target and replacement into a
+# map before it looks for an anonymous lookup to reuse, so C -- which appears
+# twice in the target class and is finally replaced by G, not E -- is compared
+# only in its final form, and the second rule reuses the first rule's lookup
+# instead of making a new one.
+#
+# Briem Hand is a source that hits this: its ccmp lookups repeat one contextual
+# rule per context with the same mark class as both target and replacement, and
+# that class lists a couple of glyphs twice.
+feature test {
+    lookup one {
+        sub [A B] [C D C]' by [E F G];
+        sub [I J] [C D C]' by [E F G];
+    } one;
+} test;

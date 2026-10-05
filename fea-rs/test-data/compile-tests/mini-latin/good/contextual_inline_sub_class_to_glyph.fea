@@ -1,0 +1,10 @@
+# the other half of the same collapse: 'by E' applies to every member of the
+# target class, so the second rule's mapping is {C: E, D: E} and it conflicts
+# with the first rule's {C: E, D: F} at D. Comparing only the first pair would
+# reuse the first lookup and quietly overwrite its D.
+feature test {
+    lookup one {
+        sub [A B] [C D]' by [E F];
+        sub [I J] [C D]' by E;
+    } one;
+} test;
