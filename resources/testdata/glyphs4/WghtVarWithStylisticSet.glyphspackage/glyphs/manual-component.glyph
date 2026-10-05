@@ -1,0 +1,37 @@
+{
+glyphname = "manual-component";
+layers = (
+{
+layerId = m01;
+shapes = (
+{
+alignment = -1;
+pos = (0,100);
+ref = hyphen;
+},
+{
+alignment = -1;
+ref = hyphen;
+},
+);
+width = 600;
+},
+{
+layerId = "E09E0C54-128D-4FEA-B209-1B70BEFE300B";
+shapes = (
+{
+alignment = -1;
+pos = (10,100);
+ref = hyphen;
+scale = (1.15,1.25);
+},
+{
+alignment = -1;
+ref = hyphen;
+},
+);
+width = 600;
+},
+);
+unicode = 61;
+}
