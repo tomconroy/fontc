@@ -86,6 +86,18 @@ fn scale_gradient_radius(bbox: &Bbox, center_pct_x: f64, center_pct_y: f64) -> u
     max_dist_squared.sqrt().ot_round()
 }
 
+/// Scale a gradient radius relative to the bounding box to font units.
+///
+/// The unit is the square root of the bbox's width times its height, as in
+/// Glyphs 4: it saves a Glyphs 3 radial gradient, which reaches the farthest
+/// bbox corner, with that distance divided by this unit as its radius, and
+/// its export multiplies it back.
+fn scale_relative_radius(bbox: &Bbox, radius: f32) -> u16 {
+    let width = (bbox.x_max - bbox.x_min) as f64;
+    let height = (bbox.y_max - bbox.y_min) as f64;
+    ((width * height).sqrt() * radius as f64).ot_round()
+}
+
 /// Scale a gradient coordinate from percentage (0.0-1.0) to absolute coordinates
 /// within the given bounding box.
 ///
@@ -204,16 +216,15 @@ fn to_colr_paint(
             // Scale gradient points from relative 0-1 to absolute coordinates
             let (x0, y0) = scale_gradient_point(bbox, radial.p0.x, radial.p0.y);
             let (x1, y1) = scale_gradient_point(bbox, radial.p1.x, radial.p1.y);
-            // Handle optional radii
-            let r0 = radial.r0.map(|r| r.0 as u16).unwrap_or(0); // default to 0
-            let r1 = if let Some(r) = radial.r1 {
-                // TODO: Semantics of explicit radius values are unclear. Are they absolute font units,
-                // or percentages of bbox dimensions? For now treat as absolute, revisit when we have
-                // a source format that actually provides explicit radii.
-                r.0 as u16
-            } else {
+            // Explicit radii are relative to the bbox, like the points
+            let r0 = radial
+                .r0
+                .map(|r| scale_relative_radius(bbox, r.0))
+                .unwrap_or(0);
+            let r1 = match radial.r1 {
+                Some(r) => scale_relative_radius(bbox, r.0),
                 // Calculate radius from bbox dimensions, matching glyphsLib behavior
-                scale_gradient_radius(bbox, radial.p1.x, radial.p1.y)
+                None => scale_gradient_radius(bbox, radial.p1.x, radial.p1.y),
             };
 
             Ok(Paint::RadialGradient(PaintRadialGradient::new(

@@ -387,9 +387,12 @@ enum Colrv1RunType {
         Vec<OrderedFloat<f64>>,
         Vec<glyphs_reader::ColorStop>,
     ),
+    // (start, end, start radius, end radius, colors)
     Radial(
         Vec<OrderedFloat<f64>>,
         Vec<OrderedFloat<f64>>,
+        Option<OrderedFloat<f64>>,
+        Option<OrderedFloat<f64>>,
         Vec<glyphs_reader::ColorStop>,
     ),
     Unknown(ShapeAttributes),
@@ -416,10 +419,12 @@ impl Colrv1RunType {
         }
         let attr = shape.attributes();
         if let Some(gradient) = &attr.gradient {
-            if gradient.style == "circle" {
+            if matches!(gradient.style.as_str(), "circle" | "radial") {
                 return Colrv1RunType::Radial(
                     gradient.start.clone(),
                     gradient.end.clone(),
+                    gradient.start_radius,
+                    gradient.end_radius,
                     gradient.colors.clone(),
                 );
             }
@@ -857,6 +862,21 @@ pub(crate) fn to_ir_paint(
                         p1: start,
                         r0: None, // Defaults to 0
                         r1: None, // Calculated in backend
+                        color_line: to_ir_color_stops(&gradient.colors),
+                    }
+                    .into(),
+                ))
+            }
+            "radial" => {
+                // Glyphs 4: from a circle at 'start' to one at 'end', radii
+                // relative to the bbox, scaled in the backend like the points
+                let radius = |r: Option<OrderedFloat<f64>>| r.map(|r| OrderedFloat(r.0 as f32));
+                Ok(Paint::RadialGradient(
+                    PaintRadialGradient {
+                        p0: start,
+                        p1: end,
+                        r0: radius(gradient.start_radius),
+                        r1: radius(gradient.end_radius),
                         color_line: to_ir_color_stops(&gradient.colors),
                     }
                     .into(),
