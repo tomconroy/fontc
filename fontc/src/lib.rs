@@ -881,6 +881,53 @@ mod tests {
         assert!(!result.contains_glyph("skip_me"))
     }
 
+    /// Each glyphs4 fixture is a Glyphs 4 conversion of a glyphs3 one, see
+    /// resources/scripts/glyphs3_to_glyphs4.py, and must compile to the same font.
+    #[rstest]
+    #[case::wght_var("WghtVar.glyphs", "WghtVar.glyphs")]
+    #[case::wght_var_package("WghtVar.glyphspackage", "WghtVar.glyphspackage")]
+    #[case::instances("WghtVar_Instances.glyphs", "WghtVar_Instances.glyphs")]
+    #[case::instances_package("WghtVar_Instances.glyphspackage", "WghtVar_Instances.glyphspackage")]
+    #[case::features_package(
+        "WghtVarWithStylisticSet.glyphs",
+        "WghtVarWithStylisticSet.glyphspackage"
+    )]
+    #[case::classes_and_prefixes_package("Oswald-AE-comb.glyphs", "Oswald-AE-comb.glyphspackage")]
+    #[case::intermediate_layer("IntermediateLayer.glyphs", "IntermediateLayer.glyphs")]
+    #[case::bracket_layer(
+        "LibreFranklin-bracketlayer.glyphs",
+        "LibreFranklin-bracketlayer.glyphs"
+    )]
+    #[case::palettes("COLRv0-2layers.glyphs", "COLRv0-2layers.glyphs")]
+    #[case::solid_colors("COLRv1-solid.glyphs", "COLRv1-solid.glyphs")]
+    #[case::gradients("COLRv1-gradient.glyphs", "COLRv1-gradient.glyphs")]
+    fn glyphs4_compiles_like_glyphs3(#[case] v3_name: &str, #[case] v4_name: &str) {
+        let v3 = TestCompile::compile_source(&format!("glyphs3/{v3_name}"));
+        let v4 = TestCompile::compile_source(&format!("glyphs4/{v4_name}"));
+        let v3_font = v3.font();
+        let v4_font = v4.font();
+        let tags = |font: &FontRef| {
+            font.table_directory
+                .table_records()
+                .iter()
+                .map(|r| r.tag())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(tags(&v3_font), tags(&v4_font));
+        for tag in tags(&v3_font) {
+            let mut v3_data = v3_font.table_data(tag).unwrap().as_bytes().to_vec();
+            let mut v4_data = v4_font.table_data(tag).unwrap().as_bytes().to_vec();
+            if tag == Tag::new(b"head") {
+                // checksumAdjustment and modified are allowed to differ
+                for data in [&mut v3_data, &mut v4_data] {
+                    data[8..12].fill(0);
+                    data[28..36].fill(0);
+                }
+            }
+            assert!(v3_data == v4_data, "'{tag}' differs for {v4_name}");
+        }
+    }
+
     #[test]
     fn missing_component_does_not_decompose_siblings() {
         // 'A' references 'B' (present) and 'F' (missing). A missing component
