@@ -1,5 +1,5 @@
 {
-.appVersion = "4107";
+.appVersion = "3300";
 .formatVersion = 4;
 axes = (
 {
@@ -56,6 +56,7 @@ Location = 400;
 );
 },
 );
+date = "2026-10-05 15:23:09 +0000";
 fontMaster = (
 {
 axesValues = (
@@ -436,7 +437,6 @@ nodes = (
 );
 },
 {
-alignment = -1;
 ref = idotless;
 },
 );
@@ -463,7 +463,6 @@ nodes = (
 );
 },
 {
-alignment = -1;
 ref = idotless;
 },
 );
@@ -495,7 +494,6 @@ nodes = (
 );
 },
 {
-alignment = -1;
 ref = idotless;
 },
 );
@@ -603,11 +601,9 @@ layers = (
 layerId = "F969B945-4602-464F-B67C-A69BED6E6A4A";
 shapes = (
 {
-alignment = -1;
 ref = idotless;
 },
 {
-alignment = -1;
 pos = (184,-26);
 ref = acutecomb;
 },
@@ -618,11 +614,9 @@ width = 600;
 layerId = m01;
 shapes = (
 {
-alignment = -1;
 ref = idotless;
 },
 {
-alignment = -1;
 pos = (159,-38);
 ref = acutecomb;
 },
@@ -635,7 +629,7 @@ unicode = 237;
 );
 instances = (
 {
-id = "EADED8FF-6F82-50B0-9858-7B7C051663E5";
+id = "1CED43A8-20C6-4592-ACBF-9A4025FD920F";
 properties = (
 {
 key = styleNames;
@@ -654,7 +648,7 @@ axesValues = (
 700,
 400,
 );
-id = "EADED8FF-6F82-50B0-9858-7B7C051663E5";
+id = "21D8398B-044F-433A-A106-2EF095831C67";
 instanceInterpolations = {
 "F969B945-4602-464F-B67C-A69BED6E6A4A" = 1;
 };
@@ -675,7 +669,7 @@ axesValues = (
 700,
 700,
 );
-id = "063482FE-E823-513B-B992-2D39749870F0";
+id = "BA5C7F3D-3FD1-4127-BF60-EC7A8AB6FE93";
 instanceInterpolations = {
 "F969B945-4602-464F-B67C-A69BED6E6A4A" = 0.4;
 m01 = 0.6;
@@ -699,7 +693,7 @@ axesValues = (
 700,
 900,
 );
-id = "2233E495-6DBC-55FF-8CA8-A5A5AA4A4909";
+id = "BC6D796D-F217-4724-901C-0F19EDC57FA9";
 instanceInterpolations = {
 m01 = 1;
 };
@@ -721,7 +715,7 @@ axesValues = (
 600,
 400,
 );
-id = "23807D22-17B9-5C2C-86BB-3CD25CB10613";
+id = "427B94E2-C5E9-4CBA-BC22-FD71EDBDD420";
 instanceInterpolations = {
 "F969B945-4602-464F-B67C-A69BED6E6A4A" = 1;
 };
@@ -742,7 +736,7 @@ axesValues = (
 600,
 700,
 );
-id = "C2B579B8-3EE4-5A2A-AE9E-A13BE6BB9D06";
+id = "9B06CD96-D812-4627-BD28-ED13B6ED4D97";
 instanceInterpolations = {
 "F969B945-4602-464F-B67C-A69BED6E6A4A" = 0.4;
 m01 = 0.6;
@@ -765,7 +759,7 @@ axesValues = (
 600,
 900,
 );
-id = "8F9BDD28-36F9-57FE-8D20-2E900CB318D5";
+id = "69229047-D05D-4FE8-9326-11C86C89A4EA";
 instanceInterpolations = {
 m01 = 1;
 };
@@ -787,7 +781,7 @@ axesValues = (
 800,
 400,
 );
-id = "F875F77A-1B39-53CB-8706-DE3C8625870B";
+id = "69F10992-6D5B-4002-9FA5-F33D3F1F2F03";
 instanceInterpolations = {
 "F969B945-4602-464F-B67C-A69BED6E6A4A" = 1;
 };
@@ -808,7 +802,7 @@ axesValues = (
 800,
 700,
 );
-id = "B201F2CC-6098-59E7-9A71-CD869919D180";
+id = "0E2DED0A-47AF-4671-8473-E6474FF0FDC0";
 instanceInterpolations = {
 "F969B945-4602-464F-B67C-A69BED6E6A4A" = 0.4;
 m01 = 0.6;
@@ -831,7 +825,7 @@ axesValues = (
 800,
 900,
 );
-id = "97B94F9A-C794-57BE-A566-3043569F9488";
+id = "D185A8A2-12D9-4A4B-8F1E-A8BDDBB8099B";
 instanceInterpolations = {
 m01 = 1;
 };
@@ -892,6 +886,9 @@ value = "Intermediate Layer";
 );
 },
 );
+settings = {
+colorSpace = "apple-rgb";
+};
 unitsPerEm = 1000;
 userData = {
 GSDontShowVersionAlert = 1;

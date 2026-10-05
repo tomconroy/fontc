@@ -1,5 +1,5 @@
 {
-.appVersion = "4107";
+.appVersion = "3343";
 .formatVersion = 4;
 axes = (
 {
@@ -7,6 +7,7 @@ name = Weight;
 tag = wght;
 },
 );
+date = "2026-10-05 15:23:12 +0000";
 fontMaster = (
 {
 axesValues = (
@@ -19,7 +20,6 @@ name = Thin;
 axesValues = (
 200,
 );
-iconName = Bold;
 id = "258ED206-D907-4350-8EBA-CBDDA1C16BF7";
 name = Bold;
 },
@@ -139,7 +139,6 @@ layers = (
 layerId = "91AB5BCA-6A50-42DA-B2F7-8181BF189245";
 shapes = (
 {
-alignment = -1;
 ref = peso;
 },
 );
@@ -149,7 +148,6 @@ width = 750;
 layerId = "258ED206-D907-4350-8EBA-CBDDA1C16BF7";
 shapes = (
 {
-alignment = -1;
 ref = peso;
 },
 );
@@ -168,7 +166,6 @@ layerId = "1D3EBF91-071A-467B-8029-6ADF751ECC6B";
 name = "Bold [150]";
 shapes = (
 {
-alignment = -1;
 ref = peso;
 },
 );
@@ -187,7 +184,6 @@ layerId = "E1B5A3D9-B3FF-40F6-8D6C-CD5C7D48B817";
 name = "Light [150]";
 shapes = (
 {
-alignment = -1;
 ref = peso;
 },
 );
@@ -203,7 +199,7 @@ instances = (
 axesValues = (
 40,
 );
-id = "A00C2D62-7C9A-5C07-84CC-CEF590386816";
+id = "FB23293F-0112-4AED-A3EE-50672359A898";
 instanceInterpolations = {
 "91AB5BCA-6A50-42DA-B2F7-8181BF189245" = 1;
 };
@@ -224,7 +220,7 @@ weightClass = 100;
 axesValues = (
 200,
 );
-id = "2233E495-6DBC-55FF-8CA8-A5A5AA4A4909";
+id = "220D1CA8-2DA5-4B20-A91F-29251006EBED";
 instanceInterpolations = {
 "258ED206-D907-4350-8EBA-CBDDA1C16BF7" = 1;
 };
@@ -253,6 +249,9 @@ value = "Libre Franklin";
 );
 },
 );
+settings = {
+colorSpace = "apple-rgb";
+};
 unitsPerEm = 1000;
 versionMajor = 3;
 versionMinor = 0;

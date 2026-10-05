@@ -930,8 +930,8 @@ mod tests {
         assert!(!result.contains_glyph("skip_me"))
     }
 
-    /// Each glyphs4 fixture is a Glyphs 4 conversion of a glyphs3 one, see
-    /// resources/scripts/glyphs3_to_glyphs4.py, and must compile to the same font.
+    /// Each glyphs4 fixture is its glyphs3 twin saved as format 4 by Glyphs
+    /// 4.1.1, and must compile to the same font.
     #[rstest]
     #[case::wght_var("WghtVar.glyphs", "WghtVar.glyphs")]
     #[case::wght_var_package("WghtVar.glyphspackage", "WghtVar.glyphspackage")]
@@ -967,10 +967,25 @@ mod tests {
             let mut v3_data = v3_font.table_data(tag).unwrap().as_bytes().to_vec();
             let mut v4_data = v4_font.table_data(tag).unwrap().as_bytes().to_vec();
             if tag == Tag::new(b"head") {
-                // checksumAdjustment and modified are allowed to differ
+                // checksumAdjustment and modified are allowed to differ, and
+                // so is created: it comes from the date Glyphs 4 records when
+                // it saves, and the glyphs3 twins have none
                 for data in [&mut v3_data, &mut v4_data] {
                     data[8..12].fill(0);
-                    data[28..36].fill(0);
+                    data[20..36].fill(0);
+                }
+            }
+            if tag == Tag::new(b"CPAL") && v4_name == "COLRv0-2layers.glyphs" {
+                // Glyphs 4 saves this fixture's made-up near-black palette
+                // colors as grey with the same alpha, so compare only alpha.
+                // Its own export of the two files differs the same way.
+                for data in [&mut v3_data, &mut v4_data] {
+                    let num_records = u16::from_be_bytes([data[6], data[7]]) as usize;
+                    let offset = u32::from_be_bytes(data[8..12].try_into().unwrap()) as usize;
+                    for record in data[offset..offset + 4 * num_records].chunks_mut(4) {
+                        // blue, green, red, alpha
+                        record[..3].fill(0);
+                    }
                 }
             }
             assert!(v3_data == v4_data, "'{tag}' differs for {v4_name}");
