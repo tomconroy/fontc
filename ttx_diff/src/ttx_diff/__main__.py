@@ -40,9 +40,10 @@ flags.DEFINE_enum(
     _FLAVOR_TTF,
     [_FLAVOR_TTF, _FLAVOR_OTF],
     "Which outline flavor to build and compare: 'ttf' (quadratic outlines in "
-    "glyf) or 'otf' (cubic outlines in CFF). 'otf' requires a static source "
-    "and --compare default; fontmake is run with --optimize-cff 1 so that "
-    "charstrings are specialized but not subroutinized, matching fontc.",
+    "glyf) or 'otf' (cubic outlines in CFF, or CFF2 when the output is "
+    "variable). 'otf' requires --compare default; fontmake is run with "
+    "--optimize-cff 1 so that charstrings are specialized but not "
+    "subroutinized, matching fontc.",
 )
 flags.DEFINE_string(
     "instance",

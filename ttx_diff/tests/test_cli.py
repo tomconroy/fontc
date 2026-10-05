@@ -216,16 +216,33 @@ class TestFlavor:
         assert output_font_path(tmp_path, "fontc") == tmp_path / "fontc.otf"
         assert output_font_path(tmp_path, "fontmake") == tmp_path / "fontmake.otf"
 
-    def test_otf_rejects_variable_source(self, tmp_path):
-        # fontc has no CFF2 writer, so there is nothing to compare
-        path = _write_glyphs(tmp_path, masters=[400, 700])
-        result = subprocess.run(
-            [sys.executable, "-m", "ttx_diff", "--flavor", "otf", str(path)],
-            capture_output=True,
-            text=True,
+    def test_otf_accepts_a_variable_source(self, tmp_path, monkeypatch, flavor):
+        # a variable PostScript build is CFF2, which both compilers write; it
+        # used to be a skip, and the skip is gone
+        flavor("otf")
+        path = _variable_designspace(
+            tmp_path, instances=[("Test Regular", {"Weight": 400})]
         )
-        assert result.returncode != 0
-        assert "--flavor otf requires a static source" in result.stderr
+        commands = _record_fontmake(monkeypatch)
+        build_fontmake(path, tmp_path)
+        (cmd,) = commands
+        assert cmd[:3] == ["fontmake", "-o", "variable-cff2"]
+        assert cmd[cmd.index("--optimize-cff") + 1] == "1"
+        # fontmake does not remove overlaps for an interpolatable build, so
+        # neither side asks it to
+        assert "--keep-overlaps" not in cmd
+        assert "-i" not in cmd
+
+    def test_otf_static_build_is_unchanged(self, tmp_path, monkeypatch, flavor):
+        flavor("otf")
+        ufo = tmp_path / "test.ufo"
+        ufo.mkdir()
+        (ufo / "metainfo.plist").write_text("")
+        commands = _record_fontmake(monkeypatch)
+        build_fontmake(ufo, tmp_path)
+        (cmd,) = commands
+        assert cmd[:3] == ["fontmake", "-o", "otf"]
+        assert cmd[cmd.index("--optimize-cff") + 1] == "1"
 
     def test_otf_rejects_gftools_compare(self, tmp_path):
         ufo = tmp_path / "test.ufo"

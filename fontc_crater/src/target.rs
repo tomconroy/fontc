@@ -154,7 +154,12 @@ impl Target {
         result
     }
 
-    pub(crate) fn repro_command(&self, repo_url: &str) -> String {
+    /// The ttx_diff invocation that reproduces this target's result.
+    ///
+    /// `mode_flags` names the build mode the report is about; see
+    /// [`crate::args::mode_flags`]. Without it the command would compare a
+    /// variable ttf whatever the run actually built.
+    pub(crate) fn repro_command(&self, repo_url: &str, mode_flags: &str) -> String {
         let repo_url = repo_url.trim();
         let source_path = self.source_path(Path::new(""));
         let rel_source_path = source_path
@@ -166,7 +171,7 @@ impl Target {
             Default::default()
         };
         let mut cmd = format!(
-            "python3 -m ttx_diff '{repo_url}{sha_part}#{}'",
+            "python3 -m ttx_diff{mode_flags} '{repo_url}{sha_part}#{}'",
             rel_source_path.display()
         );
         if self.build == BuildType::GfTools {
@@ -359,10 +364,27 @@ mod tests {
             "sources/hi.glyphs",
         );
 
-        let hmm = target.repro_command("example.com");
+        let hmm = target.repro_command("example.com", "");
         assert_eq!(
             hmm,
             "python3 -m ttx_diff 'example.com?123456789a#sources/hi.glyphs'"
+        );
+    }
+
+    /// A report is about one build mode, and its repro command has to ask for
+    /// that mode: without the flags this would compare a variable ttf.
+    #[test]
+    fn repro_command_names_the_mode() {
+        let target = Target::new(
+            "org/repo",
+            "123456789a",
+            "sources/config.yaml",
+            false,
+            "sources/hi.glyphs",
+        );
+        assert_eq!(
+            target.repro_command("example.com", " --flavor otf"),
+            "python3 -m ttx_diff --flavor otf 'example.com?123456789a#sources/hi.glyphs'"
         );
     }
 }
