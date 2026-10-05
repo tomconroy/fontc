@@ -784,13 +784,26 @@ impl ShapeAttributes {
     }
 }
 
+/// A shape's gradient fill.
+///
+/// Points are relative to the shape's bounding box, 0..1 on each axis.
 #[derive(Clone, Default, Debug, PartialEq, Eq, Hash, FromPlist)]
 pub struct Gradient {
     pub start: Vec<OrderedFloat<f64>>,
     pub end: Vec<OrderedFloat<f64>>,
     pub colors: Vec<ColorStop>,
+    /// `""` for linear; `"circle"` for a Glyphs 3 radial gradient, one circle
+    /// centered at `start` that reaches the farthest corner of the bounding box;
+    /// `"radial"` for a Glyphs 4 radial gradient, from a circle centered at
+    /// `start` to one centered at `end`, with radii given by `start_radius`
+    /// and `end_radius`
     #[fromplist(key = "type")]
     pub style: String,
+    /// The radius of the `"radial"` start circle, relative to the bounding box:
+    /// a multiple of the square root of its width times its height
+    pub start_radius: Option<OrderedFloat<f64>>,
+    /// The radius of the `"radial"` end circle, relative like `start_radius`
+    pub end_radius: Option<OrderedFloat<f64>>,
 }
 
 impl Gradient {
@@ -2083,9 +2096,9 @@ struct RawGradient {
     colors: Vec<RawColorStop>,
     #[fromplist(key = "type")]
     style: String,
-    // v4 additions
+    // v4 additions. A radial gradient's 'angle' is left unread: Glyphs 4's
+    // own export ignores it.
     extend: Option<String>,
-    angle: Option<f64>,
     start_radius: Option<f64>,
     end_radius: Option<f64>,
 }
@@ -2159,24 +2172,25 @@ impl RawGradient {
         if let Some(extend) = self.extend.as_deref().filter(|e| *e != "pad") {
             return Err(format!("gradient extend mode '{extend}' is not supported"));
         }
-        let style = match self.style.as_str() {
-            // A v4 radial gradient that sets none of the new geometry is the v3
-            // 'circle' gradient: one circle centered at 'start'.
-            "radial"
-                if self.start_radius.unwrap_or_default() == 0.0
-                    && self.end_radius.is_none()
-                    && self.angle.unwrap_or_default() == 0.0 =>
-            {
-                "circle".to_string()
-            }
+        let (start_radius, end_radius) = match self.style.as_str() {
+            // Glyphs 4 saves a v3 'circle' gradient as a radial one whose
+            // radius is explicit
             "radial" => {
-                return Err(
-                    "radial gradients with startRadius, endRadius or angle are not supported"
-                        .into(),
-                );
+                // Glyphs 4 always writes endRadius; without one it exports a
+                // meaningless 65535 unit radius
+                let end = self
+                    .end_radius
+                    .ok_or("radial gradients without endRadius are not supported")?;
+                let start = self.start_radius.unwrap_or_default();
+                if start < 0.0 || end < 0.0 {
+                    return Err(format!(
+                        "radial gradient radii must not be negative, got {start} and {end}"
+                    ));
+                }
+                (Some(start.into()), Some(end.into()))
             }
             "conic" => return Err("conic gradients are not supported".into()),
-            other => other.to_string(),
+            _ => (None, None),
         };
         Ok(Gradient {
             start: self.start.clone(),
@@ -2191,7 +2205,9 @@ impl RawGradient {
                     })
                 })
                 .collect::<Result<_, String>>()?,
-            style,
+            style: self.style.clone(),
+            start_radius,
+            end_radius,
         })
     }
 }
@@ -6082,6 +6098,41 @@ mod tests {
         font
     }
 
+    /// Glyphs 4 saves a v3 'circle' gradient as a 'radial' one with both
+    /// centers on the circle's and the radius, which depends on the shape's
+    /// bounds, made explicit. Rewrite both into one form, without the radius;
+    /// fontc's glyphs4_compiles_like_glyphs3 checks it compiles the same.
+    fn without_circle_radii(font: &Font) -> Font {
+        let mut font = font.clone();
+        for glyph in font.glyphs.values_mut() {
+            for layer in glyph
+                .layers
+                .iter_mut()
+                .chain(glyph.bracket_layers.iter_mut())
+            {
+                for shape in layer.shapes.iter_mut() {
+                    let attributes = match shape {
+                        Shape::Path(p) => &mut p.attributes,
+                        Shape::Component(c) => &mut c.attributes,
+                    };
+                    let Some(gradient) = attributes.gradient.as_mut() else {
+                        continue;
+                    };
+                    match gradient.style.as_str() {
+                        "circle" => {
+                            gradient.style = "radial".into();
+                            gradient.end = gradient.start.clone();
+                            gradient.start_radius = Some(0.0.into());
+                        }
+                        "radial" => gradient.end_radius = None,
+                        _ => (),
+                    }
+                }
+            }
+        }
+        font
+    }
+
     /// Each glyphs4 fixture is a conversion of a glyphs3 one, see
     /// resources/scripts/glyphs3_to_glyphs4.py; they must load the same.
     fn assert_load_v3_matches_load_v4(v3_name: &str, v4_name: &str) {
@@ -6096,8 +6147,8 @@ mod tests {
         let mut g4 = trim_feature_code(&g4);
         g4.format_version = FormatVersion::V3;
         assert_fonts_equal(
-            &trim_feature_code(&g3),
-            &g4,
+            &without_circle_radii(&trim_feature_code(&g3)),
+            &without_circle_radii(&g4),
             &format!("g3 vs g4: {v3_name} vs {v4_name}"),
         );
     }
@@ -6451,6 +6502,14 @@ unitsPerEm = 1000;
         "attr = {\ngradient = {\ncolors = (\n((1,0,0,1),0),\n((0,0,1,1),1),\n);\ntype = conic;\n};\n};",
         "conic gradients"
     )]
+    #[case::radial_without_end_radius(
+        "attr = {\ngradient = {\ncolors = (\n((1,0,0,1),0),\n((0,0,1,1),1),\n);\nstart = (0.5,0.5);\nend = (0.5,0.5);\ntype = radial;\n};\n};",
+        "without endRadius"
+    )]
+    #[case::negative_radius(
+        "attr = {\ngradient = {\ncolors = (\n((1,0,0,1),0),\n((0,0,1,1),1),\n);\nendRadius = -0.5;\nstart = (0.5,0.5);\nend = (0.5,0.5);\ntype = radial;\n};\n};",
+        "must not be negative"
+    )]
     fn v4_unsupported_shape_attributes(#[case] attr: &str, #[case] issue: &str) {
         let layers = format!(
             "{{\nlayerId = m01;\nshapes = (\n{{\n{attr}\nclosed = 1;\nnodes = (\n{SQUARE}\n);\n}},\n);\nwidth = 500;\n}},\n{}",
@@ -6479,6 +6538,37 @@ unitsPerEm = 1000;
         );
         let err = Font::load_from_string(&source).unwrap_err();
         assert!(err.to_string().contains("Smart Glyph axes"), "{err}");
+    }
+
+    #[test]
+    fn v4_radial_gradient() {
+        let attr = "attr = {\ngradient = {\ncolors = (\n((1,0,0,1),0),\n((0,0,1,1),1),\n);\nangle = 30;\nend = (0.6,0.7);\nendRadius = 0.6;\nstart = (0.3,0.3);\nstartRadius = 0.1;\ntype = radial;\n};\n};";
+        let layers = format!(
+            "{{\nlayerId = m01;\nshapes = (\n{{\n{attr}\nclosed = 1;\nnodes = (\n{SQUARE}\n);\n}},\n);\nwidth = 500;\n}},\n{}",
+            layer("m02", "", SQUARE)
+        );
+        let font = Font::load_from_string(&v4_font(&layers, "")).unwrap();
+        let gradient = font.glyphs["a"].layers[0].shapes[0]
+            .attributes()
+            .gradient
+            .clone()
+            .unwrap();
+        assert_eq!(
+            (
+                gradient.style.as_str(),
+                gradient.start,
+                gradient.end,
+                gradient.start_radius,
+                gradient.end_radius
+            ),
+            (
+                "radial",
+                vec![OrderedFloat(0.3), OrderedFloat(0.3)],
+                vec![OrderedFloat(0.6), OrderedFloat(0.7)],
+                Some(OrderedFloat(0.1)),
+                Some(OrderedFloat(0.6))
+            )
+        );
     }
 
     #[test]
@@ -8515,6 +8605,7 @@ unitsPerEm = 1000;
                         },
                     ],
                     style: "circle".to_string(),
+                    ..Default::default()
                 },
             ),
         ]);

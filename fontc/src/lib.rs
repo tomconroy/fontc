@@ -5811,6 +5811,43 @@ mod tests {
         assert_eq!(values, ((303, 250), 0, (303, 250), 346), "p0, r0, p1, r1");
     }
 
+    /// A Glyphs 4 radial gradient runs from a circle at 'start' to one at
+    /// 'end', with radii relative to the bbox: multiples of sqrt(width * height)
+    #[test]
+    fn colr_gradient_glyphs4_radial() {
+        let source =
+            std::fs::read_to_string(testdata_dir().join("glyphs4/COLRv1-gradient.glyphs")).unwrap();
+        // Glyph K, bbox (63, 0) to (542, 500)
+        let k_gradient = "angle = 0;\nend = (0.5,0.5);\nendRadius = 0.70743;\nstart = (0.5,0.5);\n";
+        assert_eq!(source.matches(k_gradient).count(), 1);
+        let source = source.replace(
+            k_gradient,
+            "angle = 30;\nend = (0.6,0.7);\nendRadius = 0.6;\nstart = (0.3,0.3);\nstartRadius = 0.1;\n",
+        );
+        let temp_dir = tempdir().unwrap();
+        let path = temp_dir.path().join("COLRv1-radial.glyphs");
+        std::fs::write(&path, source).unwrap();
+        let result = TestCompile::compile_source(path.to_str().unwrap());
+        let colr = result.font().colr().expect("COLR");
+
+        let Paint::RadialGradient(grad) = root_paint_glyph(&result, &colr, "K")
+            .paint()
+            .expect("Valid paint")
+        else {
+            panic!("Expected RadialGradient");
+        };
+        let values = (
+            (grad.x0().to_i16(), grad.y0().to_i16()),
+            grad.radius0().to_u16(),
+            (grad.x1().to_i16(), grad.y1().to_i16()),
+            grad.radius1().to_u16(),
+        );
+        // What Glyphs 4.1.1 exports for this gradient; it ignores the angle.
+        //   p0 = (63 + 479 * 0.3, 500 * 0.3), r0 = 0.1 * sqrt(479 * 500)
+        //   p1 = (63 + 479 * 0.6, 500 * 0.7), r1 = 0.6 * sqrt(479 * 500)
+        assert_eq!(values, ((207, 150), 49, (350, 350), 294), "p0, r0, p1, r1");
+    }
+
     #[test]
     fn colr_gradient_radial_outside_bbox() {
         // Test radial gradient with center outside the bounding box
