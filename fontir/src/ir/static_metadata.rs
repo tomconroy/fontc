@@ -280,6 +280,17 @@ pub struct InstanceOverrides {
     /// `--flavor otf` build.
     #[serde(default)]
     pub postscript_full_name: Option<String>,
+    /// The instance's own usWeightClass, which replaces the one read off its
+    /// user location.
+    ///
+    /// glyphsLib never states one: an instance's weightClass *is* its user
+    /// location there. Glyphs reads a Glyphs 3 source's user space off "Axis
+    /// Location" alone, so without it the weightClass is only this OS/2 value.
+    #[serde(default)]
+    pub us_weight_class: Option<u16>,
+    /// As [`Self::us_weight_class`], for usWidthClass.
+    #[serde(default)]
+    pub us_width_class: Option<u16>,
 }
 
 /// The four style-linking styles, i.e. UFO `styleMapStyleName`.
@@ -562,6 +573,20 @@ pub struct MiscMetadata {
     ///
     /// If empty and there is a width axis OS/2 will use the width default
     pub us_width_class: Option<u16>,
+
+    /// The variable font's usWeightClass, when the source states one that wins
+    /// over the Weight axis' default.
+    ///
+    /// fontmake reads a variable font's class off the axis default, whatever the
+    /// source said; [`Self::us_weight_class`] only counts where there's no axis.
+    /// Glyphs reads it off the exporting instance at the default location instead
+    /// (400 without one), which matters where the axis is in design units: a
+    /// Glyphs 3 source without "Axis Location". Unused by a static instance.
+    #[serde(default)]
+    pub variable_us_weight_class: Option<u16>,
+    /// As [`Self::variable_us_weight_class`], for usWidthClass and the Width axis.
+    #[serde(default)]
+    pub variable_us_width_class: Option<u16>,
 
     // <https://learn.microsoft.com/en-us/typography/opentype/spec/gasp>
     pub gasp: Vec<GaspRange>,
@@ -1058,6 +1083,8 @@ impl StaticMetadata {
                 meta_table: None,
                 us_weight_class: None,
                 us_width_class: None,
+                variable_us_weight_class: None,
+                variable_us_width_class: None,
                 gasp: Vec::new(),
                 feature_generation: None,
                 stat_axes,
@@ -1292,6 +1319,8 @@ mod tests {
                 meta_table: None,
                 us_weight_class: None,
                 us_width_class: None,
+                variable_us_weight_class: None,
+                variable_us_width_class: None,
                 gasp: Vec::new(),
                 feature_generation: Some(vec![FeatureWriterSpec {
                     writer: KnownFeatureWriter::Kern,

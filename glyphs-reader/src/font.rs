@@ -2254,6 +2254,12 @@ pub struct Instance {
     pub type_: InstanceType,
     pub axis_mappings: BTreeMap<String, AxisUserToDesignMap>,
     pub axes_values: Vec<OrderedFloat<f64>>,
+    /// The weightClass the source states, as an OS/2 usWeightClass; `None` when
+    /// it's left at the default (Regular, 400).
+    pub os2_weight_class: Option<u16>,
+    /// The widthClass the source states, as an OS/2 usWidthClass (1-9); `None`
+    /// when it's left at the default (Medium (normal), 5).
+    pub os2_width_class: Option<u16>,
     pub custom_parameters: CustomParameters,
     properties: Vec<RawName>, // used for name resolution
     /// "Style Linking > this instance is the X of", i.e. the family to link into.
@@ -4198,10 +4204,14 @@ impl Instance {
     ///
     /// Mappings based on
     /// <https://github.com/googlefonts/glyphsLib/blob/6f243c1f732ea1092717918d0328f3b5303ffe56/Lib/glyphsLib/classes.py#L3451>
+    ///
+    /// `classes_name_user_locations` says whether the instance's weightClass and
+    /// widthClass also name its user location on the Weight and Width axes; see
+    /// the caller for when they do.
     fn new(
         axes: &[Axis],
         value: &mut RawInstance,
-        masters_have_axis_locations: bool,
+        classes_name_user_locations: bool,
     ) -> Result<Self, Error> {
         let active = value.is_active();
         let mut axis_mappings: BTreeMap<String, AxisUserToDesignMap> = BTreeMap::new();
@@ -4252,8 +4262,8 @@ impl Instance {
             }
         }
 
-        // only infer legacy mappings when Axis Locations aren't defined
-        if !masters_have_axis_locations && !tags_done.contains("wght") {
+        // only infer legacy mappings when the caller says the classes are locations
+        if classes_name_user_locations && !tags_done.contains("wght") {
             // OS/2 weight_class corresponds to 'wght' axis user-space value
             add_mapping_if_new(
                 &mut axis_mappings,
@@ -4268,7 +4278,7 @@ impl Instance {
             );
         }
 
-        if !masters_have_axis_locations && !tags_done.contains("wdth") {
+        if classes_name_user_locations && !tags_done.contains("wdth") {
             // OS/2 width_class gets mapped to 'wdth' percent scale, see:
             // https://github.com/googlefonts/glyphsLib/blob/7041311e/Lib/glyphsLib/builder/constants.py#L222
             add_mapping_if_new(
@@ -4302,6 +4312,16 @@ impl Instance {
                 .unwrap_or(InstanceType::Single),
             axis_mappings,
             axes_values: value.axes_values.clone(),
+            // `normalize_instance_classes` has made both numbers already
+            os2_weight_class: value
+                .weight_class
+                .as_ref()
+                .and_then(|v| f64::from_str(v).ok())
+                .map(|v| v.clamp(0.0, u16::MAX as f64) as u16),
+            os2_width_class: value
+                .width_class
+                .as_ref()
+                .and_then(|v| u16::from_str(v).ok()),
             properties: value.properties.clone(),
             custom_parameters: value
                 .custom_parameters
@@ -4521,11 +4541,20 @@ impl TryFrom<RawFont> for Font {
             .font_master
             .iter()
             .all(|master| master.custom_parameters.contains("Axis Location"));
+        // That heuristic is glyphsLib's, and only a Glyphs 2 source gets it here. Glyphs
+        // itself reads a Glyphs 3 or 4 source's user space off "Axis Location" and "Axis
+        // Mappings" alone: without them user == design, and an instance's weightClass and
+        // widthClass are nothing but its OS/2 usWeightClass and usWidthClass. glyphsLib's
+        // reading turns a source whose one exporting instance is a Medium at weightClass
+        // 500 into a Weight axis pinned to user 500 that none of the masters sit on, which
+        // Glyphs exports as an ordinary 400-700 axis with no avar.
+        let classes_name_user_locations =
+            from.format_version.is_v2() && !masters_have_axis_locations;
 
         let instances: Vec<_> = from
             .instances
             .iter_mut()
-            .map(|ri| Instance::new(&from.axes, ri, masters_have_axis_locations))
+            .map(|ri| Instance::new(&from.axes, ri, classes_name_user_locations))
             .collect::<Result<Vec<_>, Error>>()?;
 
         // parameters like "Axis Location", "Axis Mappings" and "Variable Font Origin" are
@@ -5096,6 +5125,11 @@ impl Font {
         &self.masters[self.default_master_idx]
     }
 
+    /// Whether the source is a Glyphs 2 file, one without a `.formatVersion`.
+    pub fn is_glyphs2(&self) -> bool {
+        self.format_version.is_v2()
+    }
+
     /// Whether any glyph in the font uses `glyph_name` as a component.
     pub fn is_used_as_component(&self, glyph_name: &str) -> bool {
         self.glyphs.values().any(|g| {
@@ -5314,22 +5348,43 @@ mod tests {
 
     #[test]
     fn glyphs3_named_and_numeric_instance_classes() {
-        let font = Font::load(&glyphs3_dir().join("InstanceClasses.glyphs")).unwrap();
-
+        // Named and numeric classes both parse to the same numbers...
+        let path = glyphs3_dir().join("InstanceClasses.glyphs");
+        let mut raw = RawFont::load(&path).unwrap();
+        raw.normalize_instance_classes().unwrap();
+        let axes = raw.axes.clone();
+        let instances: Vec<_> = raw
+            .instances
+            .iter_mut()
+            .map(|instance| Instance::new(&axes, instance, true).unwrap())
+            .collect();
+        let mut by_classes = UserToDesignMapping(BTreeMap::new());
+        by_classes.add_instance_mappings(&instances);
         assert_eq!(
-            font.axis_mappings.get("Weight"),
+            by_classes.get("Weight"),
             Some(&AxisUserToDesignMap(vec![
                 (OrderedFloat(600.0), OrderedFloat(60.0)),
                 (OrderedFloat(650.0), OrderedFloat(70.0)),
             ]))
         );
         assert_eq!(
-            font.axis_mappings.get("Width"),
+            by_classes.get("Width"),
             Some(&AxisUserToDesignMap(vec![
                 (OrderedFloat(75.0), OrderedFloat(80.0)),
                 (OrderedFloat(100.0), OrderedFloat(90.0)),
             ]))
         );
+
+        // ...but in a Glyphs 3 source they're only OS/2 values: without "Axis
+        // Location" the axes are user == design, as Glyphs itself exports them
+        let font = Font::load(&path).unwrap();
+        for axis in ["Weight", "Width"] {
+            assert!(
+                font.axis_mappings.get(axis).is_none_or(|m| m.is_identity()),
+                "{axis}: {:?}",
+                font.axis_mappings.get(axis)
+            );
+        }
     }
 
     #[test]
@@ -5482,14 +5537,42 @@ mod tests {
     }
 
     fn assert_load_v2_matches_load_v3(name: &str, compare: LoadCompare) {
+        assert_load_v2_matches_load_v3_but(name, compare, |_| ());
+    }
+
+    /// As [`assert_load_v2_matches_load_v3`] for a source whose user space is
+    /// read off its instances' weight classes: glyphsLib's reading, which only the
+    /// Glyphs 2 twin gets. The Glyphs 3 twins are user == design instead, and
+    /// otherwise match.
+    fn assert_load_v2_matches_load_v3_but_class_mappings(name: &str, compare: LoadCompare) {
+        assert_load_v2_matches_load_v3_but(name, compare, |(g2, g3)| {
+            assert!(
+                g3.axis_mappings.0.values().all(|m| m.is_identity()),
+                "{:?}",
+                g3.axis_mappings
+            );
+            g3.axis_mappings = g2.axis_mappings.clone();
+            for (i2, i3) in g2.instances.iter().zip(g3.instances.iter_mut()) {
+                assert!(i3.axis_mappings.is_empty(), "{:?}", i3.axis_mappings);
+                i3.axis_mappings = i2.axis_mappings.clone();
+            }
+        });
+    }
+
+    fn assert_load_v2_matches_load_v3_but(
+        name: &str,
+        compare: LoadCompare,
+        reconcile: impl Fn((&mut Font, &mut Font)),
+    ) {
         let has_package = matches!(compare, LoadCompare::GlyphsAndPackage);
         let _ = tracing_subscriber::fmt().with_test_writer().try_init();
         let filename = format!("{name}.glyphs");
         let pkgname = format!("{name}.glyphspackage");
         let g2_file = glyphs2_dir().join(filename.clone());
         let g3_file = glyphs3_dir().join(filename.clone());
-        let g2 = Font::load(&g2_file).unwrap();
-        let g3 = Font::load(&g3_file).unwrap();
+        let mut g2 = Font::load(&g2_file).unwrap();
+        let mut g3 = Font::load(&g3_file).unwrap();
+        reconcile((&mut g2, &mut g3));
 
         // Handy if troubleshooting
         std::fs::write("/tmp/g2.glyphs.txt", format!("{g2:#?}")).unwrap();
@@ -5502,8 +5585,9 @@ mod tests {
         );
 
         if has_package {
-            let g2_pkg = Font::load(&glyphs2_dir().join(pkgname.clone())).unwrap();
-            let g3_pkg = Font::load(&glyphs3_dir().join(pkgname.clone())).unwrap();
+            let mut g2_pkg = Font::load(&glyphs2_dir().join(pkgname.clone())).unwrap();
+            let mut g3_pkg = Font::load(&glyphs3_dir().join(pkgname.clone())).unwrap();
+            reconcile((&mut g2_pkg, &mut g3_pkg));
 
             std::fs::write("/tmp/g2.glyphspackage.txt", format!("{g2_pkg:#?}")).unwrap();
             std::fs::write("/tmp/g3.glyphspackage.txt", format!("{g3_pkg:#?}")).unwrap();
@@ -5520,12 +5604,18 @@ mod tests {
 
     #[test]
     fn read_wght_var_avar_2_and_3() {
-        assert_load_v2_matches_load_v3("WghtVar_Avar", LoadCompare::GlyphsAndPackage);
+        assert_load_v2_matches_load_v3_but_class_mappings(
+            "WghtVar_Avar",
+            LoadCompare::GlyphsAndPackage,
+        );
     }
 
     #[test]
     fn read_wght_var_instances_2_and_3() {
-        assert_load_v2_matches_load_v3("WghtVar_Instances", LoadCompare::GlyphsAndPackage);
+        assert_load_v2_matches_load_v3_but_class_mappings(
+            "WghtVar_Instances",
+            LoadCompare::GlyphsAndPackage,
+        );
     }
 
     #[test]
@@ -5969,8 +6059,11 @@ slant = (10);
         );
     }
 
+    /// glyphsLib reads a user location off each instance's weightClass; Glyphs
+    /// doesn't, in a Glyphs 3 source. It exports this one as a 60-132 axis with no
+    /// avar (Glyphs 3.5 and 4.1.1 alike), and so do we.
     #[test]
-    fn loads_global_axis_mappings_from_instances_wght_glyphs3() {
+    fn glyphs3_axis_mappings_ignore_instance_weight_classes() {
         let font = Font::load(&glyphs3_dir().join("WghtVar_Avar_From_Instances.glyphs")).unwrap();
 
         let wght_idx = font.axes.iter().position(|a| a.tag == "wght").unwrap();
@@ -5990,19 +6083,14 @@ slant = (10);
             )
         );
 
-        // Did you load the mappings? DID YOU?!
+        // user == design, at the masters
         assert_eq!(
             UserToDesignMapping(BTreeMap::from([(
                 "Weight".into(),
                 AxisUserToDesignMap(vec![
-                    (OrderedFloat(300.0), OrderedFloat(60.0)),
-                    // we expect a map 400:80 here, even though the 'Regular' instance's
-                    // Weight Class property is omitted in the .glyphs source because it
-                    // is equal to its default value (400):
-                    // https://github.com/googlefonts/fontc/issues/905
-                    (OrderedFloat(400.0), OrderedFloat(80.0)),
-                    (OrderedFloat(500.0), OrderedFloat(100.0)),
-                    (OrderedFloat(700.0), OrderedFloat(132.0)),
+                    (OrderedFloat(60.0), OrderedFloat(60.0)),
+                    (OrderedFloat(80.0), OrderedFloat(80.0)),
+                    (OrderedFloat(132.0), OrderedFloat(132.0)),
                 ])
             ),])),
             font.axis_mappings
@@ -6048,8 +6136,10 @@ slant = (10);
         );
     }
 
+    /// As [`glyphs3_axis_mappings_ignore_instance_weight_classes`], for widthClass:
+    /// Glyphs exports this source as a 22-62 axis with no avar.
     #[test]
-    fn loads_global_axis_mappings_from_instances_wdth_glyphs3() {
+    fn glyphs3_axis_mappings_ignore_instance_width_classes() {
         let font = Font::load(&glyphs3_dir().join("WdthVar.glyphs")).unwrap();
 
         assert_eq!(font.axes.len(), 1);
@@ -6069,6 +6159,25 @@ slant = (10);
                 font.default_master_idx
             )
         );
+        // user == design, at the masters
+        assert_eq!(
+            UserToDesignMapping(BTreeMap::from([(
+                "Width".into(),
+                AxisUserToDesignMap(vec![
+                    (OrderedFloat(22.0), OrderedFloat(22.0)),
+                    (OrderedFloat(62.0), OrderedFloat(62.0)),
+                ])
+            ),])),
+            font.axis_mappings
+        );
+    }
+
+    /// A Glyphs 2 source still reads user locations off its instances' classes,
+    /// as glyphsLib does.
+    #[test]
+    fn loads_global_axis_mappings_from_instances_wdth_glyphs2() {
+        let font = Font::load(&glyphs2_dir().join("WdthVar.glyphs")).unwrap();
+
         // Did you load the mappings? DID YOU?!
         assert_eq!(
             UserToDesignMapping(BTreeMap::from([(
@@ -7725,6 +7834,8 @@ unitsPerEm = 1000;
             type_: InstanceType::Single,
             axis_mappings: Default::default(),
             axes_values: Vec::new(),
+            os2_weight_class: None,
+            os2_width_class: None,
             custom_parameters: CustomParameters {
                 family_name: Some("Fam Condensed".into()),
                 postscript_font_name: Some("FamCond-Regular".into()),

@@ -4517,8 +4517,34 @@ mod tests {
 
         // the default value for 'wght' is 700 (Bold) in this test font
         assert_eq!(vec![(Tag::new(b"wght"), 200.0, 700.0, 700.0)], axes(&font),);
-        // ... which is reflected in the OS/2 table usWeightClass
+        // ... but the axis is in design units, with no "Axis Location", so Glyphs
+        // doesn't read usWeightClass off it: it takes the weightClass of the
+        // exporting instance at the default, and there is none, so 400. Glyphs 3.5
+        // and 4.1.1 both export exactly that; fontmake would write 700.
+        assert_eq!(400, font.os2().unwrap().us_weight_class());
+    }
+
+    /// A Glyphs 3 source in design units reads its OS/2 classes off its
+    /// instances' weightClass, as Glyphs 3.5 and 4.1.1 export it: the variable
+    /// font's off the exporting instance at the default (here the Bold, at 132),
+    /// and each static's off its own.
+    #[test]
+    fn os2_weight_class_from_instances_in_design_units() {
+        let source = "glyphs3/WghtVar_Avar_From_Instances.glyphs";
+        let compile = TestCompile::compile_source(source);
+        let font = compile.font();
+        assert_eq!(vec![(Tag::new(b"wght"), 60.0, 132.0, 132.0)], axes(&font));
+        assert!(font.avar().is_err(), "no mapping, no avar");
         assert_eq!(700, font.os2().unwrap().us_weight_class());
+
+        for (name, class) in [("Light", 300), ("Regular", 400), ("Medium", 500)] {
+            let static_font = compile_instance(source, name);
+            assert_eq!(
+                class,
+                static_font.font().os2().unwrap().us_weight_class(),
+                "{name}"
+            );
+        }
     }
 
     #[test]
@@ -4540,12 +4566,45 @@ mod tests {
         let compile = TestCompile::compile_source("glyphs3/WdthVar.glyphs");
         let font = compile.font();
 
-        // the default value for 'wdth' is 50 (UltraCondensed) in this test font
-        assert_eq!(vec![(Tag::new(b"wdth"), 50.0, 50.0, 200.0)], axes(&font),);
-        // ... which is reflected in the OS/2 table usWidthClass (UltraCondensed = 1)
+        // A Glyphs 3 source without "Axis Location" is user == design, whatever its
+        // instances' width classes say, so the axis is the masters' 22-62, as Glyphs
+        // 3.5 and 4.1.1 both export it. The default is the UltraCondensed master...
+        assert_eq!(vec![(Tag::new(b"wdth"), 22.0, 22.0, 62.0)], axes(&font),);
+        // ... which is reflected in the OS/2 table usWidthClass (UltraCondensed = 1),
+        // again as Glyphs exports it
         assert_eq!(
             WidthClass::UltraCondensed as u16,
             font.os2().unwrap().us_width_class()
+        );
+    }
+
+    /// A Glyphs 3 source whose one exporting instance is a Medium with weightClass
+    /// 500 at design 483 used to fail with "No default master": glyphsLib's reading
+    /// pinned the axis to user 500 and every master fell off it. Glyphs 3.5 and
+    /// 4.1.1 export it as a 400-700 axis, no avar, the Medium at 483.
+    #[test]
+    fn one_exporting_instance_builds_as_glyphs_exports_it() {
+        let compile = TestCompile::compile_source("glyphs3/OneExportingInstance.glyphs");
+        let font = compile.font();
+
+        assert_eq!(vec![(Tag::new(b"wght"), 400.0, 400.0, 700.0)], axes(&font));
+        assert!(font.avar().is_err(), "no mapping, no avar");
+        assert_eq!(
+            font.fvar()
+                .unwrap()
+                .instances()
+                .unwrap()
+                .iter()
+                .map(|instance| instance.unwrap().coordinates[0].get().to_f64())
+                .collect::<Vec<_>>(),
+            vec![483.0]
+        );
+        // the weightClass is still the Medium's usWeightClass when it's built alone
+        let medium = compile_instance("glyphs3/OneExportingInstance.glyphs", "Medium");
+        assert_eq!(
+            500,
+            medium.font().os2().unwrap().us_weight_class(),
+            "the class is an OS/2 value"
         );
     }
 
@@ -7892,17 +7951,20 @@ mod tests {
     /// them — and the alternate *stays in the font*, GID and all, with no cmap
     /// entry, exactly as `fontmake -g ... -i` leaves it.
     ///
-    /// The axis maps design 40..200 onto user 100..900, so the bracket's
-    /// `min = 150` is user 650: `wght=900` is inside it and `wght=100` is not.
+    /// The source has no "Axis Location", so the axis is user == design, 40..200,
+    /// as Glyphs reads it (the instances' weight classes 100 and 900 are only
+    /// OS/2 values), and the bracket's `min = 150` is user 150: `wght=200`, the
+    /// Bold master, is inside it and `wght=40`, the Thin master, is not.
     /// `yen` is a composite of `peso` (`uni20B1`) and has a bracket layer of
     /// its own, so both swaps happen and the component references compose.
     ///
-    /// Verified against `fontmake -g LibreFranklin-bracketlayer.glyphs -i`:
-    /// `glyf`, `cmap`, `hmtx`, `post` and `GDEF` byte-identical at both pins.
+    /// Verified against `fontmake -g LibreFranklin-bracketlayer.glyphs -i`,
+    /// whose user space for this source is glyphsLib's 100..900, at the same two
+    /// masters: `glyf`, `cmap`, `hmtx`, `post` and `GDEF` byte-identical.
     #[test]
     fn instance_of_a_bracket_layer_source_keeps_the_alternate() {
-        let outside = compile_instance("glyphs3/LibreFranklin-bracketlayer.glyphs", "wght=100");
-        let inside = compile_instance("glyphs3/LibreFranklin-bracketlayer.glyphs", "wght=900");
+        let outside = compile_instance("glyphs3/LibreFranklin-bracketlayer.glyphs", "wght=40");
+        let inside = compile_instance("glyphs3/LibreFranklin-bracketlayer.glyphs", "wght=200");
 
         for result in [&outside, &inside] {
             assert_eq!(

@@ -482,6 +482,9 @@ fn instance_overrides(inst: &Instance) -> InstanceOverrides {
         names,
         name_records,
         postscript_full_name: inst.postscript_full_name().map(str::to_string),
+        // these depend on the font's axes; see `Os2ClassesFromInstances`
+        us_weight_class: None,
+        us_width_class: None,
     }
 }
 
@@ -593,6 +596,47 @@ fn plist_to_feature_writer_option(key: &str, value: &Plist) -> FeatureWriterOpti
     }
 }
 
+/// The usWeightClass and usWidthClass Glyphs reads off an instance's weightClass
+/// and widthClass rather than its user location, if any.
+///
+/// glyphsLib reads an instance's classes as its user location, so its OS/2
+/// classes come off that location and agree with them. Glyphs reads a Glyphs 3
+/// or 4 source's user space off "Axis Location" and "Axis Mappings" alone, and
+/// without them an axis is user == design and the classes are only OS/2 values:
+/// a 60-132 Weight axis whose Bold instance says weightClass 700 exports a Bold
+/// with usWeightClass 700, not 132. So for such an axis the classes come off the
+/// instance, at the defaults (400, 5) where it states none.
+#[derive(Clone, Copy, Debug, Default)]
+struct Os2ClassesFromInstances {
+    weight: bool,
+    width: bool,
+}
+
+impl Os2ClassesFromInstances {
+    fn new(font: &Font, axes: &Axes) -> Self {
+        let in_design_units = |tag: &[u8; 4]| {
+            !font.is_glyphs2()
+                && axes.get(&Tag::new(tag)).is_some_and(|axis| {
+                    axis.converter
+                        .iter()
+                        .all(|(user, design, _)| user.to_f64() == design.to_f64())
+                })
+        };
+        Self {
+            weight: in_design_units(b"wght"),
+            width: in_design_units(b"wdth"),
+        }
+    }
+
+    /// The classes for one instance, to replace those read off its location.
+    fn of(self, inst: &Instance) -> (Option<u16>, Option<u16>) {
+        (
+            self.weight.then(|| inst.os2_weight_class.unwrap_or(400)),
+            self.width.then(|| inst.os2_width_class.unwrap_or(5)),
+        )
+    }
+}
+
 #[derive(Debug)]
 struct StaticMetadataWork(GlyphsIrSource);
 
@@ -618,6 +662,7 @@ impl Work<Context, WorkId, Error> for StaticMetadataWork {
                 .unwrap_or("<nameless family>")
         );
         let axes = font_info.axes.clone();
+        let os2_classes = Os2ClassesFromInstances::new(font, &axes);
         let named_instances = font
             .instances
             .iter()
@@ -625,6 +670,8 @@ impl Work<Context, WorkId, Error> for StaticMetadataWork {
                 if inst.type_ != InstanceType::Single || !inst.active {
                     return None;
                 }
+                let mut overrides = instance_overrides(inst);
+                (overrides.us_weight_class, overrides.us_width_class) = os2_classes.of(inst);
                 // What `--instance` needs and fvar doesn't: what glyphsLib
                 // would call the instance UFO it generated here. Style linking
                 // is flag-driven, never name-driven.
@@ -657,7 +704,7 @@ impl Work<Context, WorkId, Error> for StaticMetadataWork {
                                     .to_string()
                             }),
                     ),
-                    overrides: instance_overrides(inst),
+                    overrides,
                 })
             })
             .collect();
@@ -781,6 +828,24 @@ impl Work<Context, WorkId, Error> for StaticMetadataWork {
         )
         .map_err(Error::VariationModelError)?;
         static_metadata.misc.selection_flags = selection_flags;
+        // The variable font's classes are those of the exporting instance at the
+        // default, as Glyphs exports it; with none there, the defaults.
+        let default_position = &font_info.master_positions[&font.default_master().id];
+        let at_default = font.instances.iter().find(|inst| {
+            inst.type_ == InstanceType::Single
+                && inst.active
+                && font_info.locations.get(&inst.axes_values) == Some(default_position)
+        });
+        (
+            static_metadata.misc.variable_us_weight_class,
+            static_metadata.misc.variable_us_width_class,
+        ) = match at_default {
+            Some(inst) => os2_classes.of(inst),
+            None => (
+                os2_classes.weight.then_some(400),
+                os2_classes.width.then_some(5),
+            ),
+        };
         if let Some(stat_axes) = stat_axes {
             // glyphsLib's fixed elided fallback name
             static_metadata.set_stat(stat_axes, Some("Regular".to_string()));
