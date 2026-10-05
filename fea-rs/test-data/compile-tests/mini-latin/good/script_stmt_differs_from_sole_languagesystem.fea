@@ -1,0 +1,13 @@
+# the companion to script_stmt_matches_sole_languagesystem.fea: a 'script'
+# statement is only a no-op when the active language systems are exactly that
+# script with the 'dflt' language, so a leading 'script grek' in a file whose
+# sole languagesystem is 'latn dflt' does take effect, and nothing lands under
+# DFLT.
+languagesystem latn dflt;
+
+feature test {
+script grek;
+sub A by B;
+script latn;
+sub C by D;
+} test;

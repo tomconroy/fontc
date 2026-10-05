@@ -1,0 +1,81 @@
+{
+.formatVersion = 3;
+familyName = "Glyph Predicate";
+classes = (
+{
+code = "$[category like \"Letter\" && case == lower && unicode != nil]";
+name = lower;
+}
+);
+features = (
+{
+code = "sub @lower by A;";
+tag = ss01;
+}
+);
+fontMaster = (
+{
+id = m01;
+name = Regular;
+}
+);
+glyphs = (
+{
+glyphname = space;
+layers = (
+{
+layerId = m01;
+width = 200;
+}
+);
+unicode = 32;
+},
+{
+case = upper;
+category = Letter;
+glyphname = A;
+layers = (
+{
+layerId = m01;
+width = 500;
+}
+);
+unicode = 65;
+},
+{
+case = lower;
+category = Letter;
+glyphname = a;
+layers = (
+{
+layerId = m01;
+width = 500;
+}
+);
+unicode = 97;
+},
+{
+case = lower;
+category = Letter;
+glyphname = "a.alt";
+layers = (
+{
+layerId = m01;
+width = 500;
+}
+);
+},
+{
+category = Number;
+glyphname = one;
+layers = (
+{
+layerId = m01;
+width = 500;
+}
+);
+unicode = 49;
+}
+);
+unitsPerEm = 1000;
+}

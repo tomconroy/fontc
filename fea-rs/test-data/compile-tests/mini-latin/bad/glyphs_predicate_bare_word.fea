@@ -1,3 +1,0 @@
-# Unquoted values must be quoted.
-@x = [ $[name == sc] ];
-feature test { sub @x by a; } test;

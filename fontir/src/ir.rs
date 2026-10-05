@@ -44,9 +44,9 @@ pub use feature_writers::{
 pub use path_builder::GlyphPathBuilder;
 pub use static_metadata::{
     AxisMapping, AxisValueLabel, Condition, ConditionSet, FilterScope, GdefCategories,
-    InstanceOverrides, MetaTableValues, MiscMetadata, NameKey, NamedInstance, Panose,
-    PostscriptNames, PostscriptSettings, PreliminaryGdefCategories, Rule, StatAxis, StaticMetadata,
-    StyleMapStyle, Substitution, VariableFeature,
+    GlyphPredicateAttrs, InstanceOverrides, MetaTableValues, MiscMetadata, NameKey, NamedInstance,
+    Panose, PostscriptNames, PostscriptSettings, PreliminaryGdefCategories, Rule, StatAxis,
+    StaticMetadata, StyleMapStyle, Substitution, VariableFeature,
 };
 
 pub const DEFAULT_VENDOR_ID: &str = "NONE";
@@ -1072,6 +1072,7 @@ fn is_ribbi(style_name: &str) -> bool {
 }
 
 impl NameBuilder {
+    /// Family and subfamily, joined, e.g. "Family" and "Bold Italic".
     pub fn make_family_name(family: &str, subfamily: &str) -> String {
         let mut family = vec![family];
         family.extend(subfamily.split_ascii_whitespace());

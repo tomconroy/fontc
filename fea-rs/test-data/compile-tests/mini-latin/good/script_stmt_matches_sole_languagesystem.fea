@@ -1,0 +1,23 @@
+# fonttools (since 4.66) seeds the current script and language from the
+# first declared language system, so in a file whose only 'languagesystem'
+# statement is 'languagesystem latn dflt', a leading 'script latn' names the
+# system that is already current: it keeps the lookupflag, but still narrows
+# the rules that follow to latn/dflt. Every rule here lands under latn.
+# (fonttools 4.62 instead left the first rule under DFLT/dflt.)
+#
+# Chathura is a source like this: its Glyphs feature prefix declares a single
+# 'languagesystem telu dflt' and its feature blocks each open with
+# 'script telu; language dflt;'.
+languagesystem latn dflt;
+
+feature test {
+script latn;
+language dflt;
+sub A by B;
+script latn;
+language dflt;
+sub C by D;
+script latn;
+language dflt;
+sub E by F;
+} test;

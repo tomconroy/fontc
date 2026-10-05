@@ -20,11 +20,11 @@ use fontir::{
         self, AnchorBuilder, ColorGlyphs, ColorPalettes, Condition, ConditionSet,
         DEFAULT_VENDOR_ID, FEATURE_WRITERS_LIB_KEY, FeatureWriterOptionValue, FeatureWriterSpec,
         FilterScope, GlobalMetric, GlobalMetrics, GlobalMetricsBuilder, GlyphAnchors,
-        GlyphInstance, GlyphOrder, InstanceOverrides, KernGroup, KernSide, KerningInstance,
-        KerningLocations, MetaTableValues, NameBuilder, NameKey, NamedInstance, Paint, PaintGlyph,
-        Panose, PostscriptNames, PostscriptSettings, PreliminaryGdefCategories, Rule,
-        StaticMetadata, StyleMapStyle, Substitution, VariableFeature, reject_duplicate_writers,
-        validate_feature_writer,
+        GlyphInstance, GlyphOrder, GlyphPredicateAttrs, InstanceOverrides, KernGroup, KernSide,
+        KerningInstance, KerningLocations, MetaTableValues, NameBuilder, NameKey, NamedInstance,
+        Paint, PaintGlyph, Panose, PostscriptNames, PostscriptSettings, PreliminaryGdefCategories,
+        Rule, StaticMetadata, StyleMapStyle, Substitution, VariableFeature,
+        reject_duplicate_writers, validate_feature_writer,
     },
     orchestration::{Context, Flags, IrWork, WorkId},
     source::Source,
@@ -363,6 +363,12 @@ fn to_ir_panose(raw: &[i64]) -> Panose {
 /// and `widthClass` are blacklisted out of the instance lib entirely
 /// (`constants.py:77-88`); the axis mapping decides those.
 ///
+/// `Replace Feature`/`Prefix` stay on that list *for instances only*: a
+/// master's copies are honored, but only the default master's, because those
+/// rewrite the one feature file fontc compiles (see `FeatureReplacements` in
+/// glyphs-reader). Honoring an instance's would mean rewriting features at the
+/// pin, which needs the same merge machinery we lack for the other masters.
+///
 /// <https://github.com/googlefonts/glyphsLib/blob/main/Lib/glyphsLib/builder/custom_params.py#L314-L448>
 fn instance_overrides(inst: &Instance) -> InstanceOverrides {
     let params = &inst.custom_parameters;
@@ -476,6 +482,9 @@ fn instance_overrides(inst: &Instance) -> InstanceOverrides {
         names,
         name_records,
         postscript_full_name: inst.postscript_full_name().map(str::to_string),
+        // these depend on the font's axes; see `Os2ClassesFromInstances`
+        us_weight_class: None,
+        us_width_class: None,
     }
 }
 
@@ -587,6 +596,47 @@ fn plist_to_feature_writer_option(key: &str, value: &Plist) -> FeatureWriterOpti
     }
 }
 
+/// The usWeightClass and usWidthClass Glyphs reads off an instance's weightClass
+/// and widthClass rather than its user location, if any.
+///
+/// glyphsLib reads an instance's classes as its user location, so its OS/2
+/// classes come off that location and agree with them. Glyphs reads a Glyphs 3
+/// or 4 source's user space off "Axis Location" and "Axis Mappings" alone, and
+/// without them an axis is user == design and the classes are only OS/2 values:
+/// a 60-132 Weight axis whose Bold instance says weightClass 700 exports a Bold
+/// with usWeightClass 700, not 132. So for such an axis the classes come off the
+/// instance, at the defaults (400, 5) where it states none.
+#[derive(Clone, Copy, Debug, Default)]
+struct Os2ClassesFromInstances {
+    weight: bool,
+    width: bool,
+}
+
+impl Os2ClassesFromInstances {
+    fn new(font: &Font, axes: &Axes) -> Self {
+        let in_design_units = |tag: &[u8; 4]| {
+            !font.is_glyphs2()
+                && axes.get(&Tag::new(tag)).is_some_and(|axis| {
+                    axis.converter
+                        .iter()
+                        .all(|(user, design, _)| user.to_f64() == design.to_f64())
+                })
+        };
+        Self {
+            weight: in_design_units(b"wght"),
+            width: in_design_units(b"wdth"),
+        }
+    }
+
+    /// The classes for one instance, to replace those read off its location.
+    fn of(self, inst: &Instance) -> (Option<u16>, Option<u16>) {
+        (
+            self.weight.then(|| inst.os2_weight_class.unwrap_or(400)),
+            self.width.then(|| inst.os2_width_class.unwrap_or(5)),
+        )
+    }
+}
+
 #[derive(Debug)]
 struct StaticMetadataWork(GlyphsIrSource);
 
@@ -612,6 +662,7 @@ impl Work<Context, WorkId, Error> for StaticMetadataWork {
                 .unwrap_or("<nameless family>")
         );
         let axes = font_info.axes.clone();
+        let os2_classes = Os2ClassesFromInstances::new(font, &axes);
         let named_instances = font
             .instances
             .iter()
@@ -619,6 +670,8 @@ impl Work<Context, WorkId, Error> for StaticMetadataWork {
                 if inst.type_ != InstanceType::Single || !inst.active {
                     return None;
                 }
+                let mut overrides = instance_overrides(inst);
+                (overrides.us_weight_class, overrides.us_width_class) = os2_classes.of(inst);
                 // What `--instance` needs and fvar doesn't: what glyphsLib
                 // would call the instance UFO it generated here. Style linking
                 // is flag-driven, never name-driven.
@@ -651,7 +704,7 @@ impl Work<Context, WorkId, Error> for StaticMetadataWork {
                                     .to_string()
                             }),
                     ),
-                    overrides: instance_overrides(inst),
+                    overrides,
                 })
             })
             .collect();
@@ -775,6 +828,24 @@ impl Work<Context, WorkId, Error> for StaticMetadataWork {
         )
         .map_err(Error::VariationModelError)?;
         static_metadata.misc.selection_flags = selection_flags;
+        // The variable font's classes are those of the exporting instance at the
+        // default, as Glyphs exports it; with none there, the defaults.
+        let default_position = &font_info.master_positions[&font.default_master().id];
+        let at_default = font.instances.iter().find(|inst| {
+            inst.type_ == InstanceType::Single
+                && inst.active
+                && font_info.locations.get(&inst.axes_values) == Some(default_position)
+        });
+        (
+            static_metadata.misc.variable_us_weight_class,
+            static_metadata.misc.variable_us_width_class,
+        ) = match at_default {
+            Some(inst) => os2_classes.of(inst),
+            None => (
+                os2_classes.weight.then_some(400),
+                os2_classes.width.then_some(5),
+            ),
+        };
         if let Some(stat_axes) = stat_axes {
             // glyphsLib's fixed elided fallback name
             static_metadata.set_stat(stat_axes, Some("Regular".to_string()));
@@ -783,6 +854,10 @@ impl Work<Context, WorkId, Error> for StaticMetadataWork {
         static_metadata.misc.decompose_components =
             decompose_components_from_user_data(&font.default_master().user_data);
         static_metadata.variations = variations;
+        // always Some for a Glyphs source, even when no glyph sets anything:
+        // it is what tells the FEA compiler that predicate tokens can be
+        // answered here at all
+        static_metadata.glyph_predicate_attrs = Some(make_glyph_predicate_attrs(font));
         // what `names` above already handed NameBuilder, kept so that a pin can
         // rebuild name id 3 with the same string; see `MiscMetadata::raw_vendor_id`
         static_metadata.misc.raw_vendor_id =
@@ -1211,6 +1286,11 @@ fn bracket_glyphs<'a>(
 }
 
 // https://github.com/googlefonts/glyphsLib/blob/c4db6b981d/Lib/glyphsLib/classes.py#L3947
+//
+// The rules are indexed by the source's own axes, but glyphsLib zips them against the
+// designspace axes - the ones that survived - so a rule for a dropped axis is read as
+// the next surviving axis' rule. Match that.
+// <https://github.com/googlefonts/glyphsLib/blob/v6.13.1/Lib/glyphsLib/classes.py#L4009-L4013>
 fn get_bracket_info(layer: &Layer, axes: &Axes) -> ConditionSet {
     assert!(
         !layer.attributes.axis_rules.is_empty(),
@@ -1218,7 +1298,6 @@ fn get_bracket_info(layer: &Layer, axes: &Axes) -> ConditionSet {
     );
 
     axes.iter()
-        .filter(|ax| !ax.is_point())
         .zip(&layer.attributes.axis_rules)
         .map(|(axis, rule)| {
             let min = rule
@@ -1297,6 +1376,36 @@ fn get_number_values(
         })
         .collect();
     Some(values)
+}
+
+/// What a FEA glyph predicate token may ask about each glyph.
+///
+/// Only glyphs that set at least one attribute get an entry; the rest answer
+/// `None` for everything, which is what glyphsLib compares against (a `GSGlyph`
+/// attribute the file never set stays Python `None`).
+///
+/// `unicode` is glyphsLib's `GSGlyph.unicode`: the glyph's first codepoint,
+/// formatted `%04X`, which is what glyphsLib stores for a Glyphs 3 file
+/// (`classes.py`, `_parse_unicode_dict`). We hold codepoints in a sorted set,
+/// so "first" here is the lowest, which differs from source order only for a
+/// glyph that lists several codepoints out of order.
+fn make_glyph_predicate_attrs(font: &Font) -> BTreeMap<GlyphName, GlyphPredicateAttrs> {
+    font.glyphs
+        .values()
+        .filter_map(|glyph| {
+            let attrs = GlyphPredicateAttrs {
+                category: glyph.source_info.category.clone(),
+                sub_category: glyph.source_info.sub_category.clone(),
+                case: glyph.source_info.case.clone(),
+                unicode: glyph
+                    .unicode
+                    .first()
+                    .map(|cp| SmolStr::new(format!("{cp:04X}"))),
+            };
+            (attrs != GlyphPredicateAttrs::default())
+                .then(|| (GlyphName::new(glyph.name.as_str()), attrs))
+        })
+        .collect()
 }
 
 /// Compute preliminary GDEF glyph category WITHOUT anchor inspection.
@@ -1608,11 +1717,105 @@ impl FontInfo {
     }
 }
 
-//https://github.com/googlefonts/glyphsLib/blob/682ff4b177/Lib/glyphsLib/builder/groups.py#L114
+/// Where a UFO -> .glyphs conversion stashed the source's kerning groups.
+///
+/// `_to_glyphs_kerning_group` writes the original `public.kern{1,2}.*` member
+/// lists here before flattening them onto each glyph's `kernRight`/`kernLeft`,
+/// because that flattening is lossy: Glyphs can only say "this glyph's right
+/// side kerns as group X", so a group whose name is not X, or one listing a
+/// glyph this font does not have, would otherwise be gone.
+///
+/// <https://github.com/googlefonts/glyphsLib/blob/682ff4b177/Lib/glyphsLib/builder/groups.py#L164-L171>
+const ORIGINAL_KERNING_GROUPS_KEY: &str = "com.schriftgestaltung.Glyphs.originalKerningGroups";
+
+const UFO_SIDE1_PREFIX: &str = "public.kern1.";
+const UFO_SIDE2_PREFIX: &str = "public.kern2.";
+
+/// The UFO side (1 or 2) and bare name of a `public.kern{1,2}.NAME` group.
+///
+/// glyphsLib's `UFO_KERN_GROUP_PATTERN`, `^public\.kern([12])\.(.*)$`.
+/// <https://github.com/googlefonts/glyphsLib/blob/682ff4b177/Lib/glyphsLib/builder/constants.py#L59>
+fn parse_ufo_kern_group(name: &str) -> Option<(u8, SmolStr)> {
+    name.strip_prefix(UFO_SIDE1_PREFIX)
+        .map(|ident| (1u8, ident.into()))
+        .or_else(|| {
+            name.strip_prefix(UFO_SIDE2_PREFIX)
+                .map(|ident| (2u8, ident.into()))
+        })
+}
+
+/// The per-glyph kern attribute a UFO group side is built from, unflipped.
+///
+/// glyphsLib's `_glyph_kerning_attr(side)`: UFO side 1 (the *first* glyph of a
+/// pair, so the glyph's right side) is `rightKerningGroup`, side 2 is
+/// `leftKerningGroup`.
+/// <https://github.com/googlefonts/glyphsLib/blob/682ff4b177/Lib/glyphsLib/builder/groups.py#L182-L195>
+fn kern_attr_for_side(glyph: &glyphs_reader::Glyph, side: u8) -> Option<&SmolStr> {
+    match side {
+        1 => glyph.right_kern.as_ref(),
+        _ => glyph.left_kern.as_ref(),
+    }
+}
+
+/// The `(group name, members)` pairs a round-tripped source remembers.
+fn original_kerning_groups(font: &Font) -> impl Iterator<Item = (&SmolStr, &[Plist])> {
+    font.user_data
+        .get(ORIGINAL_KERNING_GROUPS_KEY)
+        .and_then(Plist::as_dict)
+        .into_iter()
+        .flatten()
+        .filter_map(|(name, members)| Some((name, members.as_array()?)))
+}
+
+//https://github.com/googlefonts/glyphsLib/blob/682ff4b177/Lib/glyphsLib/builder/groups.py#L65-L129
 fn derive_kern_groups(font_info: &FontInfo) -> BTreeMap<KernGroup, BTreeSet<GlyphName>> {
     let font = &font_info.font;
     let mut groups: BTreeMap<KernGroup, BTreeSet<GlyphName>> = Default::default();
     let rtl_glyphs = get_glyphs_with_rtl_kerning(font);
+
+    // If this source round-tripped through a UFO, its original grouping wins
+    // wherever it is still consistent with the glyph's own kern attribute, and
+    // the (glyph, side) it settles is then off-limits below. Note that
+    // recovery reads the *unflipped* attribute: `_glyph_kerning_attr` is called
+    // without `is_rtl` here, so an RTL glyph whose two sides name different
+    // groups lands somewhere the derive-from-scratch pass would never put it.
+    // <https://github.com/googlefonts/glyphsLib/blob/682ff4b177/Lib/glyphsLib/builder/groups.py#L86-L105>
+    let mut recovered: HashSet<(SmolStr, u8)> = HashSet::new();
+    for (raw_name, members) in original_kerning_groups(font) {
+        let Some((side, ident)) = parse_ufo_kern_group(raw_name) else {
+            continue;
+        };
+        for member in members.iter().filter_map(Plist::as_str) {
+            // glyphsLib keeps a name that is not a glyph of this font, on the
+            // grounds that a UFO group may legitimately list one; ufo2ft prunes
+            // it against the glyphset before writing any kerning, as it does
+            // any non-exporting glyph, so fontc simply never adds it.
+            // <https://github.com/googlefonts/ufo2ft/blob/v3.9.0/Lib/ufo2ft/featureWriters/kernFeatureWriter.py#L877-L882>
+            let Some(glyph) = font.glyphs.get(member) else {
+                continue;
+            };
+            // The stored grouping only survives if it still agrees with the
+            // glyph.
+            if kern_attr_for_side(glyph, side) != Some(&ident) {
+                continue;
+            }
+            recovered.insert((member.into(), side));
+            if !glyph.export {
+                continue;
+            }
+            let group = if side == 1 {
+                KernGroup::Side1(ident.clone())
+            } else {
+                KernGroup::Side2(ident.clone())
+            };
+            groups.entry(group).or_default().extend(
+                bracket_glyph_names(glyph, &font_info.axes)
+                    .map(|(name, _)| name)
+                    .chain(Some(GlyphName::from(member))),
+            );
+        }
+    }
+
     // build up the kern groups; a glyph may belong to a group on either or
     // both 'side'.
     for (name, glyph) in font
@@ -1635,6 +1838,15 @@ fn derive_kern_groups(font_info: &FontInfo) -> BTreeMap<KernGroup, BTreeSet<Glyp
             (right, left)
         };
         for group in [side1, side2].into_iter().flatten() {
+            // which UFO side a group belongs to is the group's own variant, not
+            // the position in the pair above: flipping an RTL glyph swaps them.
+            let side = match group {
+                KernGroup::Side1(..) => 1,
+                KernGroup::Side2(..) => 2,
+            };
+            if recovered.contains(&(name.clone(), side)) {
+                continue;
+            }
             groups.entry(group).or_default().extend(
                 bracket_names
                     .iter()
@@ -3762,6 +3974,64 @@ mod tests {
                 ("@side1.bet", "@side2.alef", 29)
             ])
         )
+    }
+
+    #[test]
+    fn recovers_original_ufo_kern_groups() {
+        // A source that round-tripped from a UFO keeps its original grouping in
+        // `com.schriftgestaltung.Glyphs.originalKerningGroups`, and glyphsLib
+        // restores from it before deriving anything from kernLeft/kernRight
+        // (groups.py:86-105). AE, whose two sides name *different* groups
+        // (kernLeft = A, kernRight = E), is the case that can only be told
+        // apart that way: it is dragged into RTL by the @MMK_R_A pair, and
+        // recovery -- which does not flip sides -- pins it to side1.E, where the
+        // flipped derivation would have put it in side1.A and kerned it -60
+        // against o instead of -40 against a. This is Solitreo's `AE`.
+        //
+        // Oracle (glyphsLib 6.13.1 to_designspace on this same file):
+        //   public.kern1.A ['A']            public.kern2.A ['A', 'Aacute']
+        //   public.kern1.E ['AE', 'E']      public.kern2.E ['AE', 'E']
+        //   public.kern1.V ['V']            public.kern2.V ['V']
+        //                                   public.kern2.a ['a']
+        //                                   public.kern2.o ['o']
+        let (_, context) = build_kerning(glyphs3_dir().join("KerningOriginalGroups.glyphs"));
+        let kerning = context.kerning_at.all()[0].1.clone();
+
+        let groups: Vec<(String, Vec<&str>)> = kerning
+            .groups
+            .iter()
+            .map(|(group, members)| {
+                (
+                    group.to_string(),
+                    members.iter().map(|m| m.as_str()).collect(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            groups,
+            vec![
+                // AE is NOT here: the recovered public.kern1.E claimed its side 1
+                ("side1.A".to_string(), vec!["A"]),
+                ("side1.E".to_string(), vec!["AE", "E"]),
+                ("side1.V".to_string(), vec!["V"]),
+                // 'Aacute' is not a glyph of this font; glyphsLib keeps the name
+                // and ufo2ft prunes it against the glyphset, so we never add it
+                ("side2.A".to_string(), vec!["A"]),
+                ("side2.E".to_string(), vec!["AE", "E"]),
+                ("side2.V".to_string(), vec!["V"]),
+                ("side2.a".to_string(), vec!["a"]),
+                ("side2.o".to_string(), vec!["o"]),
+            ]
+        );
+
+        assert_eq!(
+            kerning.kerns,
+            make_kerning(&[
+                ("@side1.A", "@side2.V", -70),
+                ("@side1.A", "@side2.o", -60),
+                ("@side1.E", "@side2.a", -40),
+            ])
+        );
     }
 
     #[test]

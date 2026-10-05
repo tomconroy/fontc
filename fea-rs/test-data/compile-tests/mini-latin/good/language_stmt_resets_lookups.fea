@@ -1,0 +1,35 @@
+# A repeated 'language' statement keeps what the language system has already
+# accumulated: fonttools (since 4.66) only ever adds or removes the script's
+# default lookups there, never replaces the list
+# (fontTools/feaLib/builder.py, set_language). So latn/TRK gets 'two' and
+# 'four' as well as the latn/dflt lookups, which it picks up again on the
+# second 'language TRK'. (fonttools 4.62 assigned instead, dropping 'two'.)
+#
+# Estedad is a source that hits this: glyphsLib emits one lookup block per
+# generated lookup, each repeating 'script latn; language ...;'.
+languagesystem DFLT dflt;
+languagesystem latn dflt;
+languagesystem latn TRK;
+
+feature test {
+    lookup one {
+        script latn;
+        language dflt;
+        sub A by B;
+    } one;
+    lookup two {
+        script latn;
+        language TRK;
+        sub C by D;
+    } two;
+    lookup three {
+        script latn;
+        language dflt;
+        sub E by F;
+    } three;
+    lookup four {
+        script latn;
+        language TRK;
+        sub G by H;
+    } four;
+} test;

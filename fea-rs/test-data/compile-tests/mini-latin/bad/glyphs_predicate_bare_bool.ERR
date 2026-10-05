@@ -1,4 +1,4 @@
-error: glyphs predicate values must be quoted (see fontc#2052)
+error: the unquoted value 'yes' is a boolean to glyphsLib, and never equals a glyph attribute: quote it to compare it as text
 in ./test-data/compile-tests/mini-latin/bad/glyphs_predicate_bare_bool.fea at 3:17
   | 
 3 | @x = [ $[name == yes] ];
