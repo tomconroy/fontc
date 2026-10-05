@@ -27,6 +27,7 @@ rayon = "1.6"
 icu_properties = "=2.1.2"
 smallvec = {version = "1.15", features = ["const_new"]}
 tinystr = "0.8.0"
+unicode-normalization = "0.1.25"
 
 # fontations etc
 write-fonts = { version = "0.54.0", features = ["serde", "read", "tables"]  }
@@ -59,3 +60,12 @@ members = [
     "otl-normalizer",
     "fontc_crater",
 ]
+
+# fontations with the unreleased CFF/CFF2 writer (tomconroy/fontations
+# fontgit-merge-0.54: upstream write-fonts 0.54.0 / skrifa 0.48.0 plus
+# ps::cff); drop once write-fonts with ps::cff is published.
+[patch.crates-io]
+font-types = { git = "https://github.com/tomconroy/fontations.git", rev = "036c6bd36dcada9515363b57f2931321e73b4387" }
+read-fonts = { git = "https://github.com/tomconroy/fontations.git", rev = "036c6bd36dcada9515363b57f2931321e73b4387" }
+write-fonts = { git = "https://github.com/tomconroy/fontations.git", rev = "036c6bd36dcada9515363b57f2931321e73b4387" }
+skrifa = { git = "https://github.com/tomconroy/fontations.git", rev = "036c6bd36dcada9515363b57f2931321e73b4387" }

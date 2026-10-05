@@ -307,6 +307,10 @@ pub struct MiscMetadata {
 
     /// The `decomposeComponents` ufo2ft filter, if the source lists it.
     pub decompose_components: Option<FilterScope>,
+
+    /// PostScript-specific data at the default location, feeding the CFF table.
+    #[serde(default)]
+    pub postscript: PostscriptSettings,
 }
 
 /// The glyphs a ufo2ft filter applies to: all of them, or an `include` or
@@ -344,6 +348,45 @@ impl FilterScope {
             FilterScope::Exclude(names) => !names.contains(glyph_name),
         }
     }
+}
+
+/// The `postscript*` keys of UFO fontinfo, mostly CFF hinting data.
+///
+/// For Glyphs sources the equivalent values are derived from alignment zones,
+/// stems, and custom parameters, the way glyphsLib fills them into the UFOs
+/// it generates.
+///
+/// Arrays are empty when the source provides none. Values are kept unrounded;
+/// CFF compilation rounds them the same way ufo2ft does. All values are taken
+/// from the default master: hints for other masters would only matter to
+/// CFF2, which is not supported.
+///
+/// See <https://unifiedfontobject.org/versions/ufo3/fontinfo.plist/#postscript-specific-data>
+#[derive(Serialize, Deserialize, Default, Debug, Clone, PartialEq, Eq)]
+pub struct PostscriptSettings {
+    pub blue_values: Vec<OrderedFloat<f64>>,
+    pub other_blues: Vec<OrderedFloat<f64>>,
+    pub family_blues: Vec<OrderedFloat<f64>>,
+    pub family_other_blues: Vec<OrderedFloat<f64>>,
+    pub blue_scale: Option<OrderedFloat<f64>>,
+    pub blue_shift: Option<OrderedFloat<f64>>,
+    pub blue_fuzz: Option<OrderedFloat<f64>>,
+    pub stem_snap_h: Vec<OrderedFloat<f64>>,
+    pub stem_snap_v: Vec<OrderedFloat<f64>>,
+    pub force_bold: Option<bool>,
+    /// Becomes the CFF TopDict `Weight`; not necessarily a wght axis name.
+    pub weight_name: Option<String>,
+    /// Becomes the CFF TopDict `FullName`.
+    ///
+    /// This is the source's `postscriptFullName`, which is neither the name
+    /// table's full font name (id 4) nor its PostScript name (id 6), and which
+    /// nothing but the CFF reads. When it is unset the CFF work falls back the
+    /// way ufo2ft does.
+    pub full_name: Option<String>,
+    /// If set, overrides the computed CFF `defaultWidthX`.
+    pub default_width_x: Option<OrderedFloat<f64>>,
+    /// If set, overrides the computed CFF `nominalWidthX`.
+    pub nominal_width_x: Option<OrderedFloat<f64>>,
 }
 
 /// Records that will go in the '[meta]' table.
@@ -624,6 +667,7 @@ impl StaticMetadata {
                 elided_fallback_name: None,
                 unicode_variation_sequences: Default::default(),
                 decompose_components: None,
+                postscript: Default::default(),
             },
             variations: None,
         })
@@ -829,6 +873,12 @@ mod tests {
                 elided_fallback_name: None,
                 unicode_variation_sequences: Default::default(),
                 decompose_components: None,
+                postscript: PostscriptSettings {
+                    blue_values: vec![(-10.0).into(), 0.0.into(), 700.0.into(), 710.0.into()],
+                    blue_scale: Some(0.05.into()),
+                    weight_name: Some("Chonky".to_string()),
+                    ..Default::default()
+                },
             },
             number_values: Default::default(),
             variations: None,

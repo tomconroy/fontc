@@ -1,0 +1,34 @@
+{
+.appVersion = "1365";
+familyName = "New Font";
+fontMaster = (
+{
+alignmentZones = (
+"{1069, 15}",
+"{0, -20}",
+"{0, -20}",
+"{0, -20}",
+"{-160, 0}",
+"{-634, -15}"
+);
+ascender = 1069;
+descender = -634;
+id = "CEAF8881-3B30-4737-AC29-09BAEF72AFFD";
+}
+);
+glyphs = (
+{
+glyphname = A;
+layers = (
+{
+layerId = "CEAF8881-3B30-4737-AC29-09BAEF72AFFD";
+width = 600;
+}
+);
+unicode = 0041;
+}
+);
+unitsPerEm = 1000;
+versionMajor = 1;
+versionMinor = 0;
+}
