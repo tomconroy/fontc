@@ -2476,6 +2476,16 @@ impl RawFont {
                 used_metrics[i] |= val.is_some();
             }
         }
+        // v2 has no baseline field: every v2 master has an implicit baseline
+        // at 0, and an alignment zone at 0 is its overshoot. Glyphs lists the
+        // baseline when it opens a v2 file; we keep it whenever a zone gives it
+        // a value, like any other used metric.
+        used_metrics[1] |= self.font_master.iter().any(|m| {
+            m.alignment_zones
+                .iter()
+                .filter_map(|z| parse_alignment_zone(z))
+                .any(|(pos, over)| pos == 0. && over != 0.)
+        });
 
         // add only used metrics to the metric list
         self.metrics = V3_METRIC_NAMES
