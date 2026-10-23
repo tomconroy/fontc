@@ -700,14 +700,15 @@ fn apply_optional_transformations(
     Ok(())
 }
 
-/// Merge the overlapping contours of every glyph in `glyph_order`.
+/// Merge the overlapping contours of every glyph in `glyph_order`, if the
+/// font is static: a single-master source, or a pinned instance.
 ///
-/// Only for a static font: a union per master would leave the masters
+/// A variable font is left alone: a union per master would leave the masters
 /// incompatible, which is why fontmake never removes a variable font's
 /// overlaps either. See [`crate::overlaps`] for what the union does.
 fn remove_overlaps(context: &Context, glyph_order: &GlyphOrder) -> Result<(), BadGlyph> {
     if !context.static_metadata.get().axes.is_empty() {
-        log::warn!("Not removing overlaps: they are only removed from static fonts");
+        debug!("Not removing overlaps: the font is variable");
         return Ok(());
     }
     let glyphs: Vec<_> = glyph_order

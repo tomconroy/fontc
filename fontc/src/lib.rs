@@ -831,6 +831,9 @@ mod tests {
         let result = TestCompile::compile("glyphs2/MixedContourComponent.glyphs", |mut args| {
             args.flags
                 .set(Flags::PREFER_SIMPLE_GLYPHS, prefer_simple_glyphs); // <-- important :)
+            // the decomposed contour overlaps the glyph's own; keep both, so
+            // what this checks is the decomposition alone
+            args.flags.remove(Flags::REMOVE_OVERLAPS);
             args
         });
 
@@ -7317,18 +7320,23 @@ mod tests {
         })
     }
 
-    // ---- --instance removes overlaps, like fontmake's static builds ----
+    // ---- a static font loses its overlaps, like fontmake's static builds ----
 
-    /// What `--instance` sets (without `--keep-overlaps`), optionally with
-    /// `--flavor otf`.
-    fn compile_instance_removing_overlaps(source: &str, instance: &str, cff: bool) -> TestCompile {
+    /// Compile `source` (at `instance`, if any) the way the command line would,
+    /// optionally with `--flavor otf` and `--keep-overlaps`.
+    fn compile_static(
+        source: &str,
+        instance: Option<&str>,
+        cff: bool,
+        keep_overlaps: bool,
+    ) -> TestCompile {
         TestCompile::compile(source, |mut options| {
-            options.flags |= Flags::REMOVE_OVERLAPS;
+            options.flags.set(Flags::REMOVE_OVERLAPS, !keep_overlaps);
             if cff {
                 options.flags |= Flags::CFF_OUTLINES | Flags::DECOMPOSE_COMPONENTS;
                 options.output_file = options.output_file.map(|path| path.with_extension("otf"));
             }
-            options.instance = Some(instance.parse().unwrap());
+            options.instance = instance.map(|i| i.parse().unwrap());
             options
         })
     }
@@ -7372,16 +7380,9 @@ mod tests {
         assert_eq!(contours_drawn(result, "plus"), 1);
     }
 
-    #[test]
-    fn an_instance_has_its_overlaps_removed() {
-        let result = compile_instance_removing_overlaps(
-            "glyphs3/WghtVar_Overlaps.glyphs",
-            "wght=550",
-            false,
-        );
-        assert_plus_is_one_cross(&result);
-        // like ufo2ft, a composite's components are left to overlap: there
-        // are no contours to union
+    /// Like ufo2ft, a composite's components are left to overlap in a
+    /// TrueType font: there are no contours to union.
+    fn assert_plusplus_is_still_a_composite(result: &TestCompile) {
         let glyphs = result.glyphs();
         let Some(glyf::Glyph::Composite(plusplus)) =
             &glyphs.read()[result.get_gid("plusplus").to_u32() as usize]
@@ -7392,17 +7393,72 @@ mod tests {
     }
 
     #[test]
+    fn an_instance_has_its_overlaps_removed() {
+        let result = compile_static(
+            "glyphs3/WghtVar_Overlaps.glyphs",
+            Some("wght=550"),
+            false,
+            false,
+        );
+        assert_plus_is_one_cross(&result);
+        assert_plusplus_is_still_a_composite(&result);
+    }
+
+    #[test]
     fn a_cff_instance_has_its_overlaps_removed_after_decomposition() {
-        let result =
-            compile_instance_removing_overlaps("glyphs3/WghtVar_Overlaps.glyphs", "wght=550", true);
+        let result = compile_static(
+            "glyphs3/WghtVar_Overlaps.glyphs",
+            Some("wght=550"),
+            true,
+            false,
+        );
         assert_plus_is_one_cross(&result);
         // decomposed first, so its two crosses are unioned too
         assert_eq!(contours_drawn(&result, "plusplus"), 1);
     }
 
     #[test]
+    fn a_single_master_source_has_its_overlaps_removed() {
+        let result = compile_static("glyphs3/Static_Overlaps.glyphs", None, false, false);
+        assert_plus_is_one_cross(&result);
+        assert_plusplus_is_still_a_composite(&result);
+
+        let result = compile_static("glyphs3/Static_Overlaps.glyphs", None, true, false);
+        assert_plus_is_one_cross(&result);
+        assert_eq!(contours_drawn(&result, "plusplus"), 1);
+    }
+
+    #[test]
+    fn a_single_master_source_keeps_its_overlaps_if_asked() {
+        for cff in [false, true] {
+            let result = compile_static("glyphs3/Static_Overlaps.glyphs", None, cff, true);
+            assert_eq!(
+                result
+                    .read_ir_glyph("plus")
+                    .default_instance()
+                    .contours
+                    .len(),
+                2
+            );
+            assert_eq!(contours_drawn(&result, "plus"), 2);
+        }
+    }
+
+    #[test]
+    fn overlaps_are_removed_by_default() {
+        // a library caller gets what the command line does
+        let result = TestCompile::compile_source("glyphs3/Static_Overlaps.glyphs");
+        assert_plus_is_one_cross(&result);
+    }
+
+    #[test]
     fn an_instance_keeps_its_overlaps_if_asked() {
-        let result = compile_instance("glyphs3/WghtVar_Overlaps.glyphs", "wght=550");
+        let result = compile_static(
+            "glyphs3/WghtVar_Overlaps.glyphs",
+            Some("wght=550"),
+            false,
+            true,
+        );
         assert_eq!(
             result
                 .read_ir_glyph("plus")
@@ -7416,10 +7472,8 @@ mod tests {
 
     #[test]
     fn a_variable_font_keeps_its_overlaps() {
-        let result = TestCompile::compile("glyphs3/WghtVar_Overlaps.glyphs", |mut options| {
-            options.flags |= Flags::REMOVE_OVERLAPS;
-            options
-        });
+        // REMOVE_OVERLAPS is on by default
+        let result = TestCompile::compile_source("glyphs3/WghtVar_Overlaps.glyphs");
         let plus = result.read_ir_glyph("plus");
         assert_eq!(plus.sources().len(), 2);
         for instance in plus.sources().values() {

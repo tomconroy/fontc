@@ -34,15 +34,16 @@ bitflags! {
         // instead of glyf/loca
         const CFF_OUTLINES = 0b100000000000;
         // If set, overlapping contours of a static font's glyphs are merged by
-        // a union, as fontmake does for static builds unless --keep-overlaps.
-        // Ignored for a variable font, whose masters must stay compatible.
+        // a union, as fontmake does for every static build unless
+        // --keep-overlaps. Ignored for a variable font, whose masters must stay
+        // compatible.
         const REMOVE_OVERLAPS = 0b1000000000000;
     }
 }
 
 impl Default for Flags {
     fn default() -> Self {
-        Flags::PREFER_SIMPLE_GLYPHS | Flags::PRODUCTION_NAMES
+        Flags::PREFER_SIMPLE_GLYPHS | Flags::PRODUCTION_NAMES | Flags::REMOVE_OVERLAPS
     }
 }
 
