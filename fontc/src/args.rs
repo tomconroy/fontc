@@ -99,6 +99,16 @@ pub struct Args {
     #[arg(long, default_value = "false")]
     pub keep_direction: bool,
 
+    /// Don't remove overlaps from a static instance's glyphs.
+    ///
+    /// By default, building a static instance (--instance) merges each glyph's
+    /// overlapping contours into one outline, the way fontmake does for
+    /// static fonts. Variable fonts always keep their overlaps.
+    // Named to match fontmake's homonymous flag:
+    // https://github.com/googlefonts/fontmake/blob/6a8b2907/Lib/fontmake/__main__.py#L426
+    #[arg(long, default_value = "false")]
+    pub keep_overlaps: bool,
+
     /// Don't rename glyphs with production names
     // Named to match fontmake's homonymous flag:
     // https://github.com/googlefonts/fontmake/blob/6a8b2907/Lib/fontmake/__main__.py#L602
@@ -180,6 +190,12 @@ impl Args {
         );
         flags.set(Flags::DECOMPOSE_COMPONENTS, self.decompose_components);
         flags.set(Flags::KEEP_DIRECTION, self.keep_direction);
+        // only an instance: the output of any other build is variable, or
+        // compiled from a static source, which this does not (yet) change
+        flags.set(
+            Flags::REMOVE_OVERLAPS,
+            self.instance.is_some() && !self.keep_overlaps,
+        );
         flags.set(Flags::PRODUCTION_NAMES, !self.no_production_names);
 
         if self.flavor == Flavor::Otf {
@@ -424,6 +440,30 @@ mod tests {
             "{}",
             instance_error("wght=700,wght=800")
         );
+    }
+
+    fn flags(args: &[&str]) -> Flags {
+        parse(args).flags()
+    }
+
+    #[test]
+    fn an_instance_removes_overlaps_by_default() {
+        assert!(flags(&["--instance", "Bold"]).contains(Flags::REMOVE_OVERLAPS));
+        assert!(flags(&["--instance", "Bold", "--flavor", "otf"]).contains(Flags::REMOVE_OVERLAPS));
+    }
+
+    #[test]
+    fn keep_overlaps_keeps_an_instance_s_overlaps() {
+        assert!(
+            !flags(&["--instance", "Bold", "--keep-overlaps"]).contains(Flags::REMOVE_OVERLAPS)
+        );
+    }
+
+    #[test]
+    fn a_variable_build_keeps_its_overlaps() {
+        assert!(!flags(&[]).contains(Flags::REMOVE_OVERLAPS));
+        // accepted, like fontmake's, and a no-op
+        assert!(!flags(&["--keep-overlaps"]).contains(Flags::REMOVE_OVERLAPS));
     }
 
     // It's awkward to get the Flags::default values into #[arg] so test for consistency
