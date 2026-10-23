@@ -256,7 +256,7 @@ impl SourceGeometry {
     }
 
     /// One contour of the union, as segments restored to the source's,
-    /// leaving out any segment the restoration collapsed to a point.
+    /// leaving out any that only draw a point.
     fn restore(&self, contour: &BezPath) -> Vec<PathSeg> {
         contour
             .segments()
@@ -289,13 +289,18 @@ fn same_curve(a: PathSeg, b: PathSeg) -> bool {
         }
 }
 
-/// Does `seg` draw nothing but a point?
+/// Does `seg` draw nothing but a point, give or take [`SAME_POINT`]?
+///
+/// The sweep line splits a curve at its extremes, and an extreme a hair from
+/// the curve's end leaves a piece a hair long, which rounding would turn into
+/// a degenerate segment.
 fn is_a_point(seg: PathSeg) -> bool {
     let p = seg.start();
+    let near = |q: Point| q.distance(p) <= SAME_POINT;
     match seg {
-        PathSeg::Line(l) => l.p1 == p,
-        PathSeg::Quad(q) => q.p1 == p && q.p2 == p,
-        PathSeg::Cubic(c) => c.p1 == p && c.p2 == p && c.p3 == p,
+        PathSeg::Line(l) => near(l.p1),
+        PathSeg::Quad(q) => near(q.p1) && near(q.p2),
+        PathSeg::Cubic(c) => near(c.p1) && near(c.p2) && near(c.p3),
     }
 }
 
@@ -567,5 +572,46 @@ mod tests {
         }
         let (got, want) = (area(&union), path.area());
         assert!((got - want).abs() < 1.0, "{got} vs {want}");
+    }
+
+    #[test]
+    fn a_curve_split_a_hair_from_its_end_comes_back_whole() {
+        // Shantell Sans' 'l' at Regular: the first curve leaves its start
+        // horizontally, so the sweep line splits it at an extreme a hair
+        // (1e-8 of the curve) in, leaving a piece 6e-7 units long
+        let mut l = BezPath::new();
+        l.move_to((208.60000000000002, -11.0));
+        l.curve_to((252.0, -11.0), (292.4, 14.600000000000001), (292.4, 50.8));
+        l.curve_to(
+            (292.4, 69.80000000000001),
+            (285.0, 85.0),
+            (262.20000000000005, 85.0),
+        );
+        l.curve_to((247.8, 85.0), (242.2, 74.2), (214.20000000000002, 74.2));
+        l.curve_to((182.2, 74.2), (157.0, 122.4), (157.0, 297.0));
+        l.curve_to(
+            (157.0, 524.4000000000001),
+            (183.8, 610.8000000000001),
+            (183.8, 685.8000000000001),
+        );
+        l.curve_to((183.8, 739.2), (167.4, 760.0), (140.20000000000002, 760.0));
+        l.curve_to(
+            (117.2, 760.0),
+            (104.60000000000001, 742.6),
+            (95.80000000000001, 692.0000000000001),
+        );
+        l.curve_to(
+            (78.80000000000001, 585.0),
+            (67.2, 485.40000000000003),
+            (67.2, 317.0),
+        );
+        l.curve_to(
+            (67.2, 25.9652),
+            (131.60000000000002, -11.0),
+            (208.60000000000002, -11.0),
+        );
+        l.close_path();
+        let union = remove_overlaps(std::slice::from_ref(&l)).unwrap();
+        assert_eq!(union, vec![l]);
     }
 }
