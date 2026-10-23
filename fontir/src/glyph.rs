@@ -700,6 +700,26 @@ fn apply_optional_transformations(
     Ok(())
 }
 
+/// Merge the overlapping contours of every glyph in `glyph_order`.
+///
+/// Only for a static font: a union per master would leave the masters
+/// incompatible, which is why fontmake never removes a variable font's
+/// overlaps either. See [`crate::overlaps`] for what the union does.
+fn remove_overlaps(context: &Context, glyph_order: &GlyphOrder) -> Result<(), BadGlyph> {
+    if !context.static_metadata.get().axes.is_empty() {
+        log::warn!("Not removing overlaps: they are only removed from static fonts");
+        return Ok(());
+    }
+    let glyphs: Vec<_> = glyph_order
+        .names()
+        .map(|name| context.get_glyph(name.clone()))
+        .collect();
+    for glyph in crate::overlaps::remove_glyph_overlaps(&glyphs)? {
+        context.glyphs.set(glyph);
+    }
+    Ok(())
+}
+
 fn ensure_notdef_exists_and_is_gid_0(
     context: &Context,
     glyph_order: &mut GlyphOrder,
@@ -947,6 +967,12 @@ impl Work<Context, WorkId, Error> for GlyphOrderWork {
         drop(original_glyphs); // lets not accidentally use that from here on
 
         apply_optional_transformations(context, &new_glyph_order)?;
+
+        // after every decomposition, so that it sees the contours that will be
+        // compiled, and before .notdef, which ufo2ft makes after its filters
+        if context.flags.contains(Flags::REMOVE_OVERLAPS) {
+            remove_overlaps(context, &new_glyph_order)?;
+        }
 
         ensure_notdef_exists_and_is_gid_0(context, &mut new_glyph_order)?;
 
@@ -2884,5 +2910,80 @@ mod tests {
                 "instance at {loc:?} differs from independent interpolation on the original component"
             );
         }
+    }
+
+    fn square(x0: f64, y0: f64, x1: f64, y1: f64) -> BezPath {
+        let mut path = BezPath::new();
+        path.move_to((x0, y0));
+        path.line_to((x1, y0));
+        path.line_to((x1, y1));
+        path.line_to((x0, y1));
+        path.line_to((x0, y0));
+        path.close_path();
+        path
+    }
+
+    /// A glyph defined at `loc` only.
+    fn glyph_at(loc: &NormalizedLocation, name: &str, instance: GlyphInstance) -> Glyph {
+        Glyph::new(
+            name.into(),
+            true,
+            Default::default(),
+            [(loc.clone(), instance)].into(),
+        )
+        .unwrap()
+    }
+
+    /// "a" is two overlapping squares, "b" two overlapping "a"s.
+    fn overlapping_glyphs(context: &Context, loc: &NormalizedLocation) -> GlyphOrder {
+        context.glyphs.set(glyph_at(
+            loc,
+            "a",
+            GlyphInstance {
+                contours: vec![square(0., 0., 10., 10.), square(5., 5., 15., 15.)],
+                ..Default::default()
+            },
+        ));
+        context.glyphs.set(glyph_at(
+            loc,
+            "b",
+            GlyphInstance {
+                components: vec![
+                    Component::new("a", Affine::IDENTITY),
+                    Component::new("a", Affine::translate((5.0, 0.0))),
+                ],
+                ..Default::default()
+            },
+        ));
+        ["a", "b"].into_iter().map(GlyphName::new).collect()
+    }
+
+    #[test]
+    fn remove_overlaps_merges_a_static_glyph_s_contours() {
+        let static_loc = NormalizedLocation::new();
+        let context = test_context_with_locations(vec![static_loc.clone()]);
+        let order = overlapping_glyphs(&context, &static_loc);
+
+        remove_overlaps(&context, &order).unwrap();
+
+        let a = context.get_glyph("a");
+        assert_eq!(a.default_instance().contours.len(), 1, "{a:?}");
+        assert_eq!(a.default_instance().contours[0].area(), 175.0);
+        // like ufo2ft: a composite's components are not unioned
+        let b = context.get_glyph("b");
+        assert_eq!(b.default_instance().components.len(), 2, "{b:?}");
+        assert!(b.default_instance().contours.is_empty(), "{b:?}");
+    }
+
+    #[test]
+    fn remove_overlaps_leaves_a_variable_font_alone() {
+        let context = test_context();
+        let loc = NormalizedLocation::for_pos(&[("wght", 0.0)]);
+        let order = overlapping_glyphs(&context, &loc);
+
+        remove_overlaps(&context, &order).unwrap();
+
+        let a = context.get_glyph("a");
+        assert_eq!(a.default_instance().contours.len(), 2, "{a:?}");
     }
 }
