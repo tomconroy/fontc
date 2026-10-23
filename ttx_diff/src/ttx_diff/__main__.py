@@ -90,11 +90,10 @@ flags.DEFINE_bool(
     "rename glyphs to AGL-compliant names (uniXXXX, etc.) suitable for production. Disable to see the original glyph names.",
 )
 
-# fontmake - and so gftools' - static builds perform overlaps removal. fontc
-# removes them only from a static instance (--instance), and with a different
-# boolean engine than fontmake's, so the outlines would differ even where both
-# are right; we default to disabling the filter on both sides to keep the diff
-# quiet. https://github.com/googlefonts/fontc/issues/975
+# fontmake's - and so gftools' - static builds perform overlaps removal, and so
+# do fontc's, but with a different boolean engine, so the outlines would differ
+# even where both are right; we default to disabling the filter on both sides
+# to keep the diff quiet. https://github.com/googlefonts/fontc/issues/975
 flags.DEFINE_bool(
     "keep_overlaps",
     True,

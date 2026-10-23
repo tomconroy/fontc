@@ -604,16 +604,16 @@ class TestInstance:
         assert "--keep-overlaps" in cmd
         assert cmd[cmd.index("--instance") + 1] == "wght=400"
 
-    def test_variable_fontc_build_has_no_overlaps_flag(
+    def test_static_fontc_build_keeps_overlaps_too(
         self, tmp_path, monkeypatch, flavor
     ):
-        path = _variable_designspace(
-            tmp_path, instances=[("Test Regular", {"Weight": 400})]
-        )
+        # a single-master source is static, so fontc would remove its overlaps
+        # too; for a variable source the flag does nothing
         commands = _record_fontmake(monkeypatch, write_output=False)
-        build_fontc(path, Path("fontc"), tmp_path)
+        build_fontc(tmp_path / "test.ufo", Path("fontc"), tmp_path)
         (cmd,) = commands
-        assert "--keep-overlaps" not in cmd
+        assert "--keep-overlaps" in cmd
+        assert "--instance" not in cmd
 
     def test_instanced_otf_build_is_cff(self, tmp_path, monkeypatch, flavor, instance):
         flavor("otf")

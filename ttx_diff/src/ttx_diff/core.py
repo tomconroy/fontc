@@ -341,10 +341,10 @@ def build_fontc(
         # name ("Bold") where fontmake's -i wants the DesignSpace instance name
         # ("Family Bold"), so only the location means the same thing to both
         cmd += ["--instance", instance.fontc_arg()]
-        # an instance is static, so fontc removes its overlaps unless told
-        # not to -- the same as fontmake, and told the same way
-        if FLAGS.keep_overlaps:
-            cmd.append("--keep-overlaps")
+    # fontc removes a static font's overlaps unless told not to -- the same as
+    # fontmake, and told the same way. For a variable font it is a no-op.
+    if FLAGS.keep_overlaps:
+        cmd.append("--keep-overlaps")
     build(cmd, build_dir)
 
 
