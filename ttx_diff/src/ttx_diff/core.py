@@ -341,6 +341,10 @@ def build_fontc(
         # name ("Bold") where fontmake's -i wants the DesignSpace instance name
         # ("Family Bold"), so only the location means the same thing to both
         cmd += ["--instance", instance.fontc_arg()]
+        # an instance is static, so fontc removes its overlaps unless told
+        # not to -- the same as fontmake, and told the same way
+        if FLAGS.keep_overlaps:
+            cmd.append("--keep-overlaps")
     build(cmd, build_dir)
 
 
@@ -382,8 +386,8 @@ def build_fontmake(
     # what matters is whether the *output* is variable, not the source: in
     # instance mode a variable source produces a static font, which must be
     # built as a static (`-o ttf`/`-o otf`) and, crucially, must keep its
-    # overlaps -- fontmake removes them for static builds and fontc cannot, so
-    # keying this off the source would make every outline differ
+    # overlaps -- fontmake removes them for static builds unless asked not to,
+    # so keying this off the source would make every outline differ
     variable_output = instance is None and source_is_variable(source)
     # PostScript outlines come in two tables: a static build is CFF, a variable
     # one is CFF2, and fontmake spells them as different build types. This
