@@ -1,0 +1,181 @@
+{
+.appVersion = "3219";
+.formatVersion = 3;
+axes = (
+{
+name = Weight;
+tag = wght;
+}
+);
+familyName = "WghtVar Overlaps";
+fontMaster = (
+{
+axesValues = (
+400
+);
+id = m01;
+metricValues = (
+{
+pos = 800;
+},
+{
+},
+{
+pos = -200;
+},
+{
+pos = 700;
+},
+{
+pos = 500;
+}
+);
+name = Regular;
+},
+{
+axesValues = (
+700
+);
+id = m02;
+metricValues = (
+{
+pos = 800;
+},
+{
+},
+{
+pos = -200;
+},
+{
+pos = 700;
+},
+{
+pos = 500;
+}
+);
+name = Bold;
+}
+);
+glyphs = (
+{
+glyphname = space;
+layers = (
+{
+layerId = m01;
+width = 250;
+},
+{
+layerId = m02;
+width = 250;
+}
+);
+unicode = 32;
+},
+{
+glyphname = plus;
+layers = (
+{
+layerId = m01;
+shapes = (
+{
+closed = 1;
+nodes = (
+(100,250,l),
+(500,250,l),
+(500,350,l),
+(100,350,l)
+);
+},
+{
+closed = 1;
+nodes = (
+(250,100,l),
+(350,100,l),
+(350,500,l),
+(250,500,l)
+);
+}
+);
+width = 600;
+},
+{
+layerId = m02;
+shapes = (
+{
+closed = 1;
+nodes = (
+(100,200,l),
+(500,200,l),
+(500,400,l),
+(100,400,l)
+);
+},
+{
+closed = 1;
+nodes = (
+(200,100,l),
+(400,100,l),
+(400,500,l),
+(200,500,l)
+);
+}
+);
+width = 600;
+}
+);
+unicode = 43;
+},
+{
+glyphname = plusplus;
+layers = (
+{
+layerId = m01;
+shapes = (
+{
+ref = plus;
+},
+{
+pos = (200,0);
+ref = plus;
+}
+);
+width = 800;
+},
+{
+layerId = m02;
+shapes = (
+{
+ref = plus;
+},
+{
+pos = (200,0);
+ref = plus;
+}
+);
+width = 800;
+}
+);
+unicode = 8746;
+}
+);
+metrics = (
+{
+type = ascender;
+},
+{
+type = baseline;
+},
+{
+type = descender;
+},
+{
+type = "cap height";
+},
+{
+type = "x-height";
+}
+);
+unitsPerEm = 1000;
+versionMajor = 1;
+versionMinor = 0;
+}

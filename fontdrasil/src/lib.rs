@@ -4,6 +4,7 @@ pub mod agl;
 pub mod coords;
 pub mod error;
 pub mod orchestration;
+pub mod overlaps;
 pub mod paths;
 pub mod piecewise_linear_map;
 pub mod types;

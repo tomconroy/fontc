@@ -87,6 +87,8 @@ pub struct Workload {
     skip_features: bool,
     // build a CFF (cubic outline) font instead of glyf
     cff_outlines: bool,
+    // GlyphOrderWork removes overlaps from a static font's glyphs
+    remove_overlaps: bool,
     // compile one static instance, and how far along that is
     pin: PinState,
     // we count the number of errors encountered but only store the first we see
@@ -160,6 +162,7 @@ impl Workload {
             count_pending: Default::default(),
             skip_features,
             cff_outlines: flags.contains(Flags::CFF_OUTLINES),
+            remove_overlaps: flags.contains(Flags::REMOVE_OVERLAPS),
             pin: match instance {
                 Some(instance) => PinState::Requested(instance),
                 None => PinState::NotRequested,
@@ -348,6 +351,7 @@ impl Workload {
     /// * If the glyph has no components the BE for it doesn't use glyph order and needn't block on it
     /// * If the glyph does have components we need to block on glyph order because that might alter them
     ///    * For example, flatten
+    /// * If the glyph has contours and the font is static, glyph order removes their overlaps
     ///
     /// By minimizing dependencies we allow jobs to start earlier and execute with greater concurrency.
     fn update_be_glyph_work(&mut self, fe_root: &FeContext, glyph_name: GlyphName) {
@@ -383,8 +387,17 @@ impl Workload {
             }
         }
 
+        // glyph order rewrites the contours of a static font's glyphs when it
+        // removes their overlaps (a variable font's it leaves alone)
+        let loses_overlaps = self.remove_overlaps
+            && fe_root.static_metadata.get().axes.is_empty()
+            && glyph
+                .sources()
+                .values()
+                .any(|inst| !inst.contours.is_empty());
+
         // We don't *have* to wait on glyph order, but if we don't it delays the critical path
-        if has_components {
+        if has_components || loses_overlaps {
             deps = deps.variant(FeWorkIdentifier::GlyphOrder);
         }
 

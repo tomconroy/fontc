@@ -2,6 +2,7 @@ use std::{fmt::Display, io, path::PathBuf};
 
 use fontdrasil::{
     coords::{DesignCoord, NormalizedCoord, NormalizedLocation, UserCoord, UserLocation},
+    overlaps::OverlapError,
     types::GlyphName,
     variations::{DeltaError, VariationModelError},
 };
@@ -150,6 +151,7 @@ pub enum BadGlyphKind {
     PathConversion(PathConversionError),
     Anchor(BadAnchor),
     BadDeltas(DeltaError),
+    RemoveOverlaps(OverlapError),
     FrontendSpecific(String),
 }
 
@@ -261,6 +263,12 @@ impl From<DeltaError> for BadGlyphKind {
     }
 }
 
+impl From<OverlapError> for BadGlyphKind {
+    fn from(src: OverlapError) -> BadGlyphKind {
+        BadGlyphKind::RemoveOverlaps(src)
+    }
+}
+
 impl std::fmt::Display for BadSourceKind {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         match self {
@@ -293,6 +301,7 @@ impl std::fmt::Display for BadGlyphKind {
             BadGlyphKind::NoAxisPosition(axis) => write!(f, "no position on '{axis}' axis"),
             BadGlyphKind::Anchor(e) => write!(f, "bad anchor: '{e}'"),
             BadGlyphKind::BadDeltas(e) => write!(f, "delta error: '{e}'"),
+            BadGlyphKind::RemoveOverlaps(e) => write!(f, "failed to remove overlaps: '{e}'"),
             BadGlyphKind::FrontendSpecific(e) => write!(f, "{}", e),
         }
     }

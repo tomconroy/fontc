@@ -4,11 +4,13 @@ import json
 import re
 import subprocess
 import sys
+from pathlib import Path
 
 import pytest
 
 from ttx_diff.core import (
     BuildFail,
+    build_fontc,
     build_fontmake,
     output_font_path,
     resolve_instance,
@@ -586,6 +588,32 @@ class TestInstance:
         assert cmd[:3] == ["fontmake", "-o", "ttf"]
         assert "--keep-overlaps" in cmd
         assert cmd[cmd.index("-i") + 1] == resolved.fontmake_arg()
+
+    def test_instanced_fontc_build_keeps_overlaps_too(
+        self, tmp_path, monkeypatch, flavor, instance
+    ):
+        # fontc removes an instance's overlaps by default, like fontmake, so
+        # it has to be told the same thing fontmake is
+        path = _variable_designspace(
+            tmp_path, instances=[("Test Regular", {"Weight": 400})]
+        )
+        resolved = resolve_instance(path, "@default")
+        commands = _record_fontmake(monkeypatch, write_output=False)
+        build_fontc(path, Path("fontc"), tmp_path, resolved)
+        (cmd,) = commands
+        assert "--keep-overlaps" in cmd
+        assert cmd[cmd.index("--instance") + 1] == "wght=400"
+
+    def test_static_fontc_build_keeps_overlaps_too(
+        self, tmp_path, monkeypatch, flavor
+    ):
+        # a single-master source is static, so fontc would remove its overlaps
+        # too; for a variable source the flag does nothing
+        commands = _record_fontmake(monkeypatch, write_output=False)
+        build_fontc(tmp_path / "test.ufo", Path("fontc"), tmp_path)
+        (cmd,) = commands
+        assert "--keep-overlaps" in cmd
+        assert "--instance" not in cmd
 
     def test_instanced_otf_build_is_cff(self, tmp_path, monkeypatch, flavor, instance):
         flavor("otf")
