@@ -53,28 +53,32 @@ pub(super) struct CiArgs {
     /// crater modes because they are run over separate target lists, of
     /// static and of variable sources. Keeping them apart is what stops one
     /// corpus reading the other's cached fontmake output for a source that
-    /// appears in both lists. Neither runs gftools builds. Use a separate out
-    /// dir for each.
+    /// appears in both lists. Neither runs gftools builds, so neither runs
+    /// the per-instance targets split from them. Use a separate out dir for
+    /// each.
     #[arg(long, value_enum, default_value_t)]
     pub(super) flavor: Flavor,
-    /// Build one static instance of each variable source instead of a variable
-    /// font, and compare it against `fontmake -i <instance> --keep-overlaps`.
-    ///
-    /// The value is handed to ttx_diff: '@default' picks the named instance
-    /// sitting at the default location (a source without one is reported as
-    /// skipped), and anything else is a literal DesignSpace instance name,
-    /// which only makes sense for a hand-picked target list.
-    ///
-    /// Only runs default (non-gftools) builds and expects a target list of
-    /// variable sources; static sources are reported as skipped. Composes with
-    /// --flavor ttf and otf (the output is static, so its PostScript outlines
-    /// are CFF, never CFF2). Use a separate out dir; results are cached
-    /// separately.
-    #[arg(long, value_name = "INSTANCE")]
-    pub(super) instance: Option<String>,
     /// only generate html (for the provided out_dir)
     #[arg(long)]
     pub(super) html_only: bool,
+    /// Rebuild every target without reading or writing cached results.
+    ///
+    /// Source checkouts in the cache dir are still used. This is for testing
+    /// changes to python dependencies without invalidating the cache; use it
+    /// with a scratch `--out` dir, since the next normal run compares against
+    /// the last run recorded there.
+    #[arg(long)]
+    pub(super) no_results_cache: bool,
+    /// File for live progress, published by the CI script.
+    ///
+    /// Crater rewrites it as targets finish.
+    #[arg(long)]
+    pub(super) progress_file: Option<PathBuf>,
+    /// Where the report reads the live status, as published by the CI script.
+    ///
+    /// Without it, the report says that status isn't configured.
+    #[arg(long)]
+    pub(super) status_url: Option<String>,
 }
 
 /// Which outline flavor ttx_diff compiles and compares.
@@ -130,18 +134,6 @@ impl std::fmt::Display for Flavor {
 }
 
 impl CiArgs {
-    /// Reject flag combinations that name a build nobody can make.
-    pub(crate) fn validate(&self) -> Result<(), String> {
-        if self.flavor == Flavor::Cff2 && self.instance.is_some() {
-            // pinning a variable source produces a *static* font, so its
-            // PostScript outlines are CFF, not CFF2
-            return Err(
-                "--flavor cff2 builds variable fonts; use --flavor otf with --instance".to_string(),
-            );
-        }
-        Ok(())
-    }
-
     /// Determine the directory to use for caching git checkouts.
     ///
     /// This may be passed at the command line or via an environment variable.
@@ -160,52 +152,24 @@ impl CiArgs {
     }
 }
 
-/// The cache/report component naming this combination of build modes.
+/// The cache/report component naming this run's outline flavor.
 ///
-/// `None` for a plain variable ttf run, so that the cache it has always used
-/// stays where it is; otherwise flavor and instance compose into one name,
-/// e.g. "otf", "cff2", "instance@default", "otf-instance@default". The
-/// distinction between "otf" and "cff2" exists precisely so that the static
-/// and variable PostScript corpora cannot share a cache.
-pub(crate) fn mode_name(flavor: Flavor, instance: Option<&str>) -> Option<String> {
-    let mut name = String::new();
-    if flavor != Flavor::Ttf {
-        name.push_str(&flavor.to_string());
-    }
-    if let Some(instance) = instance {
-        if !name.is_empty() {
-            name.push('-');
-        }
-        name.push_str("instance");
-        // an instance can be named anything at all ('Bona Nova/Bold'), and this
-        // ends up as a directory name
-        name.extend(instance.chars().map(|c| {
-            if c.is_ascii_alphanumeric() || matches!(c, '@' | '.' | '_' | '-') {
-                c
-            } else {
-                '_'
-            }
-        }));
-    }
-    (!name.is_empty()).then_some(name)
+/// `None` for a ttf run, so that the cache it has always used stays where it
+/// is. The distinction between "otf" and "cff2" exists precisely so that the
+/// static and variable PostScript corpora cannot share a cache.
+pub(crate) fn mode_name(flavor: Flavor) -> Option<String> {
+    (flavor != Flavor::Ttf).then(|| flavor.to_string())
 }
 
 /// The ttx_diff flags that name this run's build mode.
 ///
 /// A reproduction command has to ask for the same build the report is about;
-/// without these it would compare a variable ttf whatever mode the run was.
-pub(crate) fn mode_flags(flavor: Flavor, instance: Option<&str>) -> String {
-    let mut flags = String::new();
-    if flavor != Flavor::Ttf {
-        flags.push_str(" --flavor ");
-        flags.push_str(flavor.ttx_diff_arg());
+/// without these it would compare a ttf whatever flavor the run was.
+pub(crate) fn mode_flags(flavor: Flavor) -> String {
+    match flavor {
+        Flavor::Ttf => String::new(),
+        _ => format!(" --flavor {}", flavor.ttx_diff_arg()),
     }
-    if let Some(instance) = instance {
-        flags.push_str(" --instance '");
-        flags.push_str(instance);
-        flags.push('\'');
-    }
-    flags
 }
 
 #[allow(deprecated)]
@@ -239,25 +203,8 @@ mod tests {
     }
 
     #[test]
-    fn instance_defaults_to_off() {
-        let args = parse_ci(&[]);
-        assert_eq!(args.instance, None);
-        assert_eq!(args.flavor, Flavor::Ttf);
-    }
-
-    #[test]
-    fn instance_is_a_global_flag() {
-        // deliberately not per-target: a Target serializes as a string used as
-        // a json map key, so it has no room for build options
-        let args = parse_ci(&["--instance", "@default"]);
-        assert_eq!(args.instance.as_deref(), Some("@default"));
-    }
-
-    #[test]
-    fn instance_composes_with_flavor() {
-        let args = parse_ci(&["--instance", "@default", "--flavor", "otf"]);
-        assert_eq!(args.instance.as_deref(), Some("@default"));
-        assert_eq!(args.flavor, Flavor::Otf);
+    fn flavor_defaults_to_ttf() {
+        assert_eq!(parse_ci(&[]).flavor, Flavor::Ttf);
     }
 
     /// CFF and CFF2 are one mode to ttx_diff and two to crater, so that the
@@ -268,62 +215,21 @@ mod tests {
         assert_eq!(args.flavor, Flavor::Cff2);
         assert_eq!(args.flavor.ttx_diff_arg(), "otf");
         assert_eq!(args.flavor.font_extension(), "otf");
-        assert_ne!(mode_name(Flavor::Cff2, None), mode_name(Flavor::Otf, None));
-    }
-
-    /// Pinning a variable source produces a static font, whose PostScript
-    /// outlines are CFF.
-    #[test]
-    fn cff2_does_not_compose_with_instance() {
-        assert!(parse_ci(&["--flavor", "cff2"]).validate().is_ok());
-        assert!(
-            parse_ci(&["--flavor", "otf", "--instance", "@default"])
-                .validate()
-                .is_ok()
-        );
-        let problem = parse_ci(&["--flavor", "cff2", "--instance", "@default"])
-            .validate()
-            .unwrap_err();
-        assert!(
-            problem.contains("--flavor otf with --instance"),
-            "{problem}"
-        );
+        assert_ne!(mode_name(Flavor::Cff2), mode_name(Flavor::Otf));
     }
 
     /// The report is about one mode; its repro command has to name it.
     #[test]
     fn repro_flags_name_the_mode() {
-        assert_eq!(mode_flags(Flavor::Ttf, None), "");
-        assert_eq!(mode_flags(Flavor::Otf, None), " --flavor otf");
-        assert_eq!(mode_flags(Flavor::Cff2, None), " --flavor otf");
-        assert_eq!(
-            mode_flags(Flavor::Otf, Some("@default")),
-            " --flavor otf --instance '@default'"
-        );
-        // an instance name can contain spaces, so it is quoted
-        assert_eq!(
-            mode_flags(Flavor::Ttf, Some("Bona Nova Bold")),
-            " --instance 'Bona Nova Bold'"
-        );
+        assert_eq!(mode_flags(Flavor::Ttf), "");
+        assert_eq!(mode_flags(Flavor::Otf), " --flavor otf");
+        assert_eq!(mode_flags(Flavor::Cff2), " --flavor otf");
     }
 
     #[test]
     fn mode_names() {
-        assert_eq!(mode_name(Flavor::Ttf, None), None);
-        assert_eq!(mode_name(Flavor::Otf, None).as_deref(), Some("otf"));
-        assert_eq!(mode_name(Flavor::Cff2, None).as_deref(), Some("cff2"));
-        assert_eq!(
-            mode_name(Flavor::Ttf, Some("@default")).as_deref(),
-            Some("instance@default")
-        );
-        assert_eq!(
-            mode_name(Flavor::Otf, Some("@default")).as_deref(),
-            Some("otf-instance@default")
-        );
-        // an instance name is arbitrary text; it cannot escape the cache dir
-        assert_eq!(
-            mode_name(Flavor::Ttf, Some("../Bona Nova Bold")).as_deref(),
-            Some("instance.._Bona_Nova_Bold")
-        );
+        assert_eq!(mode_name(Flavor::Ttf), None);
+        assert_eq!(mode_name(Flavor::Otf).as_deref(), Some("otf"));
+        assert_eq!(mode_name(Flavor::Cff2).as_deref(), Some("cff2"));
     }
 }

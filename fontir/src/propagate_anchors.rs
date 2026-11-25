@@ -313,11 +313,13 @@ fn anchors_traversing_components(
     let mut all_anchors = IndexMap::new();
 
     for (component_idx, component) in components.iter().enumerate() {
-        // Get the anchors for this component at this location.
+        // Get the anchors for this component at the location it samples the
+        // base at (for an ordinary component, this location).
         // Because we process dependencies first we know that all components
         // referenced have already been propagated.
+        let component_location = component.location_at(location, location);
         let mut anchors = match done_anchors
-            .get(&(component.base.clone(), location.clone()))
+            .get(&(component.base.clone(), component_location.clone()))
             .cloned()
         {
             Some(a) => a,
@@ -328,7 +330,7 @@ fn anchors_traversing_components(
                 // See: https://github.com/googlefonts/fontc/issues/1661
                 match interpolate_component_anchors(
                     &component.base,
-                    location,
+                    &component_location,
                     done_anchors,
                     axis_order,
                     variation_models,
@@ -339,7 +341,7 @@ fn anchors_traversing_components(
                             "could not get or interpolate anchors for component '{}' \
                              at location {:?} in glyph '{}'",
                             component.base,
-                            location,
+                            component_location,
                             glyph_name
                         );
                         continue;
@@ -362,7 +364,7 @@ fn anchors_traversing_components(
         // component's locations are fully processed before the current glyph, and
         // Glyph invariants require a source at the default location.
         let component_number_of_base_glyphs = base_glyph_counts
-            .get(&(component.base.clone(), location.clone()))
+            .get(&(component.base.clone(), component_location.clone()))
             .or_else(|| {
                 base_glyph_counts
                     .iter()
@@ -383,7 +385,7 @@ fn anchors_traversing_components(
             all_anchors.retain(|name: &SmolStr, _| !name.starts_with("exit"));
         }
 
-        let scale = get_xy_rotation(component.transform);
+        let scale = get_xy_rotation(component.affine());
         for mut anchor in anchors {
             let new_has_underscore = anchor.name.starts_with('_');
             if (component_idx > 0 || has_underscore) && new_has_underscore {
@@ -404,7 +406,7 @@ fn anchors_traversing_components(
                 new_anchor_name = make_liga_anchor_name(new_anchor_name, number_of_base_glyphs);
             }
 
-            apply_transform_to_anchor(&mut anchor, component.transform);
+            apply_transform_to_anchor(&mut anchor, component.affine());
             anchor.name = new_anchor_name;
             all_anchors.insert(anchor.name.clone(), anchor);
             has_underscore |= new_has_underscore;
@@ -781,9 +783,8 @@ mod tests {
             let mut instance = GlyphInstance::default();
             for (base, transform, anchor) in &glyph.components {
                 instance.components.push(Component {
-                    base: base.clone(),
-                    transform: *transform,
                     anchor: anchor.clone(),
+                    ..Component::new(base.clone(), *transform)
                 });
             }
 
@@ -1284,6 +1285,40 @@ mod tests {
         assert_anchor(&ctx, "IJ", "top", Point::new(369.0, 810.0)); // J's top + 206 offset
         assert_anchor(&ctx, "IJ", "ogonek", Point::new(103.0, 0.0)); // I's ogonek (unique)
         assert_anchor(&ctx, "IJ", "topleft", Point::new(20.0, 810.0)); // I's topleft (unique)
+    }
+
+    // Anchors like `_2top` only align components, and aren't used for mark
+    // features, but Glyphs.app (3.5) still counts them when propagating: a
+    // ligature of a glyph that has one gets no numbered anchors.
+    #[test]
+    fn ignorable_underscore_anchor_counts_in_propagation() {
+        let mut builder = GlyphSetBuilder::new(test_context());
+        builder.add_glyph("B", |glyph| {
+            glyph
+                .add_anchor("top", (100.0, 700.0))
+                .add_anchor("_2top", (100.0, 600.0));
+        });
+        builder.add_glyph("C", |glyph| {
+            glyph.add_anchor("top", (100.0, 700.0));
+        });
+        for (name, base) in [("B_B", "B"), ("C_C", "C")] {
+            builder.add_glyph(name, |glyph| {
+                glyph
+                    .set_category(GlyphClassDef::Ligature)
+                    .add_component_at(base, (0.0, 0.0))
+                    .add_component_at(base, (500.0, 0.0));
+            });
+        }
+        let ctx = builder.build();
+        propagate_all_anchors(&ctx).unwrap();
+
+        let names = get_anchor_names(&ctx, "B_B");
+        assert!(
+            !names.iter().any(|n| n.starts_with("top_")),
+            "got {names:?}"
+        );
+        assert_anchor(&ctx, "C_C", "top_1", Point::new(100.0, 700.0));
+        assert_anchor(&ctx, "C_C", "top_2", Point::new(600.0, 700.0));
     }
 
     /// Test that exit anchors are removed when subsequent component lacks entry/exit

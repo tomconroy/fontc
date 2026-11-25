@@ -23,7 +23,7 @@ use serde::{Serialize, de::DeserializeOwned};
 
 use args::{Args, Commands};
 use error::Error;
-use target::{BuildType, Target};
+use target::{BuildType, Target, TargetId};
 
 fn main() {
     tracing_subscriber::fmt()
@@ -31,16 +31,6 @@ fn main() {
         .with_ansi(std::io::stdout().is_terminal())
         .init();
     let args = Args::parse();
-    // clap cannot express "this flavor rules out this flag", so check it here
-    // and report it the way clap reports its own conflicts: a usage error, not
-    // a run that quietly does nothing
-    let Commands::Ci(ci_args) = &args.command;
-    if let Err(problem) = ci_args.validate() {
-        use clap::CommandFactory;
-        Args::command()
-            .error(clap::error::ErrorKind::ArgumentConflict, problem)
-            .exit();
-    }
     if let Err(e) = run(&args) {
         eprintln!("{e}");
     }

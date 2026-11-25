@@ -206,7 +206,7 @@ pub fn resolve_user(
         InstanceSpec::Named(name) => static_metadata
             .named_instances
             .iter()
-            .find(|instance| instance.name == *name)
+            .find(|instance| instance.name == *name || full_name(instance).as_ref() == Some(name))
             .ok_or_else(|| PinError::UnknownInstance {
                 name: name.clone(),
                 available: comma_separated(
@@ -263,6 +263,17 @@ pub fn resolve(
     resolve_user(static_metadata, spec)?
         .to_normalized(&static_metadata.axes)
         .map_err(|e| PinError::Location(e.to_string()))
+}
+
+/// What a frontend calls an instance when it lists the ones it can select,
+/// which for one that doesn't say is `"{family} {style}"`.
+fn full_name(instance: &NamedInstance) -> Option<String> {
+    instance.full_name.clone().or_else(|| {
+        instance
+            .family_name
+            .as_ref()
+            .map(|family| format!("{family} {}", instance.name))
+    })
 }
 
 fn comma_separated(items: impl Iterator<Item = String>) -> String {
@@ -1694,10 +1705,8 @@ mod tests {
     #[test]
     fn pin_glyph_midpoint_of_component_transforms() {
         let meta = test_static_metadata();
-        let component = |scale: f64, dx: f64| Component {
-            base: "box".into(),
-            transform: Affine::new([scale, 0.0, 0.0, scale, dx, 0.0]),
-            anchor: None,
+        let component = |scale: f64, dx: f64| {
+            Component::new("box", Affine::new([scale, 0.0, 0.0, scale, dx, 0.0]))
         };
         let glyph = two_master_glyph(
             "boxbox",
@@ -1709,6 +1718,7 @@ mod tests {
 
         let coeffs = pinned.default_instance().components[0]
             .transform
+            .to_affine()
             .as_coeffs();
         assert_eq!(coeffs, [1.5, 0.0, 0.0, 1.5, 20.5, 0.0]);
     }
@@ -2479,9 +2489,9 @@ mod tests {
     fn pin_names_uses_the_style_map_names() {
         let mut meta = test_static_metadata();
         meta.names = HashMap::from([
-            (NameKey::new(NameId::FAMILY_NAME, "Fam"), "Fam".to_string()),
+            (NameKey::new(NameId::FAMILY_NAME), "Fam".to_string()),
             (
-                NameKey::new(NameId::COPYRIGHT_NOTICE, "(c) Nobody"),
+                NameKey::new(NameId::COPYRIGHT_NOTICE),
                 "(c) Nobody".to_string(),
             ),
         ]);
@@ -2525,7 +2535,7 @@ mod tests {
     #[test]
     fn pin_names_falls_back_for_a_non_ribbi_style() {
         let mut meta = test_static_metadata();
-        meta.names = HashMap::from([(NameKey::new(NameId::FAMILY_NAME, "Fam"), "Fam".to_string())]);
+        meta.names = HashMap::from([(NameKey::new(NameId::FAMILY_NAME), "Fam".to_string())]);
         // ufo2ft's OBLIQUE bit is not RIBBI and has to survive
         meta.misc.selection_flags = SelectionFlags::REGULAR | SelectionFlags::USE_TYPO_METRICS;
         let instance = named("SemiBold Condensed");
@@ -2572,8 +2582,7 @@ mod tests {
             (NameId::WWS_SUBFAMILY_NAME, "Bold"),
             (NameId::UNIQUE_ID, "hand written"),
         ] {
-            meta.names
-                .insert(NameKey::new(id, value), value.to_string());
+            meta.names.insert(NameKey::new(id), value.to_string());
         }
 
         let names = pin_names(&meta, &named("Bold"));
@@ -2594,7 +2603,7 @@ mod tests {
                 .iter()
                 .find(|(key, _)| key.name_id == NameId::UNIQUE_ID)
                 .map(|(_, value)| value.as_str()),
-            Some("0.000;NONE;Fam-Bold")
+            Some("0.000;    ;Fam-Bold")
         );
     }
 
@@ -2630,8 +2639,7 @@ mod tests {
     fn pin_names_keeps_the_vendor_id_verbatim() {
         for raw in ["IFF ", " ", "NONE"] {
             let mut meta = test_static_metadata();
-            meta.names =
-                HashMap::from([(NameKey::new(NameId::FAMILY_NAME, "Fam"), "Fam".to_string())]);
+            meta.names = HashMap::from([(NameKey::new(NameId::FAMILY_NAME), "Fam".to_string())]);
             meta.misc.raw_vendor_id = Some(raw.to_string());
 
             let names = pin_names(&meta, &named("Bold"));
@@ -2657,7 +2665,7 @@ mod tests {
     #[test]
     fn pin_names_passes_a_non_ribbi_style_map_style_through() {
         let mut meta = test_static_metadata();
-        meta.names = HashMap::from([(NameKey::new(NameId::FAMILY_NAME, "Doto"), "Doto".into())]);
+        meta.names = HashMap::from([(NameKey::new(NameId::FAMILY_NAME), "Doto".into())]);
         meta.misc.selection_flags = SelectionFlags::REGULAR | SelectionFlags::USE_TYPO_METRICS;
         let instance = NamedInstance {
             style_map_family_name: Some("Doto Black".to_string()),
@@ -2806,7 +2814,7 @@ mod tests {
     #[test]
     fn pin_names_applies_the_instance_name_parameters() {
         let mut meta = test_static_metadata();
-        meta.names = HashMap::from([(NameKey::new(NameId::FAMILY_NAME, "Fam"), "Fam".to_string())]);
+        meta.names = HashMap::from([(NameKey::new(NameId::FAMILY_NAME), "Fam".to_string())]);
         let instance = NamedInstance {
             overrides: crate::ir::InstanceOverrides {
                 names: BTreeMap::from([
@@ -2815,7 +2823,7 @@ mod tests {
                 ]),
                 // Epilogue's `25; EpilogueRoman`
                 name_records: BTreeMap::from([(
-                    NameKey::new(NameId::new(25), "FamRoman"),
+                    NameKey::new(NameId::new(25)),
                     "FamRoman".to_string(),
                 )]),
                 ..Default::default()
@@ -2856,9 +2864,9 @@ mod tests {
     fn pin_names_drops_the_variations_postscript_prefix() {
         let mut meta = test_static_metadata();
         meta.names = HashMap::from([
-            (NameKey::new(NameId::FAMILY_NAME, "Fam"), "Fam".to_string()),
+            (NameKey::new(NameId::FAMILY_NAME), "Fam".to_string()),
             (
-                NameKey::new(NameId::VARIATIONS_POSTSCRIPT_NAME_PREFIX, "FamVF"),
+                NameKey::new(NameId::VARIATIONS_POSTSCRIPT_NAME_PREFIX),
                 "FamVF".to_string(),
             ),
         ]);
@@ -2874,7 +2882,7 @@ mod tests {
         let instance = NamedInstance {
             overrides: crate::ir::InstanceOverrides {
                 name_records: BTreeMap::from([(
-                    NameKey::new(NameId::VARIATIONS_POSTSCRIPT_NAME_PREFIX, "FamRoman"),
+                    NameKey::new(NameId::VARIATIONS_POSTSCRIPT_NAME_PREFIX),
                     "FamRoman".to_string(),
                 )]),
                 ..Default::default()
@@ -3440,11 +3448,7 @@ mod tests {
             height: Some(700.0),
             vertical_origin: Some(800.0),
             contours: vec![rect(0.0, 0.0, 10.0, 10.0)],
-            components: vec![Component {
-                base: "x".into(),
-                transform: Affine::IDENTITY,
-                anchor: None,
-            }],
+            components: vec![Component::new("x", Affine::IDENTITY)],
         };
         let mut b = GlyphInstance {
             width: 200.0,
@@ -3476,11 +3480,7 @@ mod tests {
             Vec::new(),
             ["a", "b", "c"]
                 .into_iter()
-                .map(|base| Component {
-                    base: base.into(),
-                    transform: Affine::IDENTITY,
-                    anchor: None,
-                })
+                .map(|base| Component::new(base, Affine::IDENTITY))
                 .collect(),
         );
 

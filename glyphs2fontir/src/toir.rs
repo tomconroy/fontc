@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque},
+    collections::{BTreeMap, BTreeSet, HashMap, VecDeque},
     path::PathBuf,
     str::FromStr,
     sync::OnceLock,
@@ -16,17 +16,18 @@ use write_fonts::types::Tag;
 use fontdrasil::{
     coords::{CoordConverter, DesignCoord, DesignLocation, NormalizedLocation, UserCoord},
     piecewise_linear_map::PiecewiseLinearMap,
-    types::{Axes, GlyphName},
+    types::GlyphName,
 };
 use fontir::{
-    error::{BadGlyph, BadGlyphKind, Error, PathConversionError},
+    error::{BadGlyph, BadGlyphKind, BadSource, Error, PathConversionError},
     ir::{
         self, Color, ColorStop, GlyphPathBuilder, Paint, PaintLinearGradient, PaintRadialGradient,
         PaintSolid,
     },
+    source::find_instance,
 };
 use glyphs_reader::{
-    Component, FeatureSnippet, Font, Glyph, InstanceType, Layer, NodeType, Path, Shape,
+    Component, FeatureSnippet, Font, Glyph, Instance, InstanceType, Layer, NodeType, Path, Shape,
     ShapeAttributes,
 };
 
@@ -60,9 +61,8 @@ fn to_ir_component(glyph_name: GlyphName, component: &Component) -> ir::Componen
         glyph_name, component.name, component.transform
     );
     ir::Component {
-        base: component.name.as_str().into(),
-        transform: component.transform,
         anchor: component.anchor.clone(),
+        ..ir::Component::new(component.name.as_str(), component.transform)
     }
 }
 
@@ -143,6 +143,7 @@ fn to_ir_path(
 
 pub(crate) fn to_ir_features(
     features: &[FeatureSnippet],
+    path: Option<PathBuf>,
     include_dir: Option<PathBuf>,
 ) -> Result<ir::FeatureSources, Error> {
     // Based on https://github.com/googlefonts/glyphsLib/blob/24b4d340e4c82948ba121dcfe563c1450a8e69c9/Lib/glyphsLib/builder/features.py#L74
@@ -152,6 +153,7 @@ pub(crate) fn to_ir_features(
     // a .glyphs file has one set of features, shared by every master
     Ok(ir::FeatureSources::single(ir::FeaturesSource::Memory {
         fea_content: fea_snippets.join("\n\n"),
+        path,
         include_dir,
     }))
 }
@@ -214,8 +216,10 @@ fn to_user_coord(mappings: &[(UserCoord, DesignCoord)], design: DesignCoord) -> 
     UserCoord::new(design_to_user.map(design.into_inner()))
 }
 
-/// An axis whose range is the masters' span, read through the mapping; see
-/// [`AxisRange::Masters`].
+/// An axis whose range is the masters' span, read through the mapping: how
+/// Glyphs itself exports.
+///
+/// Every master is on the axis, so none is ever left off it.
 ///
 /// The mapping keeps only its points inside that span, plus a point for each of
 /// the extreme and default masters it doesn't name already, so the converter's
@@ -227,9 +231,13 @@ fn masters_through_mapping(
     max: DesignCoord,
     axis_name: &str,
 ) -> Result<(CoordConverter, UserCoord, UserCoord, UserCoord), Error> {
-    let user_min = to_user_coord(mappings, min);
+    let user_at_min = to_user_coord(mappings, min);
     let user_default = to_user_coord(mappings, default);
-    let user_max = to_user_coord(mappings, max);
+    let user_at_max = to_user_coord(mappings, max);
+    // The axis runs in the user direction, which a decreasing mapping makes
+    // the opposite of the design direction.
+    let user_min = user_at_min.min(user_at_max);
+    let user_max = user_at_min.max(user_at_max);
 
     let mut trimmed: Vec<_> = mappings
         .iter()
@@ -238,7 +246,11 @@ fn masters_through_mapping(
         })
         .copied()
         .collect();
-    for point in [(user_min, min), (user_default, default), (user_max, max)] {
+    for point in [
+        (user_at_min, min),
+        (user_default, default),
+        (user_at_max, max),
+    ] {
         if !trimmed.contains(&point) {
             trimmed.push(point);
         }
@@ -262,25 +274,6 @@ fn masters_through_mapping(
     ))
 }
 
-/// Where an axis' user-space range comes from.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum AxisRange {
-    /// The masters' span, read through the mapping: how Glyphs itself exports.
-    ///
-    /// Every master is on the axis, so none is ever dropped, and the mapping is
-    /// trimmed to the masters' span. Glyphs exports a source whose "Axis Mappings"
-    /// reach from 100 to 900 but whose masters sit at 400 and 700 as a 400-700
-    /// axis, with the mapping's interior points as avar.
-    Masters,
-    /// The mapping's own user-space extremes, as glyphsLib reads them.
-    ///
-    /// A master the mapping can't reach is then off the axis, and
-    /// [`drop_sources_outside_axes`] drops it, as fontmake does. Only a Glyphs 2
-    /// source reads its axes this way, and only while some master is left at the
-    /// default location; see [`FontInfo::try_from`].
-    Mapping,
-}
-
 /// Convert .glyphs axes to IR axes.
 ///
 ///  See <https://github.com/googlefonts/glyphsLib/blob/6f243c1f732ea1092717918d0328f3b5303ffe56/Lib/glyphsLib/builder/axes.py#L155>
@@ -289,7 +282,6 @@ fn to_ir_axis(
     axis_values: &[OrderedFloat<f64>],
     default_idx: usize,
     axis: &glyphs_reader::Axis,
-    range: AxisRange,
 ) -> Result<fontdrasil::types::Axis, Error> {
     let min = axis_values.iter().min().unwrap();
     let max = axis_values.iter().max().unwrap();
@@ -312,55 +304,51 @@ fn to_ir_axis(
         })
         .unwrap_or_default();
 
-    // Read as glyphsLib does (`AxisRange::Mapping`), a mapped axis takes its user-space
-    // extremes from the mapping itself, never from the masters: instances contribute
-    // mappings too, so the mapped range can reach past the masters, and a master can sit
-    // at a design value the mapping never names.
-    // <https://github.com/googlefonts/glyphsLib/blob/6.13.1/Lib/glyphsLib/builder/axes.py#L284-L285>
-    // <https://github.com/googlefonts/fontc/issues/1991>
-    //
-    // The default master's user location is then the reverse of its design location,
-    // clamped into that range.
-    // <https://github.com/googlefonts/glyphsLib/blob/6.13.1/Lib/glyphsLib/builder/axes.py#L259-L263>
-    // <https://github.com/googlefonts/glyphsLib/blob/6.13.1/Lib/glyphsLib/builder/axes.py#L286>
-    let mapped = (range == AxisRange::Mapping && !mappings.is_empty()).then(|| {
-        #[allow(clippy::unwrap_used)] // a non-identity mapping isn't empty
-        let user_min = mappings.iter().map(|(user, _)| *user).min().unwrap();
-        #[allow(clippy::unwrap_used)] // a non-identity mapping isn't empty
-        let user_max = mappings.iter().map(|(user, _)| *user).max().unwrap();
-        (user_min, to_user_coord(&mappings, default), user_max)
-    });
-
-    // glyphsLib always uses the mapping; we can't when the axis is degenerate *and*
-    // the mapping can't reach the default master. The clamp would then invent a user
-    // default the mapping never named, and since our normalization is built from the
-    // mapping's design vertices every master would land off it. The masters that a
-    // mapping can't reach are dropped below - but on a degenerate axis that is all of
-    // them, leaving no font. varLib refuses such a source outright; we keep building it
-    // as the unmapped axis it may as well be.
-    let mapped = mapped.filter(|(user_min, user_default, user_max)| {
-        min != max || (user_min <= user_default && user_default <= user_max)
-    });
+    // If all masters sit at the same position on this axis, the mapping is
+    // meaningless and there's no variation to map. Treat as unmapped.
+    // glyphsLib handles this via reverse-map + clamp to [min(keys), max(keys)]:
+    // https://github.com/googlefonts/glyphsLib/blob/044f19e4/Lib/glyphsLib/builder/axes.py#L286
+    let has_non_identity_mapping = !mappings.is_empty() && min != max;
 
     let (converter, user_min, user_default, user_max) =
-        if range == AxisRange::Masters && !mappings.is_empty() {
+        if !mappings.is_empty() && !font.is_glyphs2() {
+            // A Glyphs 3 or 4 source reads its axes as Glyphs does: the masters are
+            // the range, read through the mapping, and the mapping is trimmed to
+            // them. Glyphs exports a source whose "Axis Mappings" reach from 100 to
+            // 900 but whose masters sit at 400 and 700 as a 400-700 axis, with the
+            // mapping's interior points as avar; glyphsLib would span the mapping.
             masters_through_mapping(&mappings, min, default, max, &axis.name)?
-        } else if let Some((user_min, user_default, user_max)) = mapped {
-            let user_default = user_default.clamp(user_min, user_max);
-            let default_idx = mappings
-                .iter()
-                .position(|(user, _)| *user == user_default)
-                .ok_or_else(|| Error::MissingMappingForUserCoord {
-                    axis_name: axis.name.clone(),
-                    mappings: mappings.clone(),
-                    value: user_default,
-                })?;
+        } else if has_non_identity_mapping
+        && let Some(default_idx) = mappings.iter().position(|(_, dc)| *dc == default)
+        // the min and max masters must be mapped too
+        && mappings.iter().any(|(_, dc)| *dc == min)
+        && mappings.iter().any(|(_, dc)| *dc == max)
+        {
+            // Use user-space values directly from the mapping, matching glyphsLib.
+            // Don't round-trip via design_to_user which is lossy for many-to-one maps.
+            // The axis spans the whole mapping, like in glyphsLib: an explicit Axis
+            // Mappings may go beyond the masters, while the mappings we derive from
+            // Axis Location or the instances only span them.
+            let user_min = mappings.iter().map(|(u, _)| *u).min().unwrap();
+            let user_default = mappings[default_idx].0;
+            let user_max = mappings.iter().map(|(u, _)| *u).max().unwrap();
             (
                 CoordConverter::new(mappings, default_idx)?,
                 user_min,
                 user_default,
                 user_max,
             )
+        } else if has_non_identity_mapping {
+            // A Glyphs 2 source whose mapping doesn't name the default, min and max
+            // masters. glyphs-reader makes the mappings it derives name them, so
+            // this is an explicit "Axis Mappings"; rather than refuse the source,
+            // read the masters through it, as for Glyphs 3.
+            warn!(
+                "Axis {}: the mapping has no point at the default, min or max master; \
+             taking the axis range from the masters",
+                axis.name
+            );
+            masters_through_mapping(&mappings, min, default, max, &axis.name)?
         } else {
             // There is no meaningful mapping; design == user. Virtual masters are in
             // axis_values, and this is the only branch where glyphsLib lets them widen
@@ -398,131 +386,19 @@ fn to_ir_axis(
     })
 }
 
-/// The user-space position glyphsLib treats as "this axis is doing nothing".
+/// Does this axis reach the font?
 ///
-/// <https://github.com/googlefonts/glyphsLib/blob/v6.13.1/Lib/glyphsLib/builder/axes.py#L543-L550>
-fn default_user_loc(tag: Tag) -> f64 {
-    match tag {
-        _ if tag == Tag::new(b"wght") => 400.0,
-        _ if tag == Tag::new(b"wdth") => 100.0,
-        _ => 0.0,
-    }
+/// An axis the masters move along does. One they all share a single value on
+/// only does when the source declares its axes: a Glyphs 2 source without an
+/// "Axes" custom parameter has its three axis slots whether it wants them or
+/// not, and one that never moves is nothing the designer asked for.
+fn wanted_in_designspace(axis: &fontdrasil::types::Axis, declares_axes: bool) -> bool {
+    axis.min < axis.max || declares_axes
 }
 
-/// Would glyphsLib write this axis into the designspace?
-///
-/// A Glyphs 2 source has three axis slots whether it wants them or not, so most fonts
-/// carry a Width and a Custom axis that never move. glyphsLib throws such an axis away,
-/// but only when it is *entirely* inert: parked at the position that axis means nothing
-/// at, with a user:design mapping that doesn't bend, and unnamed by the font's "Axes"
-/// custom parameter. Anything else - a range, a bent mapping, a source that named the
-/// axis - keeps it, and fontmake then writes it to fvar, avar, STAT and name.
-///
-/// <https://github.com/googlefonts/glyphsLib/blob/v6.13.1/Lib/glyphsLib/builder/axes.py#L288-L299>
-fn wanted_in_designspace(
-    axis: &fontdrasil::types::Axis,
-    is_identity_map: bool,
-    declares_axes: bool,
-) -> bool {
-    axis.min < axis.max
-        || axis.min.into_inner() != default_user_loc(axis.tag)
-        || !is_identity_map
-        || declares_axes
-}
-
-/// Drop the masters that sit outside the axes' user-space ranges, and what goes with them.
-///
-/// A mapped axis takes its range from the mapping, so a source can sit at a
-/// design location the mapping never reaches: a Glyphs 2 file that uses the
-/// Width axis as an italic toggle, giving every instance the same (default)
-/// widthClass, ends up with a Width axis pinned to one user value while half
-/// the masters sit off it.
-///
-/// fontmake never sees those sources. designspaceLib carves the variable font
-/// out of the designspace first, and keeps only the sources whose design
-/// location maps back into every axis' user range.
-///
-/// designspaceLib tests instances the same way, but does it on the way into fvar
-/// rather than here: an instance the region excludes is still an instance the
-/// designspace declared, and `fontmake -i` will interpolate it. That test lives in
-/// [`fontir::ir::StaticMetadata::fvar_instances`]. What has to happen *here* is
-/// narrower and not about regions at all: an instance whose masters just went away
-/// cannot be built by anything, so it goes with them.
-///
-/// <https://github.com/fonttools/fonttools/blob/4.63.0/Lib/fontTools/designspaceLib/split.py#L275-L278>
-fn drop_sources_outside_axes(
-    font: &mut Font,
-    axes: &Axes,
-    axis_indices: &[usize],
-) -> Result<(), Error> {
-    // `axes_values` is indexed by the source's own axes, dropped ones included
-    let in_range = |axes_values: &[OrderedFloat<f64>]| {
-        axes.iter().zip(axis_indices).all(|(axis, &idx)| {
-            axes_values.get(idx).is_none_or(|value| {
-                let user = DesignCoord::new(*value).to_user(&axis.converter);
-                axis.min <= user && user <= axis.max
-            })
-        })
-    };
-
-    let dropped: HashSet<_> = font
-        .masters
-        .iter()
-        .filter(|master| !in_range(&master.axes_values))
-        .map(|master| master.id.clone())
-        .collect();
-    if dropped.is_empty() {
-        return Ok(());
-    }
-
-    // If the default master is going with them the survivor at the default
-    // location takes over, as designspaceLib's `subDoc.findDefault()` does. Work
-    // that out before touching the font: with no such survivor the caller reads
-    // the axes again rather than dropping anything.
-    let default_master_id = font.default_master().id.clone();
-    let survivors = || font.masters.iter().filter(|m| !dropped.contains(&m.id));
-    let default_master_idx = if dropped.contains(&default_master_id) {
-        let at_default = |axes_values: &[OrderedFloat<f64>]| {
-            axes.iter().zip(axis_indices).all(|(axis, &idx)| {
-                axes_values.get(idx).is_some_and(|value| {
-                    *value == axis.default.to_design(&axis.converter).into_inner()
-                })
-            })
-        };
-        survivors()
-            .position(|master| at_default(&master.axes_values))
-            .ok_or(Error::NoDefaultMaster)?
-    } else {
-        #[allow(clippy::unwrap_used)] // it isn't dropped, so it survives
-        survivors()
-            .position(|master| master.id == default_master_id)
-            .unwrap()
-    };
-
-    for master in font.masters.iter().filter(|m| dropped.contains(&m.id)) {
-        warn!(
-            "Master '{}' is outside the axis ranges the mapping defines; dropping it",
-            master.name
-        );
-    }
-    font.masters.retain(|master| !dropped.contains(&master.id));
-    // A variable instance describes a whole variable font rather than a point
-    // in it; glyphsLib doesn't write it as a designspace instance at all.
-    font.instances.retain(|instance| {
-        instance.type_ != InstanceType::Single || in_range(&instance.axes_values)
-    });
-    for glyph in font.glyphs.values_mut() {
-        glyph
-            .layers
-            .retain(|layer| !dropped.contains(layer.master_id()));
-    }
-    // Kerning is keyed by master id and only ever read for a live master, so
-    // the dropped masters' entries can stay where they are.
-    font.default_master_idx = default_master_idx;
-    Ok(())
-}
-
-fn ir_axes(font: &Font, range: AxisRange) -> Result<(fontdrasil::types::Axes, Vec<usize>), Error> {
+/// The axes that survive into the designspace, and for each the index of the
+/// source axis it comes from.
+fn ir_axes(font: &Font) -> Result<(fontdrasil::types::Axes, Vec<usize>), Error> {
     // Every master should have a value for every axis
     for master in font.masters.iter() {
         if font.axes.len() != master.axes_values.len() {
@@ -552,18 +428,8 @@ fn ir_axes(font: &Font, range: AxisRange) -> Result<(fontdrasil::types::Axes, Ve
                 })
             }))
             .collect();
-        let axis = to_ir_axis(
-            font,
-            &axis_values,
-            font.default_master_idx,
-            glyphs_axis,
-            range,
-        )?;
-        let is_identity_map = font
-            .axis_mappings
-            .get(&glyphs_axis.name)
-            .is_none_or(|mapping| mapping.is_identity());
-        if wanted_in_designspace(&axis, is_identity_map, font.declares_axes) {
+        let axis = to_ir_axis(font, &axis_values, font.default_master_idx, glyphs_axis)?;
+        if wanted_in_designspace(&axis, font.declares_axes) {
             axes.push(axis);
             axis_indices.push(idx);
         }
@@ -572,10 +438,249 @@ fn ir_axes(font: &Font, range: AxisRange) -> Result<(fontdrasil::types::Axes, Ve
     Ok((fontdrasil::types::Axes::new(axes), axis_indices))
 }
 
+/// The family name of an instance: its own, else the font's, like glyphsLib's
+/// `GSInstance.familyName`.
+pub(crate) fn instance_family_name<'a>(font: &'a Font, instance: &'a Instance) -> &'a str {
+    instance
+        .family_name()
+        .or_else(|| font.get_default_name("familyNames"))
+        .unwrap_or_default()
+}
+
+/// The full name of an instance, `"{family} {name}"`.
+///
+/// glyphsLib gives the designspace instance this name, so it is also what
+/// fontmake's `-i` matches.
+pub(crate) fn instance_full_name(font: &Font, instance: &Instance) -> String {
+    format!("{} {}", instance_family_name(font, instance), instance.name)
+}
+
+fn invalid_instance<T>(name: &str, reason: String) -> Result<T, Error> {
+    Err(Error::InvalidInstance {
+        name: name.to_string(),
+        reason,
+    })
+}
+
+fn bad_source<T>(message: String) -> Result<T, Error> {
+    Err(BadSource::custom("<Glyphs source>", message).into())
+}
+
+/// The active static instances, with their full names.
+pub(crate) fn static_instances(font: &Font) -> Vec<(usize, String)> {
+    font.instances
+        .iter()
+        .enumerate()
+        .filter(|(_, instance)| instance.active && instance.type_ == InstanceType::Single)
+        .map(|(index, instance)| (index, instance_full_name(font, instance)))
+        .collect()
+}
+
+fn list_instances(instances: &[(usize, String)]) -> String {
+    instances
+        .iter()
+        .map(|(_, name)| format!("\"{name}\""))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// The index of the one active static instance with the requested full name.
+fn find_static_instance(font: &Font, requested: &str) -> Result<usize, Error> {
+    let instances = static_instances(font);
+    let (indices, names): (Vec<_>, Vec<_>) = instances.iter().cloned().unzip();
+    if !names.iter().any(|name| name == requested) {
+        // Say why an instance with that name doesn't count.
+        let reason = font
+            .instances
+            .iter()
+            .find(|instance| instance_full_name(font, instance) == requested)
+            .map(|instance| {
+                if instance.type_ == InstanceType::Variable {
+                    "that is a variable font setting"
+                } else {
+                    "that instance is inactive"
+                }
+            });
+        if let Some(reason) = reason {
+            let available = if instances.is_empty() {
+                "there are none".to_string()
+            } else {
+                format!("available: {}", list_instances(&instances))
+            };
+            return invalid_instance(requested, format!("{reason}; {available}"));
+        }
+    }
+    find_instance(requested, &names).map(|i| indices[i])
+}
+
+/// Choose the export whose metadata a static build uses.
+///
+/// That is the one active static instance, or the one with the requested
+/// full name.
+///
+/// `font` must build a static font, i.e. its axes are all points.
+fn static_export(font: &Font, requested: Option<&str>) -> Result<Option<usize>, Error> {
+    if let Some(requested) = requested {
+        return find_static_instance(font, requested).map(Some);
+    }
+    let instances = static_instances(font);
+    if instances.len() > 1 {
+        // Without a selection, build the master as before.
+        warn!(
+            "Several active static instances ({}), building the master without \
+             their metadata; select one by its full name with --instance, or \
+             disable all but one",
+            list_instances(&instances)
+        );
+        return Ok(None);
+    }
+    Ok(instances.first().map(|(index, _)| *index))
+}
+
+/// Whether each axis varies across the masters.
+///
+/// An axis varies when the masters, virtual ones included, don't all sit at
+/// the same location along it.
+fn varying_axes(font: &Font) -> Vec<bool> {
+    font.axes
+        .iter()
+        .enumerate()
+        .map(|(idx, axis)| {
+            let first = font.masters[0].axes_values[idx];
+            font.masters.iter().any(|m| m.axes_values[idx] != first)
+                || font
+                    .virtual_masters
+                    .iter()
+                    .filter_map(|vm| vm.get(&axis.name))
+                    .any(|value| *value != first)
+        })
+        .collect()
+}
+
+/// Instantiate `font` at the location of its active static instance `full_name`.
+///
+/// This is the one case that needs no interpolation: the instance is on a
+/// master, so that master is kept alone (see [`Font::retain_master`]).
+///
+/// Locations are compared exactly, in design coordinates. Masters that aren't
+/// meant to interpolate ("bag of statics" sources, see
+/// <https://github.com/googlefonts/fontc/issues/1288>) can't make an instance
+/// anywhere else. Along an axis where all masters, virtual ones included, sit
+/// at the same location there is nothing to interpolate, so the instance is
+/// built from the master whatever its own location there. The instance keeps
+/// its location, at which its alternate layers then apply, as Glyphs 3.5
+/// exports it, and its classes. This is fontc's choice:
+/// glyphsLib only moves such an instance onto the masters when the axis has
+/// no mapping (<https://github.com/googlefonts/glyphsLib/pull/1197>), and
+/// otherwise fontmake silently builds nothing for it (e.g. Fuzzy Bubbles
+/// Regular, which Google Fonts ships).
+///
+/// Every glyph must have a layer for the kept master. Where fontmake would
+/// take a missing one from the other masters, this is an error.
+///
+/// The kept master's own data replaces the default master's, e.g. glyph
+/// categories are inferred from its anchors. fontmake instead gives every
+/// instance the default master's (ufo2ft's instantiator copies the default
+/// source's lib), so the GDEF classes of an instance on another master can
+/// differ.
+fn instantiate_on_master(font: &mut Font, full_name: &str) -> Result<(), Error> {
+    let instance_index = find_static_instance(font, full_name)?;
+    let instance = &font.instances[instance_index];
+    let fmt_location = |values: &[OrderedFloat<f64>]| {
+        values
+            .iter()
+            .map(|v| v.to_string())
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    if instance.axes_values.len() != font.axes.len() {
+        return bad_source(format!(
+            "Instance \"{full_name}\" has location ({}) but the font has {} axes",
+            fmt_location(&instance.axes_values),
+            font.axes.len()
+        ));
+    }
+    let varies = varying_axes(font);
+    let matches: Vec<_> = font
+        .masters
+        .iter()
+        .filter(|master| {
+            master
+                .axes_values
+                .iter()
+                .zip(&instance.axes_values)
+                .zip(&varies)
+                .all(|((master, instance), varies)| !varies || master == instance)
+        })
+        .collect();
+    let master_id = match matches.as_slice() {
+        [master] => master.id.clone(),
+        [] => {
+            return invalid_instance(
+                full_name,
+                format!(
+                    "its location ({}) is not at the location of a master ({}), and fontc \
+                 can't interpolate static instances",
+                    fmt_location(&instance.axes_values),
+                    font.masters
+                        .iter()
+                        .map(|m| format!("\"{}\" at ({})", m.name, fmt_location(&m.axes_values)))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+            );
+        }
+        _ => {
+            return invalid_instance(
+                full_name,
+                format!(
+                    "masters {} are all at its location",
+                    matches
+                        .iter()
+                        .map(|m| format!("\"{}\"", m.name))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+            );
+        }
+    };
+    let missing: Vec<_> = font
+        .glyphs
+        .values()
+        .filter(|glyph| {
+            !glyph.layers.is_empty()
+                && !glyph.layers.iter().any(|layer| layer.layer_id == master_id)
+        })
+        .map(|glyph| format!("'{}'", glyph.name))
+        .collect();
+    if !missing.is_empty() {
+        let master_name = &font
+            .masters
+            .iter()
+            .find(|m| m.id == master_id)
+            .unwrap()
+            .name;
+        return invalid_instance(
+            full_name,
+            format!(
+                "glyphs {} have no layer for its master \"{master_name}\"",
+                missing.join(", ")
+            ),
+        );
+    }
+    let retained = font.retain_master(&master_id);
+    debug_assert!(retained, "{master_id} is one of the font's masters");
+    Ok(())
+}
+
 /// A [Font] with some prework to convert to IR predone.
 #[derive(Debug)]
 pub(crate) struct FontInfo {
     pub font: Font,
+    /// Index into `font.instances` of the export whose metadata the build
+    /// applies: for now, the active static instance when the font is static.
+    // TODO(anthrotype): the Variable Font Settings being built, for variable fonts.
+    pub export_index: Option<usize>,
     /// Index by master id
     pub master_indices: HashMap<String, usize>,
     // Master id => location
@@ -592,32 +697,45 @@ pub(crate) struct FontInfo {
     pub kern_groups: OnceLock<BTreeMap<ir::KernGroup, BTreeSet<GlyphName>>>,
 }
 
-impl TryFrom<Font> for FontInfo {
-    type Error = Error;
-
-    fn try_from(mut font: Font) -> Result<Self, Self::Error> {
-        // A Glyphs 3 or 4 source reads its axes as Glyphs does: the masters are
-        // the range, and they all stay. A Glyphs 2 source reads them as glyphsLib
-        // does, for fontmake's sake: the axes are read off every master, and only
-        // then do the sources the axes can't reach get dropped. Not the default
-        // master, though, unless another master can take its place; when none
-        // can, fontmake can't build the source at all, and we take the range off
-        // the masters instead, so that every one of them stays.
-        let (axes, axis_indices) = if font.is_glyphs2() {
-            let (axes, axis_indices) = ir_axes(&font, AxisRange::Mapping)?;
-            match drop_sources_outside_axes(&mut font, &axes, &axis_indices) {
-                Ok(()) => (axes, axis_indices),
-                Err(Error::NoDefaultMaster) => {
-                    warn!(
-                        "The axis mappings leave no master at the default location; \
-                         taking the axis ranges from the masters instead"
-                    );
-                    ir_axes(&font, AxisRange::Masters)?
-                }
-                Err(e) => return Err(e),
+impl FontInfo {
+    /// Prepare `font` for IR.
+    ///
+    /// Builds the static instance whose full name is `instance`, if given.
+    ///
+    /// When the font would otherwise build a variable font, the instance must
+    /// be at the location of a master, and the font is reduced to that master
+    /// (see [`Font::retain_master`]), so the rest of the pipeline sees a
+    /// single-master static source.
+    pub(crate) fn new(mut font: Font, instance: Option<&str>) -> Result<Self, Error> {
+        // before ir_axes, which needs mappings for the locations the instance drops
+        if let Some(name) = instance
+            && varying_axes(&font).contains(&true)
+        {
+            instantiate_on_master(&mut font, name)?;
+        }
+        let (axes, axis_indices) = ir_axes(&font)?;
+        // one master, no virtual masters: every axis is a point
+        debug_assert!(
+            instance.is_none() || axes.iter().all(|axis| axis.is_point()),
+            "{axes:?}"
+        );
+        // Like StaticMetadata, a font whose axes are all points is static.
+        let export_index = if axes.iter().all(|axis| axis.is_point()) {
+            let export_index = static_export(&font, instance)?;
+            // built at the export's location, else at the master's
+            let location = match export_index {
+                Some(index) => font.instances[index].axes_values.clone(),
+                None => font.default_master().axes_values.clone(),
+            };
+            font.apply_alternate_layers(&location);
+            if let Some(index) = export_index {
+                font.apply_instance_parameters(index);
             }
+            export_index
         } else {
-            ir_axes(&font, AxisRange::Masters)?
+            // so that the alternate layers of components are swapped in composites
+            font.align_bracket_layers();
+            None
         };
 
         let master_indices: HashMap<_, _> = font
@@ -659,6 +777,7 @@ impl TryFrom<Font> for FontInfo {
 
         Ok(FontInfo {
             font,
+            export_index,
             master_indices,
             master_positions,
             locations,
@@ -892,17 +1011,89 @@ fn colrv0_color_glyphs(
     new_glyphs
 }
 
+/// A palette layer's palette index, and the name of its color glyph, if any.
+type PaletteLayer = (i64, Option<SmolStr>);
+
+/// The palette layers of each COLRv0 glyph, keyed by (glyph name, master id).
+///
+/// Each entry lists every palette layer of that master, in document order.
+/// Empty layers, and layers the split drops, have no color glyph.
+#[derive(Default)]
+struct ColrLayerGlyphNames(HashMap<(SmolStr, String), Vec<PaletteLayer>>);
+
+impl ColrLayerGlyphNames {
+    /// Record the palette layers of a glyph that [colrv0_color_glyphs] split into `color_glyphs`.
+    ///
+    /// As in the split, the i-th non-empty palette layer of each master is in
+    /// `color_glyphs[i]`.
+    fn insert(&mut self, original: &Glyph, color_glyphs: &[Glyph]) {
+        let mut non_empty_by_master: HashMap<&str, usize> = HashMap::new();
+        for layer in original.layers.iter().filter(|l| !l.is_intermediate()) {
+            let (Some(palette_idx), Some(master_id)) = (
+                layer.attributes.color_palette,
+                layer.associated_master_id.as_deref(),
+            ) else {
+                continue;
+            };
+            let color_glyph = if layer.shapes.is_empty() {
+                None
+            } else {
+                let i = non_empty_by_master.entry(master_id).or_default();
+                *i += 1;
+                color_glyphs.get(*i - 1).map(|g| g.name.clone())
+            };
+            self.0
+                .entry((original.name.clone(), master_id.to_string()))
+                .or_default()
+                .push((palette_idx, color_glyph));
+        }
+    }
+
+    /// Point the components of a palette layer at the component glyphs' color glyphs.
+    ///
+    /// Glyphs resolves a component in a palette layer, master or intermediate,
+    /// to the component glyph's first palette layer with the same master and
+    /// palette index. If there is none, or that layer is empty, the component
+    /// keeps referencing the component glyph itself, even if a later layer with
+    /// that palette index has shapes.
+    ///
+    /// See [glyphsLib's version] of the lookup.
+    ///
+    /// [glyphsLib's version]: https://github.com/googlefonts/glyphsLib/blob/8952d1c5/Lib/glyphsLib/builder/color_layers.py#L51-L71
+    fn remap_components(&self, layer: &mut Layer) {
+        let Some(palette_idx) = layer.attributes.color_palette else {
+            return;
+        };
+        let master_id = layer.master_id().to_string();
+        for shape in layer.shapes.iter_mut() {
+            let Shape::Component(component) = shape else {
+                continue;
+            };
+            if let Some(name) = self
+                .0
+                .get(&(component.name.clone(), master_id.clone()))
+                .and_then(|layers| layers.iter().find(|(p, _)| *p == palette_idx))
+                .and_then(|(_, name)| name.clone())
+            {
+                component.name = name;
+            }
+        }
+    }
+}
+
 fn split_colrv0_glyph(
     original: &Glyph,
     default_master_id: &str,
     master_ids: &[String],
     color_glyphs: &mut IndexMap<SmolStr, Vec<SmolStr>>,
+    layer_glyph_names: &mut ColrLayerGlyphNames,
     additions: &mut Vec<(SmolStr, Glyph)>,
 ) -> Result<(), Error> {
     // COLRv0 runs are just consecutive shapes by palette index
     // The original glyph becomes uncolored,
     // each color run becomes a new glyph named [original].color[i]
     let new_glyphs = colrv0_color_glyphs(original, default_master_id, master_ids);
+    layer_glyph_names.insert(original, &new_glyphs);
 
     for new_glyph in new_glyphs {
         debug!("Add COLRv0 {}", new_glyph.name);
@@ -1020,6 +1211,7 @@ fn split_color_glyphs(font: Font) -> Result<(Font, IndexMap<SmolStr, Vec<SmolStr
     let mut color_glyphs: IndexMap<SmolStr, Vec<SmolStr>> = Default::default();
     let default_master_id = font.default_master().id.clone();
     let master_ids: Vec<String> = font.masters.iter().map(|m| m.id.clone()).collect();
+    let mut layer_glyph_names = ColrLayerGlyphNames::default();
 
     let mut additions: Vec<(SmolStr, Glyph)> = Vec::new();
     for glyph in font.glyphs.values_mut() {
@@ -1039,6 +1231,7 @@ fn split_color_glyphs(font: Font) -> Result<(Font, IndexMap<SmolStr, Vec<SmolStr
                     &default_master_id,
                     &master_ids,
                     &mut color_glyphs,
+                    &mut layer_glyph_names,
                     &mut additions,
                 )?;
             } else if default_master_layer.is_color() {
@@ -1067,6 +1260,12 @@ fn split_color_glyphs(font: Font) -> Result<(Font, IndexMap<SmolStr, Vec<SmolStr
             .retain(|l| l.attributes.color_palette.is_none() || !l.is_intermediate());
     }
 
+    for (_, glyph) in additions.iter_mut() {
+        for layer in glyph.layers.iter_mut() {
+            layer_glyph_names.remap_components(layer);
+        }
+    }
+
     font.glyph_order
         .extend(additions.iter().map(|(gn, _)| gn.clone()));
     font.glyphs.extend(additions);
@@ -1090,8 +1289,8 @@ pub(crate) fn to_ir_color_stops(stops: &[glyphs_reader::ColorStop]) -> Vec<Color
         .iter()
         .map(|cs| ColorStop {
             offset: (cs.stop_offset.0 as f32).into(),
-            color: to_ir_color(cs.color),
-            alpha: 255.0.into(),
+            color: ir::ColorReference::Color(to_ir_color(cs.color)),
+            alpha: 1.0.into(),
         })
         .collect()
 }
@@ -1105,7 +1304,13 @@ pub(crate) fn to_ir_paint(
     if let Some(palette_idx) = layer.attributes.color_palette {
         // 0xFFFF is a special COLR palette index meaning "use the text foreground color"
         if palette_idx == 0xFFFF {
-            return Ok(Paint::Solid(PaintSolid { color: None }.into()));
+            return Ok(Paint::Solid(
+                PaintSolid {
+                    color: ir::ColorReference::PaletteIndex(0xFFFF),
+                    alpha: 1.0.into(),
+                }
+                .into(),
+            ));
         }
         let Some(palette) = palette else {
             return Err(Error::BadGlyph(BadGlyph::new(
@@ -1123,7 +1328,8 @@ pub(crate) fn to_ir_paint(
         };
         return Ok(Paint::Solid(
             PaintSolid {
-                color: Some(to_ir_color(*color)),
+                color: ir::ColorReference::Color(to_ir_color(*color)),
+                alpha: 1.0.into(),
             }
             .into(),
         ));
@@ -1131,7 +1337,8 @@ pub(crate) fn to_ir_paint(
     if let Some(color) = attr.fill_color {
         return Ok(Paint::Solid(
             PaintSolid {
-                color: Some(to_ir_color(color)),
+                color: ir::ColorReference::Color(to_ir_color(color)),
+                alpha: 1.0.into(),
             }
             .into(),
         ));
@@ -1150,6 +1357,8 @@ pub(crate) fn to_ir_paint(
                 // with the radius calculated as % of the max distance to bbox corners.
                 Ok(Paint::RadialGradient(
                     PaintRadialGradient {
+                        coordinates: ir::GradientCoordinates::Relative,
+                        extend: write_fonts::tables::colr::Extend::Pad,
                         p0: start,
                         p1: start,
                         r0: None, // Defaults to 0
@@ -1165,6 +1374,10 @@ pub(crate) fn to_ir_paint(
                 let radius = |r: Option<OrderedFloat<f64>>| r.map(|r| OrderedFloat(r.0 as f32));
                 Ok(Paint::RadialGradient(
                     PaintRadialGradient {
+                        // relative radii: multiples of the square root of the
+                        // bbox's width times its height
+                        coordinates: ir::GradientCoordinates::Relative,
+                        extend: write_fonts::tables::colr::Extend::Pad,
                         p0: start,
                         p1: end,
                         r0: radius(gradient.start_radius),
@@ -1179,6 +1392,8 @@ pub(crate) fn to_ir_paint(
                 // (rotation works differently in percentage vs absolute space).
                 Ok(Paint::LinearGradient(
                     PaintLinearGradient {
+                        coordinates: ir::GradientCoordinates::Relative,
+                        extend: write_fonts::tables::colr::Extend::Pad,
                         p0: start,
                         p1: end,
                         p2: None,
@@ -1206,7 +1421,7 @@ pub(crate) fn to_ir_paint(
 #[cfg(test)]
 mod tests {
     use glyphs_reader::{
-        Font, Glyph, Layer, LayerAttributes, Node, Path,
+        Component, Font, Glyph, Layer, LayerAttributes, Node, Path, Shape,
         glyphdata::{Category, Subcategory},
     };
     use std::path::PathBuf;
@@ -1599,6 +1814,181 @@ mod tests {
         }
     }
 
+    fn component_names(layer: &Layer) -> Vec<&str> {
+        layer
+            .shapes
+            .iter()
+            .map(|shape| match shape {
+                Shape::Component(c) => c.name.as_str(),
+                Shape::Path(_) => panic!("{} should only have components", layer.layer_id),
+            })
+            .collect()
+    }
+
+    /// A component in a palette layer references the component glyph's color
+    /// glyph for the same master and palette index, in every master and in
+    /// intermediate layers.
+    ///
+    /// A component of a glyph with no palette layer for that index, or whose
+    /// palette layer for that index is empty, keeps referencing that glyph.
+    #[test]
+    fn colrv0_components_reference_matching_palette_layer() {
+        let font = Font::load(&testdata_dir().join("glyphs3/COLRv0-components.glyphs")).unwrap();
+        let (font, color_glyphs) = split_color_glyphs(font).unwrap();
+
+        assert_eq!(
+            color_glyphs.get("Aacute").unwrap(),
+            &["Aacute.color0", "Aacute.color1", "Aacute.color2"]
+        );
+        assert!(!color_glyphs.contains_key("cedilla"));
+        for (name, layer_ids, components) in [
+            (
+                "Aacute.color0",
+                ["m01", "m02"].as_slice(),
+                ["A.color1", "acute", "dot", "cedilla"].as_slice(),
+            ),
+            (
+                "Aacute.color1",
+                &["m01", "cbrace", "m02"],
+                &["A.color0", "acute.color0"],
+            ),
+            ("Aacute.color2", &["m01", "m02"], &["A"]),
+        ] {
+            let layers = &font.glyphs[name].layers;
+            assert_eq!(
+                layers
+                    .iter()
+                    .map(|l| l.layer_id.as_str())
+                    .collect::<Vec<_>>(),
+                layer_ids,
+                "{name}"
+            );
+            for layer in layers {
+                assert_eq!(
+                    component_names(layer),
+                    components,
+                    "{name} {}",
+                    layer.layer_id
+                );
+            }
+        }
+    }
+
+    /// Each master's components are looked up among the component glyph's
+    /// palette layers for that master, not the default master's.
+    #[test]
+    fn colrv0_components_reference_their_own_masters_palette_layers() {
+        let mut font =
+            Font::load(&testdata_dir().join("glyphs3/COLRv0-components.glyphs")).unwrap();
+        // In Bold only, move A's palette 0 layer ahead of its palette 1 layer
+        let a = font.glyphs.get_mut("A").unwrap();
+        let bold_palette_1 = a.layers.iter().position(|l| l.layer_id == "c03").unwrap();
+        a.layers.swap(bold_palette_1, bold_palette_1 + 1);
+
+        let (font, _) = split_color_glyphs(font).unwrap();
+
+        let components = |name: &str, layer_id: &str| {
+            let layer = font.glyphs[name]
+                .layers
+                .iter()
+                .find(|l| l.layer_id == layer_id)
+                .unwrap();
+            component_names(layer)
+        };
+        assert_eq!(
+            components("Aacute.color0", "m01"),
+            ["A.color1", "acute", "dot", "cedilla"]
+        );
+        assert_eq!(
+            components("Aacute.color0", "m02"),
+            ["A.color0", "acute", "dot", "cedilla"]
+        );
+        assert_eq!(
+            components("Aacute.color1", "m01"),
+            ["A.color0", "acute.color0"]
+        );
+        assert_eq!(
+            components("Aacute.color1", "cbrace"),
+            ["A.color0", "acute.color0"]
+        );
+        assert_eq!(
+            components("Aacute.color1", "m02"),
+            ["A.color1", "acute.color0"]
+        );
+    }
+
+    /// A component uses the component glyph's first palette layer with the
+    /// same palette index, and the component glyph itself if that layer is
+    /// empty, even when a later layer with that index has shapes.
+    ///
+    /// Ported from glyphsLib's
+    /// test_glyph_color_palette_layers_skip_empty_components_repeated_index.
+    #[test]
+    fn colrv0_components_use_first_palette_layer_with_index() {
+        let mut font =
+            Font::load(&testdata_dir().join("glyphs3/COLRv0-components.glyphs")).unwrap();
+        let master_id = font.default_master().id.clone();
+        let color_glyph_layers = |name: &str, palette_layers: &[(i64, bool)]| {
+            let mut layers = vec![master_layer(&master_id, 0.0)];
+            for (i, &(palette, has_shape)) in palette_layers.iter().enumerate() {
+                let mut layer = palette_layer(&format!("{name}{i}"), &master_id, 0.0, palette, &[]);
+                if !has_shape {
+                    layer.shapes.clear();
+                }
+                layers.push(layer);
+            }
+            layers
+        };
+        let component_layer = |id: &str, palette: i64, components: &[&str]| Layer {
+            shapes: components
+                .iter()
+                .map(|name| {
+                    Shape::Component(Component {
+                        name: (*name).into(),
+                        ..Default::default()
+                    })
+                })
+                .collect(),
+            ..palette_layer(id, &master_id, 0.0, palette, &[])
+        };
+        let n = color_glyph_layers("n", &[(0, false), (0, true)]);
+        let t = color_glyph_layers("t", &[(1, false), (0, true), (1, true)]);
+        let r = color_glyph_layers("r", &[(0, true), (0, false), (0, true)]);
+        let a = vec![
+            master_layer(&master_id, 0.0),
+            component_layer("a0", 0, &["n", "r"]),
+            component_layer("a1", 1, &["t"]),
+        ];
+        insert_glyph(&mut font, "n", n);
+        insert_glyph(&mut font, "t", t);
+        insert_glyph(&mut font, "r", r);
+        insert_glyph(&mut font, "a", a);
+
+        let (font, color_glyphs) = split_color_glyphs(font).unwrap();
+
+        for (name, palettes) in [
+            ("a", [0, 1].as_slice()),
+            ("n", &[0]),
+            ("t", &[0, 1]),
+            ("r", &[0, 0]),
+        ] {
+            let color_glyph_palettes = color_glyphs[name]
+                .iter()
+                .map(|color_glyph| font.glyphs[color_glyph].layers[0].attributes.color_palette)
+                .collect::<Vec<_>>();
+            assert_eq!(
+                color_glyph_palettes,
+                palettes.iter().copied().map(Some).collect::<Vec<_>>(),
+                "{name}"
+            );
+        }
+        assert_eq!(
+            component_names(&font.glyphs["a.color0"].layers[0]),
+            ["n", "r.color0"]
+        );
+        assert_eq!(component_names(&font.glyphs["a.color1"].layers[0]), ["t"]);
+    }
+
     /// Test that COLRv1 glyphs with empty color layers are not added to color_glyphs.
     ///
     /// This is similar to the COLRv0 test but for the COLRv1 code path.
@@ -1649,7 +2039,7 @@ mod tests {
     #[test]
     fn many_to_one_axis_map_preserves_max() {
         let font = Font::load(&testdata_dir().join("glyphs3/ManyToOneAxisMap.glyphs")).unwrap();
-        let font_info = FontInfo::try_from(font).unwrap();
+        let font_info = FontInfo::new(font, None).unwrap();
         let wght_tag = write_fonts::types::Tag::from_str("wght").unwrap();
         let wght = font_info.axes.get(&wght_tag).unwrap();
         // user=900 and user=1000 both map to design=1000;
@@ -1684,97 +2074,6 @@ mod tests {
             super::to_user_coord(&mappings, DesignCoord::new(65.0)),
             UserCoord::new(299.0)
         );
-    }
-
-    /// A Glyphs 2 source that uses the Width axis as an italic toggle leaves
-    /// every instance on the default widthClass, so the mapping pins the axis
-    /// to one user value and half the masters sit at a design value it never
-    /// names.
-    ///
-    /// glyphsLib writes exactly this axis
-    ///
-    /// ```xml
-    /// <axis tag="wdth" name="Width" minimum="100" maximum="100" default="100">
-    ///   <map input="100" output="1"/>
-    /// </axis>
-    /// ```
-    ///
-    /// and designspaceLib then hands varLib only the Width=1 sources, with the
-    /// Width=1 Regular as the default.
-    #[test]
-    fn width_axis_pinned_by_instances() {
-        use fontdrasil::coords::UserCoord;
-
-        let font =
-            Font::load(&testdata_dir().join("glyphs2/WidthPinnedByInstances.glyphs")).unwrap();
-        let font_info = FontInfo::try_from(font).unwrap();
-
-        let wdth = font_info
-            .axes
-            .get(&write_fonts::types::Tag::from_str("wdth").unwrap())
-            .unwrap();
-        assert_eq!(
-            (wdth.min, wdth.default, wdth.max),
-            (
-                UserCoord::new(100.0),
-                UserCoord::new(100.0),
-                UserCoord::new(100.0)
-            )
-        );
-        assert_eq!(
-            wdth.converter
-                .iter()
-                .map(|(user, design, _)| (user.to_f64(), design.to_f64()))
-                .collect::<Vec<_>>(),
-            vec![(100.0, 1.0)]
-        );
-
-        // the Weight axis, which nothing pins, is untouched
-        let wght = font_info
-            .axes
-            .get(&write_fonts::types::Tag::from_str("wght").unwrap())
-            .unwrap();
-        assert_eq!(
-            (wght.min, wght.default, wght.max),
-            (
-                UserCoord::new(400.0),
-                UserCoord::new(400.0),
-                UserCoord::new(700.0)
-            )
-        );
-
-        // the Width=0 masters are outside the axis and aren't in the font,
-        // and neither are their layers or the instances that sit with them
-        assert_eq!(
-            font_info
-                .font
-                .masters
-                .iter()
-                .map(|master| master.id.as_str())
-                .collect::<Vec<_>>(),
-            vec!["italic-regular", "italic-bold"]
-        );
-        assert_eq!(
-            font_info
-                .font
-                .instances
-                .iter()
-                .map(|instance| instance.name.as_str())
-                .collect::<Vec<_>>(),
-            vec!["Italic", "Bold Italic"]
-        );
-        assert_eq!(
-            font_info.font.glyphs["hyphen"]
-                .layers
-                .iter()
-                .map(|layer| layer.layer_id.as_str())
-                .collect::<Vec<_>>(),
-            vec!["italic-regular", "italic-bold"]
-        );
-
-        // the default master went with them, so the survivor at the default
-        // location takes over
-        assert_eq!(font_info.font.default_master().id, "italic-regular");
     }
 
     /// A Weight axis' user (min, default, max), its converter's (user, design)
@@ -1813,7 +2112,7 @@ mod tests {
     #[test]
     fn one_exporting_instance_keeps_the_masters() {
         let font = Font::load(&testdata_dir().join("glyphs3/OneExportingInstance.glyphs")).unwrap();
-        let font_info = FontInfo::try_from(font).unwrap();
+        let font_info = FontInfo::new(font, None).unwrap();
 
         let (range, converter, masters) = wght_axis_and_masters(&font_info);
         assert_eq!(range, (400.0, 400.0, 700.0));
@@ -1851,7 +2150,7 @@ mod tests {
                  familyName = WghtVar;",
                 );
         let font = Font::load_from_string(&raw).unwrap();
-        let font_info = FontInfo::try_from(font).unwrap();
+        let font_info = FontInfo::new(font, None).unwrap();
 
         let (range, converter, masters) = wght_axis_and_masters(&font_info);
         assert_eq!(range, (400.0, 400.0, 700.0));
@@ -1863,62 +2162,16 @@ mod tests {
         assert_eq!(font_info.font.default_master().id, "m01");
     }
 
-    /// The same design in Glyphs 2 still reads its user space as glyphsLib does,
-    /// off the instance's weightClass. That leaves no master at the default, a
-    /// source fontmake can't build at all, so rather than fail we take the range
-    /// off the masters, read through that mapping, and keep them all.
+    /// A Glyphs 2 source that doesn't declare its axes has a Width and a Custom
+    /// slot whether it wants them or not. The ones no master moves along are
+    /// dropped, wherever they are parked: this source's Custom axis sits at 10
+    /// on every master.
     #[test]
-    fn glyphs2_mapping_that_leaves_no_default_master() {
-        let raw = std::fs::read_to_string(testdata_dir().join("glyphs2/WghtVar_Instances.glyphs"))
-            .unwrap();
-        let start = raw.find("instances = (").unwrap();
-        let end = raw[start..].find("\n);\n").unwrap() + start + "\n);\n".len();
-        let raw = format!(
-            "{}instances = (\n{{\nexports = 0;\ninterpolationWeight = 400;\nname = Regular;\n}},\n\
-             {{\ninterpolationWeight = 483;\nname = Medium;\nweightClass = Medium;\n}}\n);\n{}",
-            &raw[..start],
-            &raw[end..]
-        );
-        let font = Font::load_from_string(&raw).unwrap();
-        assert!(font.is_glyphs2());
-        // glyphsLib's reading: one point, user 500 -> design 483
-        assert_eq!(
-            font.axis_mappings
-                .get("Weight")
-                .unwrap()
-                .iter()
-                .map(|(user, design)| (user.into_inner(), design.into_inner()))
-                .collect::<Vec<_>>(),
-            vec![(500.0, 483.0)]
-        );
-        let font_info = FontInfo::try_from(font).unwrap();
-
-        let (range, converter, masters) = wght_axis_and_masters(&font_info);
-        // the masters' span, read through the mapping
-        assert_eq!(range, (417.0, 417.0, 717.0));
-        assert_eq!(
-            converter,
-            vec![(417.0, 400.0), (500.0, 483.0), (717.0, 700.0)]
-        );
-        assert_eq!(masters, vec!["m01", "E09E0C54-128D-4FEA-B209-1B70BEFE300B"]);
-        assert_eq!(font_info.font.default_master().id, "m01");
-    }
-
-    /// Dropping an axis and dropping a master meet here: a master's `axesValues`
-    /// still has a slot for every axis the source declared, dropped ones included,
-    /// so reading one back has to skip the gaps rather than count from the left.
-    ///
-    /// This source drops the *middle* axis - an inert Width - and keeps the Custom
-    /// axis after it, while its Weight axis is pinned by its instances so one master
-    /// falls outside it. glyphsLib agrees: Weight 400/400/400 mapped to design 65,
-    /// Custom 10/10/10, and no Width at all.
-    #[test]
-    fn a_dropped_axis_does_not_shift_the_masters_that_outlive_it() {
-        use fontdrasil::coords::UserCoord;
-
+    fn an_undeclared_axis_no_master_moves_along_is_dropped() {
         let font =
             Font::load(&testdata_dir().join("glyphs2/WeightPinnedWithCustomAxis.glyphs")).unwrap();
-        let font_info = FontInfo::try_from(font).unwrap();
+        assert!(!font.declares_axes);
+        let font_info = FontInfo::new(font, None).unwrap();
 
         assert_eq!(
             font_info
@@ -1926,38 +2179,15 @@ mod tests {
                 .iter()
                 .map(|axis| axis.tag.to_string())
                 .collect::<Vec<_>>(),
-            vec!["wght", "XXXX"],
-            "the inert Width between them is gone"
-        );
-        // read through the gap, Custom is still the 10 the masters state; read past it,
-        // it would be the 100 of the Width axis that isn't there any more
-        let custom = font_info
-            .axes
-            .get(&write_fonts::types::Tag::from_str("XXXX").unwrap())
-            .unwrap();
-        assert_eq!(
-            (custom.min, custom.default, custom.max),
-            (
-                UserCoord::new(10.0),
-                UserCoord::new(10.0),
-                UserCoord::new(10.0)
-            )
+            vec!["wght"],
+            "the Width and Custom axes are gone"
         );
 
-        // the mapping only reaches design 65, so the master at 151 is outside the axis
-        assert_eq!(
-            font_info
-                .font
-                .masters
-                .iter()
-                .map(|master| master.id.as_str())
-                .collect::<Vec<_>>(),
-            vec!["hollow"]
-        );
-        assert_eq!(font_info.font.default_master().id, "hollow");
+        // both masters stay, whatever the instances' mapping reaches
+        assert_eq!(font_info.font.masters.len(), 2);
     }
 
-    /// Test that a layer with palette index 0xFFFF produces a PaintSolid with color `None`.
+    /// Palette index 0xFFFF uses the text foreground color.
     #[test]
     fn palette_index_0xffff() {
         use super::to_ir_paint;
@@ -1975,7 +2205,10 @@ mod tests {
         let paint = to_ir_paint(None, "test", &layer, &attr).unwrap();
         match paint {
             Paint::Solid(solid) => {
-                assert_eq!(solid.color, None, "expected foreground paint (color: None)");
+                assert_eq!(
+                    solid.color,
+                    fontir::ir::ColorReference::PaletteIndex(0xFFFF)
+                );
             }
             other => panic!("expected Paint::Solid, got {other:?}"),
         }

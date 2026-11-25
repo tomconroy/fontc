@@ -1,4 +1,9 @@
-use std::{fmt::Display, io, path::PathBuf};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fmt::Display,
+    io,
+    path::PathBuf,
+};
 
 use fontdrasil::{
     coords::{DesignCoord, NormalizedCoord, NormalizedLocation, UserCoord, UserLocation},
@@ -45,6 +50,8 @@ pub enum Error {
     MissingAxisMapping(Tag),
     #[error("no glyph for name '{0}'")]
     NoGlyphForName(GlyphName),
+    #[error("Component cycle through glyphs {0:?}")]
+    ComponentCycle(Vec<GlyphName>),
     #[error("Missing required axis values for {0}")]
     NoAxisDefinitions(String),
     #[error("Axis {0} has no entry in axes")]
@@ -77,6 +84,9 @@ pub enum Error {
     InvalidTag { raw_tag: String, cause: InvalidTag },
     #[error("Source file contained a construct we don't yet support: {0}")]
     UnsupportedConstruct(String),
+    /// The instance requested with `--instance` can't be built from the source
+    #[error("Cannot build instance \"{name}\": {reason}")]
+    InvalidInstance { name: String, reason: String },
     #[error("Inconsistent palette size, [0] has {size_0}, [{n}] has {size_n}")]
     InconsistentPaletteLength {
         size_0: usize,
@@ -102,8 +112,7 @@ pub enum Error {
 }
 
 /// An error related to loading source input files
-#[derive(Debug, Error)]
-#[error("Reading source failed for '{path}': '{kind}'")]
+#[derive(Debug)]
 pub struct BadSource {
     /// The path to the file where the error occured
     path: PathBuf,
@@ -122,6 +131,13 @@ pub enum BadSourceKind {
     Io(io::Error),
     /// Payload is a message to print; this error can originate from various parsers
     Custom(String),
+    /// An error from the library that reads the source, such as norad
+    ///
+    /// Its message is part of the [`BadSource`] message, and its causes are
+    /// the [`BadSource`]'s [`source`].
+    ///
+    /// [`source`]: std::error::Error::source
+    Error(Box<dyn std::error::Error + Send + Sync>),
 }
 
 /// An error that occurs while trying to convert a glyph to IR.
@@ -152,6 +168,9 @@ pub enum BadGlyphKind {
     Anchor(BadAnchor),
     BadDeltas(DeltaError),
     RemoveOverlaps(OverlapError),
+    InconsistentVariableComponents(String),
+    // each distinct sequence of component glyph names -> locations that use it
+    InconsistentComponents(BTreeMap<Vec<GlyphName>, BTreeSet<NormalizedLocation>>),
     FrontendSpecific(String),
 }
 
@@ -218,6 +237,35 @@ impl BadSource {
     pub fn custom(path: impl Into<PathBuf>, msg: impl Display) -> Self {
         Self::new(path, BadSourceKind::Custom(msg.to_string()))
     }
+
+    /// Wrap an error from the library that reads the source, keeping its causes.
+    pub fn wrap(
+        path: impl Into<PathBuf>,
+        error: impl std::error::Error + Send + Sync + 'static,
+    ) -> Self {
+        Self::new(path, BadSourceKind::Error(Box::new(error)))
+    }
+}
+
+impl Display for BadSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(
+            f,
+            "Reading source failed for '{}': {}",
+            self.path.display(),
+            self.kind
+        )
+    }
+}
+
+impl std::error::Error for BadSource {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match &self.kind {
+            BadSourceKind::Io(e) => e.source(),
+            BadSourceKind::Error(e) => e.source(),
+            _ => None,
+        }
+    }
 }
 
 impl BadGlyph {
@@ -278,6 +326,7 @@ impl std::fmt::Display for BadSourceKind {
             BadSourceKind::ExpectedParent => f.write_str("missing parent directory"),
             BadSourceKind::Io(e) => e.fmt(f),
             BadSourceKind::Custom(e) => f.write_str(e),
+            BadSourceKind::Error(e) => e.fmt(f),
         }
     }
 }
@@ -302,6 +351,25 @@ impl std::fmt::Display for BadGlyphKind {
             BadGlyphKind::Anchor(e) => write!(f, "bad anchor: '{e}'"),
             BadGlyphKind::BadDeltas(e) => write!(f, "delta error: '{e}'"),
             BadGlyphKind::RemoveOverlaps(e) => write!(f, "failed to remove overlaps: '{e}'"),
+            BadGlyphKind::InconsistentVariableComponents(detail) => {
+                write!(f, "inconsistent variable components: {detail}")
+            }
+            BadGlyphKind::InconsistentComponents(seqs) => {
+                f.write_str("components differ between sources: ")?;
+                for (i, (names, locs)) in seqs.iter().enumerate() {
+                    if i > 0 {
+                        f.write_str("; ")?;
+                    }
+                    write!(f, "{names:?} at ")?;
+                    for (j, loc) in locs.iter().enumerate() {
+                        if j > 0 {
+                            f.write_str(", ")?;
+                        }
+                        write!(f, "{loc:?}")?;
+                    }
+                }
+                Ok(())
+            }
             BadGlyphKind::FrontendSpecific(e) => write!(f, "{}", e),
         }
     }

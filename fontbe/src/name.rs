@@ -6,13 +6,13 @@ use fontdrasil::orchestration::{Access, AccessBuilder, Work};
 use fontir::orchestration::WorkId as FeWorkId;
 use write_fonts::{
     OffsetMarker,
+    read::tables::name::{Encoding, MacRomanMapping},
     tables::name::{Name, NameRecord},
     types::NameId,
-    validate::Validate,
 };
 
 use crate::{
-    error::Error,
+    error::{Error, NameRecordProblem},
     orchestration::{AnyWorkId, BeWork, Context, WorkId},
 };
 
@@ -70,20 +70,38 @@ impl Work<Context, AnyWorkId, Error> for NameWork {
             stamp_compiler_version(&mut name_records, version);
         }
 
-        let name = Name::new(name_records);
-        // Validate here rather than at assembly time: `font.rs` turns a table
-        // into bytes with `dump_table(..).ok()`, so a table that fails
-        // validation is silently *dropped* from the font. The most likely
-        // failure is a name record whose platform/encoding pair we cannot
-        // encode — Mac platform with a non-Roman encoding, which a Glyphs
-        // "Name Table Entry" custom parameter can ask for. fontmake writes
-        // those through fontTools' legacy codecs; we cannot yet, and losing the
-        // whole name table without a word would be far worse than saying so.
-        name.validate()
-            .map_err(|report| Error::UnencodableNames(report.to_string()))?;
-        context.name.set(name);
+        check_encodable(&name_records)?;
+
+        context.name.set(Name::new(name_records));
         Ok(())
     }
+}
+
+/// Error on any record write-fonts would panic on when writing the table.
+///
+/// It only writes UTF-16 (Unicode platform, Windows platform encodings 0, 1
+/// and 10) and Mac Roman (Mac platform, encoding 0), and in Mac Roman every
+/// character of the string must be representable.
+fn check_encodable(records: &[NameRecord]) -> Result<(), Error> {
+    for record in records {
+        let problem = match Encoding::new(record.platform_id, record.encoding_id) {
+            Encoding::Utf16Be => None,
+            Encoding::MacRoman => record.string.chars().find_map(|c| {
+                MacRomanMapping
+                    .encode(c)
+                    .is_none()
+                    .then_some(NameRecordProblem::NotMacRoman(c))
+            }),
+            Encoding::Unknown => Some(NameRecordProblem::UnsupportedEncoding),
+        };
+        if let Some(problem) = problem {
+            return Err(Error::BadNameEncoding {
+                record: record.clone(),
+                problem,
+            });
+        }
+    }
+    Ok(())
 }
 
 /// Append `;fontc {version}` to every version string (name ID 5) record,
@@ -245,6 +263,48 @@ mod tests {
             records
                 .iter()
                 .all(|r| r.string.as_str() == "Version 1.000;fontc 0.6.0")
+        );
+    }
+
+    fn record(platform_id: u16, encoding_id: u16, language_id: u16, value: &str) -> NameRecord {
+        NameRecord::new(
+            platform_id,
+            encoding_id,
+            language_id,
+            NameId::FAMILY_NAME,
+            value.to_string().into(),
+        )
+    }
+
+    #[test]
+    fn encodable_records_pass() {
+        check_encodable(&[
+            record(3, 1, 0x409, "Duck Duck"),
+            record(3, 1, 0x412, "가석체"),
+            record(3, 10, 0x409, "Duck 😀"),
+            record(0, 4, 0, "Duck 😀"),
+            record(1, 0, 0, "Duck Duck ÄÖÜ"),
+        ])
+        .unwrap();
+    }
+
+    #[test]
+    fn unsupported_encoding_is_an_error() {
+        let error =
+            check_encodable(&[record(3, 1, 0x409, "Duck Duck"), record(1, 3, 23, "가석체")])
+                .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "name ID 1 (platform 1, encoding 3, language 23) uses an unsupported platform/encoding: \"가석체\""
+        );
+    }
+
+    #[test]
+    fn non_mac_roman_character_is_an_error() {
+        let error = check_encodable(&[record(1, 0, 0, "Duck 가석체")]).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "name ID 1 (platform 1, encoding 0, language 0) has a character not in Mac Roman, '가' (U+AC00): \"Duck 가석체\""
         );
     }
 }

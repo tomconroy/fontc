@@ -35,6 +35,7 @@ use fontbe::{
     os2::create_os2_work,
     post::create_post_work,
     stat::create_stat_work,
+    varc::create_varc_work,
     vertical_metrics::create_vertical_metrics_work,
     vvar::create_vvar_work,
 };
@@ -218,6 +219,7 @@ impl Workload {
         if !workload.cff_outlines {
             workload.add(create_gvar_work());
         }
+        workload.add(create_varc_work());
         workload.add(create_head_work());
         workload.add_skippable_feature_work(create_gather_ir_kerning_work());
         workload.add_skippable_feature_work(create_kerns_work());
@@ -365,7 +367,10 @@ impl Workload {
             return;
         };
 
-        if !glyph.emit_to_binary {
+        // The glyph order work drops an unexported .notdef and generates a new
+        // one under the same name, so its BE work still has to run (after that).
+        let replaced_notdef = !glyph.emit_to_binary && glyph.name == GlyphName::NOTDEF;
+        if !glyph.emit_to_binary && !replaced_notdef {
             trace!("Skipping execution of {be_id:?}; it does not emit to binary");
             for counter in self.counters(&be_id) {
                 counter.fetch_sub(1, Ordering::AcqRel);
@@ -396,8 +401,9 @@ impl Workload {
                 .values()
                 .any(|inst| !inst.contours.is_empty());
 
-        // We don't *have* to wait on glyph order, but if we don't it delays the critical path
-        if has_components || loses_overlaps {
+        // We don't *have* to wait on glyph order, but if we don't it delays the critical path.
+        // A glyph with local axes must wait, the glyph order work drops the axes.
+        if has_components || !glyph.axes().is_empty() || replaced_notdef || loses_overlaps {
             deps = deps.variant(FeWorkIdentifier::GlyphOrder);
         }
 
@@ -921,7 +927,10 @@ impl Workload {
                         self.error = Some(e);
                     } else {
                         // the first error will be reported on exit, log the rest:
-                        log::error!("task '{completed_id:?}' failed: '{e}'");
+                        log::error!(
+                            "task '{completed_id:?}' failed: '{}'",
+                            e.display_with_causes()
+                        );
                     }
                     true
                 }
