@@ -618,10 +618,7 @@ mod tests {
         // re-run the constructor so the axis/instance names get minted
         let meta = StaticMetadata::new(
             1000,
-            HashMap::from([(
-                NameKey::new(NameId::FAMILY_NAME, "Test"),
-                "Test".to_string(),
-            )]),
+            HashMap::from([(NameKey::new(NameId::FAMILY_NAME), "Test".to_string())]),
             meta.all_source_axes.clone().into_inner(),
             meta.named_instances.clone(),
             meta.variation_model.locations().cloned().collect(),
@@ -648,7 +645,7 @@ mod tests {
             pinned.names
         );
         assert_eq!(
-            pinned.names.get(&NameKey::new(NameId::FAMILY_NAME, "Test")),
+            pinned.names.get(&NameKey::new(NameId::FAMILY_NAME)),
             Some(&"Test".to_string()),
             "names the source gave us are untouched"
         );

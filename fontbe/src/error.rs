@@ -15,7 +15,7 @@ use thiserror::Error;
 use write_fonts::{
     read::ReadError,
     tables::{
-        cmap::CmapConflict, glyf::MalformedPath, gvar::iup::IupError,
+        cmap::CmapConflict, glyf::MalformedPath, gvar::iup::IupError, name::NameRecord,
         variations::TupleVariationStoreInputError,
     },
     types::{GlyphId, Tag},
@@ -68,12 +68,6 @@ pub enum Error {
         e: write_fonts::error::Error,
         context: String,
     },
-    #[error(
-        "the name table is not writable: {0}\n\
-         (fontc cannot encode name records for the Mac platform with a \
-         non-Roman encoding; see googlefonts/fontc)"
-    )]
-    UnencodableNames(String),
     #[error("{what} out of bounds: {value}")]
     OutOfBounds { what: String, value: String },
     #[error("'{0}' has components; CFF glyphs must be decomposed first")]
@@ -125,6 +119,8 @@ pub enum Error {
     DuplicateAxisMapping(NormalizedLocation),
     #[error("No glyph id for '{0}'")]
     MissingGlyphId(GlyphName),
+    #[error("Unable to store VARC deltas for '{0}': {1}")]
+    VarcDeltaStoreError(GlyphName, write_fonts::error::Error),
     #[error("Error making CMap: {0}")]
     CmapConflict(#[from] CmapConflict),
     #[error("Progress stalled computing composite bbox: {0:?}")]
@@ -135,6 +131,47 @@ pub enum Error {
     NoGlobalMetricsInstance(NormalizedLocation),
     #[error("No palette entry for '{0:?}'")]
     MissingPaletteEntry(Color),
+    #[error("Variable component axis '{tag}' of glyph '{glyph}' is not a font axis")]
+    VariableComponentUnknownAxis { glyph: GlyphName, tag: Tag },
+    #[error("'{glyph}' references non-export glyph '{base}' as a variable component")]
+    VariableComponentBaseNotInGlyphOrder { glyph: GlyphName, base: GlyphName },
+    #[error("Invalid COLR glyph '{0}': {1}")]
+    InvalidColorGlyph(GlyphName, String),
+    #[error(
+        "name ID {} (platform {}, encoding {}, language {}) {problem}: {:?}",
+        .record.name_id.to_u16(), .record.platform_id, .record.encoding_id, .record.language_id, .record.string.as_str()
+    )]
+    BadNameEncoding {
+        record: NameRecord,
+        problem: NameRecordProblem,
+    },
+}
+
+/// Why a name record cannot be written
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum NameRecordProblem {
+    /// Only Unicode (UTF-16) and Mac Roman encodings can be written
+    UnsupportedEncoding,
+    /// A Mac Roman record contains a character Mac Roman cannot encode
+    NotMacRoman(char),
+}
+
+impl Display for NameRecordProblem {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            NameRecordProblem::UnsupportedEncoding => {
+                write!(f, "uses an unsupported platform/encoding")
+            }
+            NameRecordProblem::NotMacRoman(c) => {
+                write!(
+                    f,
+                    "has a character not in Mac Roman, {c:?} (U+{:04X})",
+                    *c as u32
+                )
+            }
+        }
+    }
 }
 
 #[derive(Debug)]

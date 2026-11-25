@@ -1,4 +1,8 @@
-use std::{io, path::PathBuf};
+use std::{
+    fmt::{self, Display},
+    io,
+    path::PathBuf,
+};
 
 use thiserror::Error;
 
@@ -44,4 +48,38 @@ pub enum Error {
     InstanceOfSourceWithFeaConditionSet,
     #[error("Unable to interpolate the instance: {0}")]
     InstanceDeltaError(#[from] fontdrasil::variations::DeltaError),
+    #[error("Selecting an instance is only supported for Glyphs and designspace sources")]
+    InstanceUnsupported,
+    #[error("Custom glyph data is only supported for .glyphs or .glyphspackage files")]
+    GlyphDataRequiresGlyphsSource,
+}
+
+impl Error {
+    /// Display this error followed by its chain of causes.
+    ///
+    /// Each cause is appended after a colon, unless the message before it
+    /// already includes it, as happens with errors that both print their
+    /// source and return it.
+    pub fn display_with_causes(&self) -> impl Display + '_ {
+        WithCauses(self)
+    }
+}
+
+struct WithCauses<'a>(&'a dyn std::error::Error);
+
+impl Display for WithCauses<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        let mut parent = self.0.to_string();
+        f.write_str(&parent)?;
+        let mut next = self.0.source();
+        while let Some(cause) = next {
+            let message = cause.to_string();
+            if !parent.contains(&message) {
+                write!(f, ": {message}")?;
+            }
+            parent = message;
+            next = cause.source();
+        }
+        Ok(())
+    }
 }

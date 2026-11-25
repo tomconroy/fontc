@@ -233,10 +233,6 @@ name = typoAscender;
 value = 1234;
 },
 {
-name = styleMapStyleName;
-value = Black;
-},
-{
 name = "meta Table";
 value = (
 {
@@ -248,10 +244,6 @@ data = Latn;
 tag = slng;
 }
 );
-},
-{
-name = preferredFamilyName;
-value = "WghtVar Preferred";
 }
 );
 instanceInterpolations = {
@@ -265,6 +257,24 @@ values = (
 {
 language = dflt;
 value = "WghtVar Narrow";
+}
+);
+},
+{
+key = preferredFamilyNames;
+values = (
+{
+language = dflt;
+value = "WghtVar Preferred";
+}
+);
+},
+{
+key = styleMapStyleNames;
+values = (
+{
+language = dflt;
+value = Black;
 }
 );
 }

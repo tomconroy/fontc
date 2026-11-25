@@ -6,7 +6,7 @@ use std::{
 };
 
 use indexmap::{IndexMap, IndexSet};
-use kurbo::{Affine, BezPath, PathEl, Point};
+use kurbo::{Affine, BezPath, PathEl, Point, Rect};
 use log::{log_enabled, trace, warn};
 use ordered_float::OrderedFloat;
 use parking_lot::RwLock;
@@ -19,7 +19,7 @@ use write_fonts::{
 };
 
 use fontdrasil::{
-    coords::{DesignLocation, NormalizedLocation},
+    coords::{DesignLocation, NormalizedCoord, NormalizedLocation},
     types::{Axes, GlyphName},
     variations::{ModelDeltas, RoundingBehaviour, VariationModel},
 };
@@ -49,7 +49,8 @@ pub use static_metadata::{
     StaticMetadata, StyleMapStyle, Substitution, VariableFeature,
 };
 
-pub const DEFAULT_VENDOR_ID: &str = "NONE";
+/// A blank vendor ID, which the OS/2 spec allows when there is no vendor.
+pub const DEFAULT_VENDOR_ID: &str = "    ";
 
 /// The name of every glyph, in the order it will be emitted
 ///
@@ -551,7 +552,7 @@ impl GlobalMetricsBuilder {
         self.set_if_absent(GlobalMetric::Descender, pos, descender);
 
         // https://github.com/googlefonts/ufo2ft/blob/0d2688cd8/Lib/ufo2ft/fontInfoData.py#L229-L238
-        let computed_typo_line_gap = (units_per_em * 1.2 + descender - ascender).max(0.);
+        let computed_typo_line_gap = ((units_per_em * 1.2).trunc() - ascender + descender).max(0.);
 
         // Capture the actual stored value: if Os2TypoLineGap was already set (e.g. from a
         // custom parameter), set_if_absent returns it unchanged; otherwise it stores and
@@ -1058,7 +1059,12 @@ pub mod test_helpers {
 pub struct NameBuilder {
     names: HashMap<NameKey, String>,
     /// Helps lookup entries in name when all we have is a NameId
+    ///
+    /// Only holds the English names added with [`NameBuilder::add`], so
+    /// lookups and fallbacks never see an entry from `records`.
     name_to_key: HashMap<NameId, NameKey>,
+    /// Records with their own platform, encoding and language ids
+    records: HashMap<NameKey, String>,
     version_major: i32,
     version_minor: u32,
 }
@@ -1101,17 +1107,36 @@ impl NameBuilder {
         linked_style.join(" ")
     }
 
-    pub fn add(&mut self, name_id: NameId, value: String) {
-        // Work around plist crate not performing XML end-of-line normalization
-        // (XML 1.0 §2.11: \r\n → \n, bare \r → \n)
-        let value = if value.contains('\r') {
+    /// Work around plist crate not performing XML end-of-line normalization
+    /// (XML 1.0 §2.11: \r\n → \n, bare \r → \n)
+    pub fn normalize_line_endings(value: String) -> String {
+        if value.contains('\r') {
             value.replace("\r\n", "\n").replace('\r', "\n")
         } else {
             value
-        };
-        let key = NameKey::new(name_id, &value);
+        }
+    }
+
+    pub fn add(&mut self, name_id: NameId, value: String) {
+        let value = Self::normalize_line_endings(value);
+        let key = NameKey::new(name_id);
         self.names.insert(key, value);
         self.name_to_key.insert(name_id, key);
+    }
+
+    /// Add a record under exactly the platform, encoding and language ids of `key`.
+    ///
+    /// Like ufo2ft's `openTypeNameRecords`, records are applied after the
+    /// names derived from the other fields, replacing one only when all four
+    /// ids match. They are never consulted for fallbacks or derived names, so
+    /// a localized family name (or an English one given as a record) does not
+    /// change the full name, the PostScript name and so on.
+    ///
+    /// The value is kept as it is, unlike with [`NameBuilder::add`].
+    ///
+    /// <https://github.com/googlefonts/ufo2ft/blob/fca66fe3/Lib/ufo2ft/outlineCompiler.py#L438-L445>
+    pub fn add_record(&mut self, key: NameKey, value: String) {
+        self.records.insert(key, value);
     }
 
     pub fn remove(&mut self, name_id: NameId) {
@@ -1257,7 +1282,6 @@ impl NameBuilder {
                 .get(NameId::VERSION_STRING)
                 .unwrap()
                 .replace("Version ", "");
-            // fontmake pulls the openTypeOS2VendorID but we don't have that so just use their default
             let postscript_name = self.get(NameId::POSTSCRIPT_NAME).unwrap();
             self.add(
                 NameId::UNIQUE_ID,
@@ -1281,6 +1305,10 @@ impl NameBuilder {
         // so that an explicit empty string prevents fallback: see
         // https://github.com/googlefonts/ufo2ft/issues/958
         self.names.retain(|_k, v| !v.is_empty());
+
+        // Records go in last, so nothing above sees them. This is after the
+        // empty string removal because ufo2ft adds records as they are.
+        self.names.extend(self.records);
         self.names
     }
 
@@ -1331,6 +1359,11 @@ pub enum FeaturesSource {
     },
     Memory {
         fea_content: String,
+        /// The file the content came from, used to name it in diagnostics.
+        ///
+        /// This need not be a file on disk: the features of a zipped or JSON
+        /// UFO are named as if it were a directory, e.g. `Foo.ufoz/features.fea`.
+        path: Option<PathBuf>,
         include_dir: Option<PathBuf>,
     },
 }
@@ -1350,6 +1383,7 @@ impl FeaturesSource {
     pub fn from_string(fea_content: String) -> FeaturesSource {
         FeaturesSource::Memory {
             fea_content,
+            path: None,
             include_dir: None,
         }
     }
@@ -1360,7 +1394,10 @@ impl Display for FeaturesSource {
         match self {
             FeaturesSource::Empty => f.write_str("<no features>"),
             FeaturesSource::File { fea_file, .. } => write!(f, "{}", fea_file.display()),
-            FeaturesSource::Memory { .. } => f.write_str("<memory>"),
+            FeaturesSource::Memory {
+                path: Some(path), ..
+            } => write!(f, "{}", path.display()),
+            FeaturesSource::Memory { path: None, .. } => f.write_str("<memory>"),
         }
     }
 }
@@ -1591,6 +1628,26 @@ impl AnchorKind {
         matches!(self, AnchorKind::Base(_) | AnchorKind::Ligature { .. })
     }
 
+    /// Returns `true` if this anchor is only used to align components.
+    ///
+    /// These are anchors whose group name starts with a non-letter, such as
+    /// `#exit`, `_2top` or `2top_1`, which [ufo2ft] and Glyphs.app ignore when
+    /// writing mark features. Names starting with `*` (contextual and origin
+    /// anchors in Glyphs) are not included.
+    ///
+    /// [ufo2ft]: https://github.com/googlefonts/ufo2ft/blob/541fd0e8/Lib/ufo2ft/featureWriters/markFeatureWriter.py#L172
+    pub fn is_ignorable(&self) -> bool {
+        match self {
+            AnchorKind::Base(group_name)
+            | AnchorKind::Mark(group_name)
+            | AnchorKind::Ligature { group_name, .. } => group_name
+                .chars()
+                .next()
+                .is_some_and(|c| !c.is_alphabetic() && c != '*'),
+            _ => false,
+        }
+    }
+
     /// Convert AnchorKind back to its canonical string name representation.
     ///
     /// Note: this is lossy for non-standard names (e.g. `caret_1_` becomes `caret_1`).
@@ -1749,10 +1806,27 @@ pub struct Glyph {
     #[serde(default)]
     pub skip_anchor_propagation: bool,
     pub codepoints: HashSet<u32>, // single unicodes that each point to this glyph. Typically 0 or 1.
+    #[serde(default, skip_serializing_if = "Axes::is_empty")]
+    axes: Axes, // Glyph-local axes for variable components.
     default_location: NormalizedLocation,
     sources: HashMap<NormalizedLocation, GlyphInstance>,
     has_consistent_2x2_transforms: bool,
     has_overflowing_2x2_transforms: bool,
+    #[serde(default)]
+    lowering: GlyphLowering,
+}
+
+/// How a glyph lowers to the binary. Assigned at the end of glyph order
+/// processing.
+#[derive(Serialize, Deserialize, Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum GlyphLowering {
+    /// A glyf entry of contours, possibly empty.
+    #[default]
+    GlyfContours,
+    /// A glyf composite of ordinary components.
+    GlyfComposite,
+    /// A VARC record and a glyf entry of contours, possibly empty.
+    Varc,
 }
 
 /// Compute this during glyph processing and without allocation
@@ -1776,7 +1850,7 @@ fn has_consistent_2x2_transforms(
             .iter()
             .zip(inst.components.iter())
             .all(|(c1, c2)| {
-                c1.base == c2.base && c1.transform.as_coeffs()[..4] == c2.transform.as_coeffs()[..4]
+                c1.base == c2.base && c1.affine().as_coeffs()[..4] == c2.affine().as_coeffs()[..4]
             })
     });
     if log_enabled!(log::Level::Trace) && !consistent {
@@ -1794,7 +1868,7 @@ fn has_overflowing_2x2_transforms(
     // fontbe uses F2Dot14::from_f64() which saturates at MAX_F2DOT14
     let overflow_info = sources.iter().find_map(|(location, instance)| {
         instance.components.iter().find_map(|component| {
-            component.transform.as_coeffs()[..4]
+            component.affine().as_coeffs()[..4]
                 .iter()
                 .find(|&value| !(-2.0..=2.0).contains(value))
                 .map(|&value| (location.clone(), component.base.as_str(), value))
@@ -1843,15 +1917,37 @@ impl Glyph {
             emit_to_binary,
             skip_anchor_propagation: false,
             codepoints,
+            axes: Axes::default(),
             default_location,
             sources: instances,
             has_consistent_2x2_transforms,
             has_overflowing_2x2_transforms,
+            lowering: GlyphLowering::default(),
         })
+    }
+
+    pub fn axes(&self) -> &Axes {
+        &self.axes
+    }
+
+    pub fn set_axes(&mut self, axes: Axes) {
+        self.axes = axes;
+    }
+
+    pub fn lowering(&self) -> GlyphLowering {
+        self.lowering
+    }
+
+    pub fn set_lowering(&mut self, lowering: GlyphLowering) {
+        self.lowering = lowering;
     }
 
     pub fn default_instance(&self) -> &GlyphInstance {
         self.sources.get(&self.default_location).unwrap()
+    }
+
+    pub fn default_location(&self) -> &NormalizedLocation {
+        &self.default_location
     }
 
     #[cfg(test)]
@@ -1968,6 +2064,8 @@ pub struct GlyphBuilder {
     pub skip_anchor_propagation: bool,
     pub codepoints: HashSet<u32>, // single unicodes that each point to this glyph. Typically 0 or 1.
     pub sources: HashMap<NormalizedLocation, GlyphInstance>,
+    #[serde(default, skip_serializing_if = "Axes::is_empty")]
+    pub axes: Axes, // Glyph-local axes for variable components.
 }
 
 impl GlyphBuilder {
@@ -1978,6 +2076,7 @@ impl GlyphBuilder {
             skip_anchor_propagation: false,
             codepoints: HashSet::new(),
             sources: HashMap::new(),
+            axes: Axes::default(),
         }
     }
 
@@ -2009,6 +2108,7 @@ impl GlyphBuilder {
             self.codepoints,
             self.sources,
         )?;
+        glyph.axes = self.axes;
         glyph.skip_anchor_propagation = self.skip_anchor_propagation;
         Ok(glyph)
     }
@@ -2022,6 +2122,7 @@ impl From<Glyph> for GlyphBuilder {
             skip_anchor_propagation: value.skip_anchor_propagation,
             codepoints: value.codepoints,
             sources: value.sources,
+            axes: value.axes,
         }
     }
 }
@@ -2128,7 +2229,9 @@ impl GlyphInstance {
     /// The returned values must be provided in the following order:
     ///
     /// - the (x,y) values of points in any contours, in order
-    /// - the decomposed transform of any components, in order
+    /// - per component, in order: the transform values (see
+    ///   [`ComponentTransform::interpolation_values`]), then the location
+    ///   coordinates by tag
     /// - the width, height, and vertical origin (if present).
     ///
     /// These values are used to generate a `VariationModel`; after interpolation
@@ -2159,7 +2262,7 @@ impl GlyphInstance {
                 // <https://github.com/googlefonts/ufo2ft/issues/949>
                 self.components
                     .iter()
-                    .flat_map(|comp| comp.transform.as_coeffs()),
+                    .flat_map(component_interpolation_values),
             )
             .chain(Some(self.width))
             .chain(self.height)
@@ -2174,20 +2277,26 @@ impl GlyphInstance {
             contours.push(contour);
             values = remaining;
         }
-        let components = self
-            .components
-            .iter()
-            .zip(values.as_chunks::<6>().0)
-            .map(|(comp, coeffs)| Component {
+        // Per component: the transform values, then one coordinate per
+        // location axis. Fields not set in the template stay unset.
+        let mut components = Vec::with_capacity(self.components.len());
+        for comp in &self.components {
+            let (transform, remaining) = comp.transform.with_interpolated_values(values);
+            values = remaining;
+            let mut location = NormalizedLocation::new();
+            for (tag, _) in comp.location.iter() {
+                location.insert(*tag, NormalizedCoord::new(values[0]));
+                values = &values[1..];
+            }
+            components.push(Component {
                 base: comp.base.clone(),
-                transform: Affine::new(*coeffs),
+                transform,
                 anchor: comp.anchor.clone(),
-            })
-            .collect();
+                location,
+                reset_unspecified_axes: comp.reset_unspecified_axes,
+            });
+        }
 
-        // kind of silly but here i'm just manually truncating values as we
-        // consume them, just to simplify bookkeeping
-        values = &values[self.components.len() * 6..];
         let width = values[0];
         values = &values[1..];
         let height = self.height.and_then(|_| values.first().copied());
@@ -2212,6 +2321,31 @@ impl GlyphInstance {
             components,
         }
     }
+}
+
+/// The nine transform fields (a field that is not set is fed as 0, or 1 for
+/// scale).
+fn decomposed_transform_interpolation_values(t: &DecomposedTransform) -> impl Iterator<Item = f64> {
+    [
+        t.translate_x.unwrap_or(0.0),
+        t.translate_y.unwrap_or(0.0),
+        t.rotation.unwrap_or(0.0),
+        t.scale_x.unwrap_or(1.0),
+        t.scale_y.unwrap_or(1.0),
+        t.skew_x.unwrap_or(0.0),
+        t.skew_y.unwrap_or(0.0),
+        t.center_x.unwrap_or(0.0),
+        t.center_y.unwrap_or(0.0),
+    ]
+    .into_iter()
+}
+
+/// The transform values plus location coordinates of a component.
+fn component_interpolation_values(comp: &Component) -> impl Iterator<Item = f64> + '_ {
+    comp.transform
+        .interpolation_values()
+        .into_iter()
+        .chain(comp.location.iter().map(|(_, coord)| coord.to_f64()))
 }
 
 /// Create a new contour from raw points.
@@ -2258,8 +2392,8 @@ fn copy_ponts_to_el<'a>(el: &PathEl, vals: &'a [f64]) -> (PathEl, &'a [f64]) {
 pub struct Component {
     /// The name of the referenced glyph.
     pub base: GlyphName,
-    /// Affine transformation to apply to the referenced glyph.
-    pub transform: Affine,
+    /// Transform to apply to the referenced glyph.
+    pub transform: ComponentTransform,
     /// Explicit anchor for mark component attachment.
     ///
     /// In Glyphs.app, when a base glyph has multiple anchors with the same
@@ -2281,6 +2415,16 @@ pub struct Component {
     /// See: <https://handbook.glyphsapp.com/components/#reusing-shapes/anchors>
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub anchor: Option<SmolStr>,
+    /// Location in the *referenced* glyph's axis space. Empty for an ordinary
+    /// component.
+    #[serde(default, skip_serializing_if = "NormalizedLocation::is_empty")]
+    pub location: NormalizedLocation,
+    /// If `true`, axes of the referenced glyph not present in
+    /// [`location`](Self::location) take the font's current variation settings.
+    /// If `false` they inherit the enclosing glyph's location. See
+    /// <https://github.com/harfbuzz/boring-expansion-spec/blob/main/VARC.md#processing>
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub reset_unspecified_axes: bool,
 }
 
 impl Component {
@@ -2288,22 +2432,242 @@ impl Component {
     pub fn new(base: impl Into<GlyphName>, transform: Affine) -> Self {
         Self {
             base: base.into(),
-            transform,
+            transform: ComponentTransform::Affine(transform),
             anchor: None,
+            location: NormalizedLocation::new(),
+            reset_unspecified_axes: false,
         }
     }
 
     /// Create a component with an explicit attachment anchor.
     pub fn with_anchor(base: impl Into<GlyphName>, transform: Affine, anchor: SmolStr) -> Self {
         Self {
-            base: base.into(),
-            transform,
             anchor: Some(anchor),
+            ..Self::new(base, transform)
         }
     }
 
+    /// Create a variable component: one that positions the referenced glyph in
+    /// that glyph's own axis space.
+    pub fn new_variable(
+        base: impl Into<GlyphName>,
+        transform: DecomposedTransform,
+        location: NormalizedLocation,
+        reset_unspecified_axes: bool,
+    ) -> Self {
+        Self {
+            base: base.into(),
+            transform: ComponentTransform::Decomposed(transform),
+            anchor: None,
+            location,
+            reset_unspecified_axes,
+        }
+    }
+
+    /// The transform as a matrix.
+    pub fn affine(&self) -> Affine {
+        self.transform.to_affine()
+    }
+
+    /// A variable component positions the referenced glyph in its own axis
+    /// space. An ordinary component does not, and behaves like a glyf
+    /// component.
+    pub fn is_variable(&self) -> bool {
+        !self.location.is_empty() || self.reset_unspecified_axes
+    }
+
+    /// The location the referenced glyph is sampled at inside a glyph at
+    /// `enclosing`.
+    ///
+    /// A reset component starts from the font's current location. Everything
+    /// else inherits the enclosing glyph's location.
+    pub fn location_at(
+        &self,
+        font_location: &NormalizedLocation,
+        enclosing: &NormalizedLocation,
+    ) -> NormalizedLocation {
+        let mut at = if self.reset_unspecified_axes {
+            font_location.clone()
+        } else {
+            enclosing.clone()
+        };
+        for (tag, coord) in self.location.iter() {
+            at.insert(*tag, *coord);
+        }
+        at
+    }
+
     pub(crate) fn has_nonidentity_2x2(&self) -> bool {
-        self.transform.as_coeffs()[..4] != [1.0, 0.0, 0.0, 1.0]
+        self.affine().as_coeffs()[..4] != [1.0, 0.0, 0.0, 1.0]
+    }
+}
+
+/// A component transform, stored as authored.
+///
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub enum ComponentTransform {
+    Affine(Affine),
+    Decomposed(DecomposedTransform),
+}
+
+impl ComponentTransform {
+    /// The transform as a matrix.
+    pub fn to_affine(&self) -> Affine {
+        match self {
+            ComponentTransform::Affine(affine) => *affine,
+            ComponentTransform::Decomposed(transform) => transform.to_affine(),
+        }
+    }
+
+    /// The values fed to interpolation: 6 affine coefficients, or the nine
+    /// decomposed fields (a field that is not set is fed as 0, or 1 for scale).
+    pub(crate) fn interpolation_values(&self) -> Vec<f64> {
+        match self {
+            ComponentTransform::Affine(affine) => affine.as_coeffs().to_vec(),
+            ComponentTransform::Decomposed(transform) => {
+                decomposed_transform_interpolation_values(transform).collect()
+            }
+        }
+    }
+
+    /// Rebuild from interpolated values, in the same order and count as
+    /// [`interpolation_values`](Self::interpolation_values).
+    pub(crate) fn with_interpolated_values<'a>(&self, values: &'a [f64]) -> (Self, &'a [f64]) {
+        match self {
+            ComponentTransform::Affine(_) => (
+                ComponentTransform::Affine(Affine::new(values[..6].try_into().unwrap())),
+                &values[6..],
+            ),
+            ComponentTransform::Decomposed(transform) => (
+                ComponentTransform::Decomposed(transform.with_field_values(&values[..9])),
+                &values[9..],
+            ),
+        }
+    }
+}
+
+/// <https://github.com/fonttools/fonttools/blob/5e6b12d12fa08abafbeb7570f47707fbedf69a45/Lib/fontTools/misc/transform.py#L410>
+///
+/// The field aliases accept the fontTools attribute names, which Fontra
+/// also uses in its JSON.
+#[derive(Serialize, Deserialize, Debug, Default, Clone, PartialEq)]
+#[serde(default)]
+pub struct DecomposedTransform {
+    #[serde(alias = "translateX")]
+    pub translate_x: Option<f64>,
+    #[serde(alias = "translateY")]
+    pub translate_y: Option<f64>,
+    pub rotation: Option<f64>, // in degrees, counter-clockwise
+    #[serde(alias = "scaleX")]
+    pub scale_x: Option<f64>,
+    #[serde(alias = "scaleY")]
+    pub scale_y: Option<f64>,
+    #[serde(alias = "skewX")]
+    pub skew_x: Option<f64>, // in degrees, clockwise
+    #[serde(alias = "skewY")]
+    pub skew_y: Option<f64>, // in degrees, counter-clockwise
+    #[serde(alias = "tCenterX")]
+    pub center_x: Option<f64>,
+    #[serde(alias = "tCenterY")]
+    pub center_y: Option<f64>,
+}
+
+impl DecomposedTransform {
+    /// Compose the fields into an affine transform.
+    ///
+    /// Mirrors fontTools'
+    /// [`DecomposedTransform.toTransform`](https://github.com/fonttools/fonttools/blob/5e6b12d12fa08abafbeb7570f47707fbedf69a45/Lib/fontTools/misc/transform.py#L484):
+    /// translate by (translate + center), rotate, scale, skew, then translate back
+    /// by -center. Absent fields take their identity default (`0`, or `1` for scale).
+    pub fn to_affine(&self) -> Affine {
+        let translate_x = self.translate_x.unwrap_or(0.0);
+        let translate_y = self.translate_y.unwrap_or(0.0);
+        let rotation = self.rotation.unwrap_or(0.0).to_radians();
+        let scale_x = self.scale_x.unwrap_or(1.0);
+        let scale_y = self.scale_y.unwrap_or(1.0);
+        let skew_x = self.skew_x.unwrap_or(0.0).to_radians();
+        let skew_y = self.skew_y.unwrap_or(0.0).to_radians();
+        let center_x = self.center_x.unwrap_or(0.0);
+        let center_y = self.center_y.unwrap_or(0.0);
+
+        // fontTools skew matrix is (1, tan(skewY), tan(skewX), 1, 0, 0).
+        let skew = Affine::new([1.0, skew_y.tan(), skew_x.tan(), 1.0, 0.0, 0.0]);
+        Affine::translate((translate_x + center_x, translate_y + center_y))
+            * Affine::rotate(rotation)
+            * Affine::scale_non_uniform(scale_x, scale_y)
+            * skew
+            * Affine::translate((-center_x, -center_y))
+    }
+
+    /// Decompose an affine into transform fields. Inverse of [`to_affine`] for
+    /// invertible matrices.
+    ///
+    /// Port of fontTools
+    /// [`DecomposedTransform.fromTransform`](https://github.com/fonttools/fonttools/blob/5e6b12d12fa08abafbeb7570f47707fbedf69a45/Lib/fontTools/misc/transform.py#L439).
+    /// Center is never set.
+    ///
+    /// [`to_affine`]: Self::to_affine
+    pub fn from_affine(affine: Affine) -> DecomposedTransform {
+        let [mut a, mut b, c, d, x, y] = affine.as_coeffs();
+
+        let sx = a.signum();
+        if sx < 0.0 {
+            a *= sx;
+            b *= sx;
+        }
+
+        let delta = a * d - b * c;
+        let mut rotation = 0.0;
+        let (mut scale_x, mut scale_y) = (0.0, 0.0);
+        let (mut skew_x, mut skew_y) = (0.0, 0.0);
+        if a != 0.0 || b != 0.0 {
+            let r = (a * a + b * b).sqrt();
+            rotation = if b >= 0.0 {
+                (a / r).acos()
+            } else {
+                -(a / r).acos()
+            };
+            (scale_x, scale_y) = (r, delta / r);
+            skew_x = ((a * c + b * d) / (r * r)).atan();
+        } else if c != 0.0 || d != 0.0 {
+            let s = (c * c + d * d).sqrt();
+            rotation = std::f64::consts::FRAC_PI_2
+                - if d >= 0.0 {
+                    (-c / s).acos()
+                } else {
+                    -(c / s).acos()
+                };
+            (scale_x, scale_y) = (delta / s, s);
+            skew_y = ((a * c + b * d) / (s * s)).atan();
+        }
+
+        DecomposedTransform {
+            translate_x: Some(x),
+            translate_y: Some(y),
+            rotation: Some(rotation.to_degrees()),
+            scale_x: Some(scale_x * sx),
+            scale_y: Some(scale_y),
+            skew_x: Some(skew_x.to_degrees() * sx),
+            skew_y: Some(skew_y.to_degrees()),
+            center_x: None,
+            center_y: None,
+        }
+    }
+
+    /// Rebuild from nine field values, keeping only the fields set in `self`.
+    pub(crate) fn with_field_values(&self, fields: &[f64]) -> DecomposedTransform {
+        let take = |present: Option<f64>, v: f64| present.map(|_| v);
+        DecomposedTransform {
+            translate_x: take(self.translate_x, fields[0]),
+            translate_y: take(self.translate_y, fields[1]),
+            rotation: take(self.rotation, fields[2]),
+            scale_x: take(self.scale_x, fields[3]),
+            scale_y: take(self.scale_y, fields[4]),
+            skew_x: take(self.skew_x, fields[5]),
+            skew_y: take(self.skew_y, fields[6]),
+            center_x: take(self.center_x, fields[7]),
+            center_y: take(self.center_y, fields[8]),
+        }
     }
 }
 
@@ -2315,7 +2679,21 @@ pub struct ColorPalettes {
 }
 
 impl ColorPalettes {
-    pub fn new(mut palettes: Vec<Vec<Color>>) -> Result<Option<Self>, Error> {
+    pub fn new(palettes: Vec<Vec<Color>>) -> Result<Option<Self>, Error> {
+        let Some(mut result) = Self::new_preserving_indices(palettes)? else {
+            return Ok(None);
+        };
+
+        // Glyphs paints refer to colors rather than source palette indices.
+        if let [one_palette] = result.palettes.as_mut_slice() {
+            let mut seen = HashSet::new();
+            one_palette.retain(|color| seen.insert(*color));
+        }
+        Ok(Some(result))
+    }
+
+    /// Construct palettes whose entry positions are referenced by source paints.
+    pub fn new_preserving_indices(palettes: Vec<Vec<Color>>) -> Result<Option<Self>, Error> {
         // Fail if boring
         if !palettes.iter().any(|p| !p.is_empty()) {
             return Ok(None);
@@ -2328,22 +2706,6 @@ impl ColorPalettes {
                 n: bad_idx,
                 size_n: palettes[bad_idx].len(),
             });
-        }
-
-        // Trivial optimization: if there is only one palette we can deduplicate it
-        if let [one_palette] = palettes.as_mut_slice() {
-            // Keep the first occurance in original order to match fontmake
-            let mut seen = HashSet::new();
-            let mut delme = Vec::new();
-            for (i, c) in one_palette.iter().enumerate() {
-                if !seen.insert(c) {
-                    delme.push(i);
-                }
-            }
-
-            for i in delme.into_iter().rev() {
-                one_palette.remove(i);
-            }
         }
 
         Ok(Some(Self { palettes }))
@@ -2370,14 +2732,25 @@ pub struct Color {
 #[derive(Serialize, Deserialize, Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ColorStop {
     pub offset: OrderedFloat<f32>,
-    pub color: Color,
+    pub color: ColorReference,
+    /// Opacity multiplier, independent of the palette entry's alpha (0..1).
     pub alpha: OrderedFloat<f32>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum ColorReference {
+    /// A Glyphs color, resolved against the generated palette.
+    Color(Color),
+    /// An existing palette entry; 0xFFFF means the text foreground color.
+    PaletteIndex(u16),
 }
 
 /// Data to inform construction of [COLR](https://learn.microsoft.com/en-us/typography/opentype/spec/colr)
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub struct ColorGlyphs {
     pub base_glyphs: IndexMap<GlyphName, Paint>,
+    /// Explicit static clipping rectangles in font units.
+    pub clip_boxes: BTreeMap<GlyphName, Rect>,
 }
 
 /// <https://learn.microsoft.com/en-us/typography/opentype/spec/colr#paint-tables>
@@ -2388,6 +2761,9 @@ pub enum Paint {
     LinearGradient(Box<PaintLinearGradient>),
     RadialGradient(Box<PaintRadialGradient>),
     Layers(Box<Vec<Paint>>),
+    ColrGlyph(GlyphName),
+    Transform(Box<PaintTransform>),
+    Translate(Box<PaintTranslate>),
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
@@ -2398,14 +2774,25 @@ pub struct PaintGlyph {
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub struct PaintSolid {
-    /// The color to use. `None` means the text foreground color
-    /// (COLR palette index 0xFFFF).
-    pub color: Option<Color>,
+    pub color: ColorReference,
+    /// Opacity multiplier, independent of the palette entry's alpha (0..1).
+    pub alpha: OrderedFloat<f32>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Copy, Clone, PartialEq, Eq)]
+pub enum GradientCoordinates {
+    /// Percentages of the enclosing PaintGlyph's outline bounds, as in Glyphs.
+    Relative,
+    /// Font units, as in UFO COLRv1 paint dictionaries.
+    Absolute,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub struct PaintLinearGradient {
     pub color_line: Vec<ColorStop>,
+    #[serde(default)]
+    pub extend: write_fonts::tables::colr::Extend,
+    pub coordinates: GradientCoordinates,
     pub p0: Point,
     pub p1: Point,
     /// Third point defining gradient rotation. None means calculate perpendicular
@@ -2416,15 +2803,32 @@ pub struct PaintLinearGradient {
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub struct PaintRadialGradient {
     pub color_line: Vec<ColorStop>,
+    #[serde(default)]
+    pub extend: write_fonts::tables::colr::Extend,
+    pub coordinates: GradientCoordinates,
     pub p0: Point,
-    /// Inner radius, relative to the bounding box like the points: a multiple
-    /// of the square root of its width times its height. None means 0
-    /// (gradient radiating from center, not a ring).
+    /// Explicit inner radius, in the units of [`Self::coordinates`]: font
+    /// units when absolute; when relative, a multiple of the square root of
+    /// the bounds' width times their height (as Glyphs 4 saves it).
+    /// None means 0 (gradient radiating from center, not a ring).
     pub r0: Option<OrderedFloat<f32>>,
     pub p1: Point,
-    /// Outer radius, relative like `r0`. None means calculate as max distance
-    /// from center to bounding box corners (like Glyphs 3 does).
+    /// Explicit outer radius, in the same units as `r0`. None means calculate
+    /// as max distance from center to bounding box corners (like Glyphs 3 does).
     pub r1: Option<OrderedFloat<f32>>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct PaintTransform {
+    pub paint: Paint,
+    pub transform: Affine,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct PaintTranslate {
+    pub paint: Paint,
+    pub dx: f64,
+    pub dy: f64,
 }
 
 #[cfg(test)]
@@ -2438,6 +2842,39 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use super::*;
+
+    #[test]
+    fn decomposed_transform_round_trips_through_affine() {
+        // from_affine inverts to_affine for invertible matrices, so wrapping an
+        // ordinary component's affine and composing it back gives the same matrix.
+        for affine in [
+            Affine::translate((10.0, -5.0)),
+            Affine::scale_non_uniform(2.0, 3.0),
+            Affine::rotate(0.7),
+            Affine::new([1.0, 0.0, 0.3, 1.0, 0.0, 0.0]), // skew
+            Affine::translate((4.0, 8.0))
+                * Affine::rotate(0.4)
+                * Affine::scale_non_uniform(1.5, 0.8),
+            Affine::new([-1.0, 0.0, 0.0, 1.0, 0.0, 0.0]), // reflection (negative determinant)
+        ] {
+            let round = DecomposedTransform::from_affine(affine).to_affine();
+            let (got, want) = (round.as_coeffs(), affine.as_coeffs());
+            assert!(
+                got.iter().zip(want).all(|(a, b)| (a - b).abs() < 1e-9),
+                "affine {want:?} round-tripped to {got:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn decomposed_transform_parses_fonttools_field_names() {
+        let transform: DecomposedTransform =
+            serde_yaml::from_str("{scaleX: 2.0, tCenterX: 100.0, tCenterY: -50.0}").unwrap();
+        assert_eq!(
+            (Some(2.0), Some(100.0), Some(-50.0)),
+            (transform.scale_x, transform.center_x, transform.center_y)
+        );
+    }
 
     // from
     // <https://github.com/googlefonts/ufo2ft/blob/6787e37e6/tests/featureWriters/markFeatureWriter_test.py#L34>
@@ -2549,9 +2986,7 @@ mod tests {
     fn assert_name(names: &HashMap<NameKey, String>, expected: &str, name_id: NameId) {
         assert_eq!(
             Some(expected),
-            names
-                .get(&NameKey::new(name_id, expected))
-                .map(String::as_str)
+            names.get(&NameKey::new(name_id)).map(String::as_str)
         );
     }
 
@@ -2564,7 +2999,7 @@ mod tests {
             &[
                 (NameId::FAMILY_NAME, "New Font"),
                 (NameId::SUBFAMILY_NAME, "Regular"),
-                (NameId::UNIQUE_ID, "0.000;NONE;NewFont-Regular"),
+                (NameId::UNIQUE_ID, "0.000;    ;NewFont-Regular"),
                 (NameId::FULL_NAME, "New Font Regular"),
                 (NameId::VERSION_STRING, "Version 0.000"),
                 (NameId::POSTSCRIPT_NAME, "NewFont-Regular"),
@@ -2580,7 +3015,7 @@ mod tests {
         let names = builder.build(DEFAULT_VENDOR_ID);
 
         assert_name(&names, "Version 1.002", NameId::VERSION_STRING);
-        assert_name(&names, "1.002;NONE;NewFont-Regular", NameId::UNIQUE_ID);
+        assert_name(&names, "1.002;    ;NewFont-Regular", NameId::UNIQUE_ID);
     }
 
     #[test]
@@ -2594,7 +3029,7 @@ mod tests {
             &[
                 (NameId::FAMILY_NAME, "Family"),
                 (NameId::SUBFAMILY_NAME, "Bold Italic"),
-                (NameId::UNIQUE_ID, "0.000;NONE;Family-BoldItalic"),
+                (NameId::UNIQUE_ID, "0.000;    ;Family-BoldItalic"),
                 (NameId::FULL_NAME, "Family Bold Italic"),
                 (NameId::VERSION_STRING, "Version 0.000"),
                 (NameId::POSTSCRIPT_NAME, "Family-BoldItalic"),
@@ -2614,7 +3049,7 @@ mod tests {
             &[
                 (NameId::FAMILY_NAME, "Family Subfamily"),
                 (NameId::SUBFAMILY_NAME, "Regular"),
-                (NameId::UNIQUE_ID, "0.000;NONE;Family-Subfamily"),
+                (NameId::UNIQUE_ID, "0.000;    ;Family-Subfamily"),
                 (NameId::FULL_NAME, "Family Subfamily"),
                 (NameId::VERSION_STRING, "Version 0.000"),
                 (NameId::POSTSCRIPT_NAME, "Family-Subfamily"),
@@ -2675,7 +3110,7 @@ mod tests {
             &[
                 (NameId::FAMILY_NAME, "Legacy Family"),
                 (NameId::SUBFAMILY_NAME, "Regular"),
-                (NameId::UNIQUE_ID, "0.000;NONE;Family-Subfamily"),
+                (NameId::UNIQUE_ID, "0.000;    ;Family-Subfamily"),
                 (NameId::FULL_NAME, "Family Subfamily"),
                 (NameId::VERSION_STRING, "Version 0.000"),
                 (NameId::POSTSCRIPT_NAME, "Family-Subfamily"),
@@ -2699,7 +3134,7 @@ mod tests {
             &[
                 (NameId::FAMILY_NAME, "Family"),
                 (NameId::SUBFAMILY_NAME, "Subfamily"),
-                (NameId::UNIQUE_ID, "0.000;NONE;Family-Subfamily"),
+                (NameId::UNIQUE_ID, "0.000;    ;Family-Subfamily"),
                 (NameId::FULL_NAME, "Family Subfamily"),
                 (NameId::VERSION_STRING, "Version 0.000"),
                 (NameId::POSTSCRIPT_NAME, "Family-Subfamily"),
@@ -2720,7 +3155,7 @@ mod tests {
             &[
                 (NameId::FAMILY_NAME, "Family"),
                 (NameId::SUBFAMILY_NAME, "Italic"),
-                (NameId::UNIQUE_ID, "0.000;NONE;Family-Italic"),
+                (NameId::UNIQUE_ID, "0.000;    ;Family-Italic"),
                 (NameId::FULL_NAME, "Family Italic"),
                 (NameId::VERSION_STRING, "Version 0.000"),
                 (NameId::POSTSCRIPT_NAME, "Family-Italic"),
@@ -2818,10 +3253,8 @@ mod tests {
             (NameId::TYPOGRAPHIC_SUBFAMILY_NAME, "Regular"),
         ]);
 
-        assert!(!identical.contains_key(&NameKey::new_bmp_only(NameId::TYPOGRAPHIC_FAMILY_NAME)));
-        assert!(
-            !identical.contains_key(&NameKey::new_bmp_only(NameId::TYPOGRAPHIC_SUBFAMILY_NAME))
-        );
+        assert!(!identical.contains_key(&NameKey::new(NameId::TYPOGRAPHIC_FAMILY_NAME)));
+        assert!(!identical.contains_key(&NameKey::new(NameId::TYPOGRAPHIC_SUBFAMILY_NAME)));
 
         let different_subfamily = make_builder(&[
             (NameId::FAMILY_NAME, "Derp"),
@@ -2830,13 +3263,9 @@ mod tests {
             (NameId::TYPOGRAPHIC_SUBFAMILY_NAME, "Regular Italic"),
         ]);
 
+        assert!(different_subfamily.contains_key(&NameKey::new(NameId::TYPOGRAPHIC_FAMILY_NAME)));
         assert!(
-            different_subfamily
-                .contains_key(&NameKey::new_bmp_only(NameId::TYPOGRAPHIC_FAMILY_NAME))
-        );
-        assert!(
-            different_subfamily
-                .contains_key(&NameKey::new_bmp_only(NameId::TYPOGRAPHIC_SUBFAMILY_NAME))
+            different_subfamily.contains_key(&NameKey::new(NameId::TYPOGRAPHIC_SUBFAMILY_NAME))
         );
     }
 
@@ -2846,7 +3275,7 @@ mod tests {
         let mut builder = NameBuilder::default();
         builder.add(NameId::UNIQUE_ID, "".into());
         let names = builder.build("derp");
-        assert!(!names.contains_key(&NameKey::new_bmp_only(NameId::UNIQUE_ID)));
+        assert!(!names.contains_key(&NameKey::new(NameId::UNIQUE_ID)));
     }
 
     // If x-height is undefined, ufo2ft derives the strikeout position from its
@@ -2905,6 +3334,23 @@ mod tests {
         );
     }
 
+    // ufo2ft truncates upem * 1.2 to an int before subtracting the ascender and descender
+    #[test]
+    fn default_typo_line_gap_truncates_like_ufo2ft() {
+        let pos = NormalizedLocation::for_pos(&[("wght", 0.0)]);
+        let mut metrics = GlobalMetricsBuilder::new();
+        metrics.populate_defaults(&pos, 1024, None, Some(768.0), Some(-256.0), None);
+
+        let built = metrics.build(&Axes::default()).unwrap();
+        assert_eq!(
+            (204.0, 972.0),
+            (
+                built.get(GlobalMetric::Os2TypoLineGap, &pos).into_inner(),
+                built.get(GlobalMetric::HheaAscender, &pos).into_inner(),
+            )
+        );
+    }
+
     /// Test that we can interpolate metrics between source locations.
     #[test]
     fn interpolated_metrics() {
@@ -2941,6 +3387,29 @@ mod tests {
     #[test]
     fn glyphorder_non_equality() {
         assert_ne!(make_glyph_order(["a", "b"]), make_glyph_order(["b", "a"]));
+    }
+
+    #[test]
+    fn variable_component_serde_round_trip() {
+        let vc = Component::new_variable(
+            "radical",
+            DecomposedTransform {
+                translate_x: Some(100.0),
+                rotation: Some(15.0),
+                ..Default::default()
+            },
+            NormalizedLocation::for_pos(&[("wght", 0.5)]),
+            true,
+        );
+        let yaml = serde_yaml::to_string(&vc).unwrap();
+        let back: Component = serde_yaml::from_str(&yaml).unwrap();
+        assert_eq!(vc, back);
+        // Absent transform fields stay absent (VARC HAVE_* semantics).
+        let ComponentTransform::Decomposed(transform) = &back.transform else {
+            panic!("expected a decomposed transform, got {:?}", back.transform);
+        };
+        assert!(transform.scale_x.is_none());
+        assert_eq!(Some(15.0), transform.rotation);
     }
 
     #[test]
@@ -2999,7 +3468,51 @@ mod tests {
             }
         }
 
-        assert_eq!(new_instance.components[0].transform.as_coeffs(), [-1.; 6]);
+        assert_eq!(new_instance.components[0].affine().as_coeffs(), [-1.; 6]);
+    }
+
+    #[test]
+    fn instance_from_deltas_decomposed() {
+        // A decomposed transform consumes nine values in field order. Fields
+        // not set in the template stay unset.
+        let template = Component {
+            transform: ComponentTransform::Decomposed(DecomposedTransform {
+                translate_x: Some(1.),
+                rotation: Some(2.),
+                skew_x: Some(3.),
+                skew_y: Some(4.),
+                center_x: Some(5.),
+                center_y: Some(6.),
+                ..Default::default()
+            }),
+            ..Component::new("derp", Affine::IDENTITY)
+        };
+        let instance = GlyphInstance {
+            width: 600.,
+            components: vec![template],
+            ..Default::default()
+        };
+
+        let deltas = [10., 20., 45., 2., 3., 5., 6., 99., 98.]
+            .into_iter()
+            .chain([600.]) // width
+            .collect::<Vec<_>>();
+        let new_instance = instance.new_with_interpolated_values(&deltas);
+
+        assert_eq!(
+            new_instance.components[0].transform,
+            ComponentTransform::Decomposed(DecomposedTransform {
+                translate_x: Some(10.),
+                translate_y: None, // not set in the template
+                rotation: Some(45.),
+                scale_x: None,
+                scale_y: None,
+                skew_x: Some(5.),
+                skew_y: Some(6.),
+                center_x: Some(99.),
+                center_y: Some(98.),
+            })
+        );
     }
 
     #[test]
@@ -3015,5 +3528,79 @@ mod tests {
         let mut builder = NameBuilder::default();
         builder.add(NameId::COPYRIGHT_NOTICE, "a\r\nb\rc\nd".to_string());
         assert_eq!(builder.get(NameId::COPYRIGHT_NOTICE), Some("a\nb\nc\nd"));
+    }
+
+    fn record_key(name_id: NameId, lang_id: u16) -> NameKey {
+        NameKey {
+            name_id,
+            platform_id: 3,
+            encoding_id: 1,
+            lang_id,
+        }
+    }
+
+    // Derived names stay at Windows encoding 1 whatever they contain, like in
+    // Glyphs.app and ufo2ft (googlefonts/ufo2ft#1011)
+    #[test]
+    fn name_builder_name_outside_bmp_keeps_windows_bmp_encoding() {
+        let mut builder = NameBuilder::default();
+        builder.add(NameId::FAMILY_NAME, "Local\u{20000}Font".to_string());
+        let names = builder.build(DEFAULT_VENDOR_ID);
+        assert_eq!(
+            names
+                .get(&record_key(NameId::FAMILY_NAME, 0x409))
+                .map(String::as_str),
+            Some("Local\u{20000}Font")
+        );
+        assert!(names.keys().all(|key| key.encoding_id == 1));
+    }
+
+    // Records are added as they are, an empty one included
+    #[test]
+    fn name_builder_keeps_empty_records() {
+        let mut builder = NameBuilder::default();
+        let empty = record_key(NameId::DESCRIPTION, 0x407);
+        builder.add_record(empty, String::new());
+        // an empty name is dropped, an empty record isn't
+        builder.add(NameId::COPYRIGHT_NOTICE, String::new());
+        let names = builder.build(DEFAULT_VENDOR_ID);
+        assert_eq!(names.get(&empty).map(String::as_str), Some(""));
+        assert!(!names.contains_key(&NameKey::new(NameId::COPYRIGHT_NOTICE)));
+    }
+
+    // A record for the English name wins in the end, but doesn't change the
+    // names derived from the field it replaces, as in ufo2ft
+    #[test]
+    fn name_builder_english_record_replaces_without_feeding() {
+        let mut builder = NameBuilder::default();
+        // the order of the calls doesn't matter
+        builder.add_record(record_key(NameId::FAMILY_NAME, 0x409), "Record".to_string());
+        builder.add_record(
+            record_key(NameId::TYPOGRAPHIC_FAMILY_NAME, 0x409),
+            "Typo Record".to_string(),
+        );
+        builder.add(NameId::TYPOGRAPHIC_FAMILY_NAME, "Typo".to_string());
+        builder.add(NameId::TYPOGRAPHIC_SUBFAMILY_NAME, "Light".to_string());
+        let names = builder.build(DEFAULT_VENDOR_ID);
+
+        let name = |id| names[&record_key(id, 0x409)].as_str();
+        // the record replaces the derived name ...
+        assert_eq!(name(NameId::FAMILY_NAME), "Record");
+        assert_eq!(name(NameId::TYPOGRAPHIC_FAMILY_NAME), "Typo Record");
+        // ... but the others derive from the fields, not the record
+        assert_eq!(name(NameId::SUBFAMILY_NAME), "Regular");
+        assert_eq!(name(NameId::FULL_NAME), "Typo Light");
+        assert_eq!(name(NameId::POSTSCRIPT_NAME), "Typo-Light");
+    }
+
+    // The last record for a key wins
+    #[test]
+    fn name_builder_records_last_wins() {
+        let mut builder = NameBuilder::default();
+        let key = record_key(NameId::DESCRIPTION, 0x407);
+        builder.add_record(key, "first".to_string());
+        builder.add_record(key, "second".to_string());
+        let names = builder.build(DEFAULT_VENDOR_ID);
+        assert_eq!(names[&key], "second");
     }
 }

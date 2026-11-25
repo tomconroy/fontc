@@ -3,8 +3,8 @@
 use std::path::PathBuf;
 
 use clap::{ArgAction, Parser};
-use fontc::{DisableFlags, Input, Options};
-use fontir::{instance::InstanceSpec, orchestration::Flags};
+use fontc::{DisableFlags, Input, Options, SourceOptions};
+use fontir::orchestration::Flags;
 
 use regex::Regex;
 use serde::{Deserialize, Deserializer, Serialize};
@@ -67,6 +67,10 @@ pub struct Args {
     #[arg(long, default_value = "false")]
     pub decompose_components: bool,
 
+    /// Emit variable composites as a VARC table instead of decomposing them.
+    #[arg(long, default_value = "false")]
+    pub emit_varc_table: bool,
+
     /// Whether to output timing data in Chrome trace format (written to trace.json in build dir).
     ///
     /// The generated JSON file can be viewed at https://ui.perfetto.dev/.
@@ -110,6 +114,28 @@ pub struct Args {
     #[arg(long, default_value = "false")]
     pub keep_overlaps: bool,
 
+    /// Build the static instance with this name
+    ///
+    /// Like fontmake's -i, but matched exactly, not as a regex. For a Glyphs
+    /// source it is the full name ("{family} {style}"); for a designspace it
+    /// is the instance's name attribute, else its "{family} {style}", the
+    /// family defaulting to the default source's, as fontmake names it.
+    ///
+    /// An instance on a master is built from that master alone. One between
+    /// masters is interpolated from the whole source. A bare style name
+    /// ("Bold") or a user-space location ("wght=700,wdth=87.5", axes left out
+    /// taking their default) is interpolated too.
+    #[arg(long, value_name = "NAME")]
+    pub instance: Option<String>,
+
+    /// Custom GlyphData XML file with glyph info (production name, category,
+    /// subCategory, etc.). Can be used more than once, later files taking
+    /// precedence (for Glyphs sources only).
+    // Named to match fontmake's homonymous flag
+    #[arg(long, value_name = "GLYPHDATA")]
+    #[serde(default)]
+    pub glyph_data: Vec<PathBuf>,
+
     /// Don't rename glyphs with production names
     // Named to match fontmake's homonymous flag:
     // https://github.com/googlefonts/fontmake/blob/6a8b2907/Lib/fontmake/__main__.py#L602
@@ -136,18 +162,6 @@ pub struct Args {
     // Named for fontmake's -o/--output {ttf,otf}, which clashes with our -o
     #[arg(long, value_enum, default_value_t)]
     pub flavor: Flavor,
-
-    /// Build a single static instance instead of a variable font.
-    ///
-    /// Accepts either the style name of one of the source's named instances
-    /// ("Bold"), or an explicit user-space location ("wght=700,wdth=87.5").
-    /// Axes you don't mention take their default.
-    ///
-    /// One instance per invocation. Requires a variable source.
-    // Named for fontmake's -i/--interpolate, which takes a style-name regex;
-    // we take one instance, not a pattern.
-    #[arg(long, value_name = "INSTANCE")]
-    pub instance: Option<InstanceSpec>,
 }
 
 /// Which outline format the compiled font uses.
@@ -190,6 +204,7 @@ impl Args {
             self.decompose_transformed_components,
         );
         flags.set(Flags::DECOMPOSE_COMPONENTS, self.decompose_components);
+        flags.set(Flags::EMIT_VARC_TABLE, self.emit_varc_table);
         flags.set(Flags::KEEP_DIRECTION, self.keep_direction);
         // only takes effect if the font turns out static, which isn't known
         // until the source has been read
@@ -233,6 +248,13 @@ impl Args {
             .as_ref()
             .unwrap_or_else(|| self.input_source.as_ref().unwrap());
         Input::try_from(path.as_path())
+    }
+
+    pub fn source_options(&self) -> SourceOptions {
+        SourceOptions {
+            instance: self.instance.clone(),
+            glyph_data: self.glyph_data.clone(),
+        }
     }
 
     /// Returns the trace path if timing output is enabled.
@@ -297,13 +319,17 @@ impl TryInto<Options> for Args {
                 }))
             }),
             debug_dir,
-            instance: self.instance,
+            // decided once the source has been asked for the instance, see
+            // fontc::run
+            instance: None,
         })
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+
     use clap::Parser;
     use fontdrasil::coords::{UserCoord, UserLocation};
     use fontir::{instance::InstanceSpec, orchestration::Flags};
@@ -317,21 +343,19 @@ mod tests {
         Args::parse_from(argv)
     }
 
-    fn try_parse(args: &[&str]) -> Result<Args, clap::Error> {
-        let mut argv = vec!["program", "dont.care.designspace"];
-        argv.extend_from_slice(args);
-        Args::try_parse_from(argv)
-    }
-
     #[test]
     fn instance_defaults_to_none() {
         assert_eq!(parse(&[]).instance, None);
+        assert_eq!(
+            parse(&["--instance", "Example Bold"]).instance.as_deref(),
+            Some("Example Bold")
+        );
     }
 
     #[test]
     fn instance_by_style_name() {
         assert_eq!(
-            parse(&["--instance", "Bold Condensed"]).instance,
+            spec("Bold Condensed"),
             Some(InstanceSpec::Named("Bold Condensed".to_string()))
         );
     }
@@ -344,7 +368,7 @@ mod tests {
         ]
         .into();
         assert_eq!(
-            parse(&["--instance", "wght=700,wdth=87.5"]).instance,
+            spec("wght=700,wdth=87.5"),
             Some(InstanceSpec::Location(expected))
         );
     }
@@ -352,10 +376,7 @@ mod tests {
     #[test]
     fn instance_tolerates_whitespace_and_short_tags() {
         let expected: UserLocation = vec![(Tag::new(b"XX  "), UserCoord::new(-1.0))].into();
-        assert_eq!(
-            parse(&["--instance", " XX = -1 "]).instance,
-            Some(InstanceSpec::Location(expected))
-        );
+        assert_eq!(spec(" XX = -1 "), Some(InstanceSpec::Location(expected)));
     }
 
     /// The value is user space, so it may be negative or fractional; a *name*
@@ -363,13 +384,18 @@ mod tests {
     #[test]
     fn instance_name_can_look_like_almost_anything() {
         assert_eq!(
-            parse(&["--instance", "12 Point"]).instance,
+            spec("12 Point"),
             Some(InstanceSpec::Named("12 Point".to_string()))
         );
     }
 
+    /// What fontc::run makes of an --instance the source doesn't offer
+    fn spec(spec: &str) -> Option<InstanceSpec> {
+        spec.parse().ok()
+    }
+
     fn instance_error(spec: &str) -> String {
-        try_parse(&["--instance", spec])
+        spec.parse::<InstanceSpec>()
             .expect_err("'{spec}' should not parse")
             .to_string()
     }
@@ -473,6 +499,22 @@ mod tests {
             "mismatch in defaults. flags_default: {:#032b}. args_default: {:#032b}",
             flags_default.bits(),
             arg_default.bits(),
+        );
+    }
+
+    #[test]
+    fn glyph_data_is_repeatable_and_ordered() {
+        let args = Args::parse_from(vec![
+            "program",
+            "font.glyphs",
+            "--glyph-data",
+            "a.xml",
+            "--glyph-data",
+            "b.xml",
+        ]);
+        assert_eq!(
+            args.glyph_data,
+            vec![PathBuf::from("a.xml"), PathBuf::from("b.xml")]
         );
     }
 }

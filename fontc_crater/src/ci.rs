@@ -7,13 +7,16 @@
 
 use std::{
     collections::{BTreeMap, HashSet},
+    ffi::OsStr,
     path::{Path, PathBuf},
     process::Command,
 };
 
 use chrono::{DateTime, Utc};
+use glyphs_reader::Plist;
 use google_fonts_sources::{Config, FontSource, SourceSet};
-use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
+use norad::designspace::DesignSpaceDocument;
+use rayon::iter::{IntoParallelIterator, IntoParallelRefIterator, ParallelIterator};
 use serde::de::DeserializeOwned;
 
 use crate::{
@@ -23,10 +26,15 @@ use crate::{
     ttx_diff_runner::{DiffError, DiffOutput},
 };
 
+mod accepted;
 mod html;
+mod progress;
 mod results_cache;
+mod skipped;
 
-pub(crate) use results_cache::{FontmakeOutput, ResultsCache};
+pub(crate) use accepted::AcceptedFailures;
+pub(crate) use results_cache::{FontmakeOutput, ResultKey, ResultsCache, sha256_file};
+use skipped::SkippedConfigs;
 
 static SUMMARY_FILE: &str = "summary.json";
 static SOURCES_FILE: &str = "sources.json";
@@ -49,11 +57,11 @@ struct RunSummary {
     input_file_sha: String,
     #[serde(default)]
     flavor: Flavor,
-    /// which instance was built from each variable source, if any; `None` is a
-    /// plain variable build, and is what every run before instance mode was
-    #[serde(default)]
-    instance: Option<String>,
     stats: super::ttx_diff_runner::Summary,
+    /// How many targets reused their result without running ttx_diff, because
+    /// the fontc binary and ttx_diff's inputs were unchanged.
+    #[serde(default)]
+    reused_unchanged_results: usize,
     /// How many targets skipped the comparison because fontc's output was unchanged.
     #[serde(default)]
     reused_cached_results: usize,
@@ -80,7 +88,7 @@ pub(super) fn run_ci(args: &CiArgs) -> Result<(), Error> {
         super::ttx_diff_runner::assert_can_run_script();
         run_crater_and_save_results(args)?;
     }
-    html::generate(&args.out_dir)?;
+    html::generate(&args.out_dir, &args.to_run, args.status_url.as_deref())?;
     // now we want to generate an html report, based on this info.
     Ok(())
 }
@@ -95,30 +103,6 @@ fn load_json_if_exists_else_default<T: DeserializeOwned + Default>(
     }
 }
 
-fn get_inputs_applying_denylist(input_path: &Path) -> Result<SourceSet, Error> {
-    // we can move this to a file and/or make it fancier at some point, if needed
-    fn deny(url: &str) -> bool {
-        static DENY_REPOS: &[&str] = &[
-            "chiron-fonts/chiron-hei-hk", // these repos are huge and we can't build them anyway
-            "chiron-fonts/chiron-go-round-tc",
-            "chiron-fonts/chiron-sung-hk",
-            "EbenSorkin/Merriweather4",
-        ];
-
-        // this is quadratic. I'm sorry.
-        for deny in DENY_REPOS {
-            if url.contains(deny) {
-                log::debug!("'{url}' is on denylist, skipping");
-                return true;
-            }
-        }
-        false
-    }
-    let mut inputs: SourceSet = super::try_read_json(input_path)?;
-    inputs.sources.retain(|src| !deny(&src.repo_url));
-    Ok(inputs)
-}
-
 fn run_crater_and_save_results(args: &CiArgs) -> Result<(), Error> {
     if !args.out_dir.exists() {
         super::try_create_dir(&args.out_dir)?;
@@ -126,12 +110,20 @@ fn run_crater_and_save_results(args: &CiArgs) -> Result<(), Error> {
 
     log_if_auth_or_not();
     // do this now so we error if the input file doesn't exist
-    let inputs = get_inputs_applying_denylist(&args.to_run)?;
+    let mut inputs: SourceSet = super::try_read_json(&args.to_run)?;
+    let skipped = SkippedConfigs::load(&args.out_dir)?;
+    inputs.sources.retain(|src| !skipped.skips(src));
+    let accepted = AcceptedFailures::load(&args.out_dir)?;
 
     let summary_file = args.out_dir.join(SUMMARY_FILE);
     let mut prev_runs: Vec<RunSummary> = load_json_if_exists_else_default(&summary_file)?;
     // todo: fontc_repo should be checked out by us, and have a known path
     let fontc_rev = super::get_git_rev(None).unwrap();
+    let progress_file = args.progress_file.as_deref().map(|path| {
+        let prev_rev = prev_runs.last().map(|run| run.fontc_rev.as_str());
+        let compare_url = html::fontc_compare_url(prev_rev, &fontc_rev);
+        progress::ProgressFile::new(path, &fontc_rev, compare_url)
+    });
     let pip_freeze_sha = super::pip_freeze_sha();
     let input_file_sha = super::get_input_sha(&args.to_run);
 
@@ -147,16 +139,22 @@ fn run_crater_and_save_results(args: &CiArgs) -> Result<(), Error> {
         log::info!("no external configs, skipping google/fonts update");
     }
     log::info!("using cache dir {}", cache_dir.display());
-    let results_cache = ResultsCache::in_dir(&cache_dir, args.flavor, args.instance.as_deref());
+    // each flavor has its own cache
+    let results_cache =
+        (!args.no_results_cache).then(|| ResultsCache::in_dir(&cache_dir, args.flavor));
 
-    if let Some(last_run) = prev_runs.last() {
+    if let Some(last_run) = prev_runs.last()
+        && let Some(results_cache) = &results_cache
+    {
         if last_run.fontc_rev == fontc_rev
             && input_file_sha == last_run.input_file_sha
             && pip_freeze_sha == last_run.pip_freeze_sha
             && last_run.flavor == args.flavor
-            && last_run.instance == args.instance
         {
             log::info!("no changes since last run, skipping");
+            if let Some(progress_file) = &progress_file {
+                progress_file.write_skipped();
+            }
             return Ok(());
         }
         if pip_freeze_sha != last_run.pip_freeze_sha || ttx_diff_has_changes(&last_run.fontc_rev) {
@@ -173,8 +171,14 @@ fn run_crater_and_save_results(args: &CiArgs) -> Result<(), Error> {
     let temp_bin_dir = tempfile::tempdir().expect("couldn't create tempdir");
     let (fontc_path, normalizer_path) = precompile_rust_binaries(temp_bin_dir.path());
 
-    log::info!("compiled fontc to {}", fontc_path.display());
-    log::info!("compiled otl-normalizeer to {}", normalizer_path.display());
+    let fontc_hash = sha256_file(&fontc_path).expect("failed to hash fontc");
+    let normalizer_hash = sha256_file(&normalizer_path).expect("failed to hash otl-normalizer");
+
+    log::info!("compiled fontc to {} ({fontc_hash})", fontc_path.display());
+    log::info!(
+        "compiled otl-normalizer to {} ({normalizer_hash})",
+        normalizer_path.display()
+    );
 
     let ResolvedTargets {
         mut targets,
@@ -183,43 +187,52 @@ fn run_crater_and_save_results(args: &CiArgs) -> Result<(), Error> {
     } = make_targets(&cache_dir, &inputs.sources);
 
     // gftools decides its own build type and output set from the config file,
-    // so neither a CFF build nor an instanced build can be expressed through it
-    if !args.gftools || args.flavor != Flavor::Ttf || args.instance.is_some() {
-        if args.gftools && args.flavor != Flavor::Ttf {
+    // so a CFF build can't be expressed through it
+    if !args.gftools || args.flavor != Flavor::Ttf {
+        if args.gftools {
             log::info!(
                 "--flavor {} only runs default builds, ignoring gftools targets",
                 args.flavor
             );
         }
-        if args.gftools && args.instance.is_some() {
-            log::info!("--instance only runs default builds, ignoring gftools targets");
-        }
-        targets.retain(|t| t.build == BuildType::Default);
+        targets.retain(|t| t.build() == BuildType::Default);
     }
 
     let n_targets = targets.len();
 
     let context = super::ttx_diff_runner::TtxContext {
         fontc_path,
+        fontc_hash,
         normalizer_path,
+        normalizer_hash,
         source_cache: cache_dir,
         results_cache,
         flavor: args.flavor,
-        instance: args.instance.clone(),
+        reused_unchanged_results: Default::default(),
         reused_cached_results: Default::default(),
         reused_fontmake_failures: Default::default(),
     };
 
+    let progress = progress_file.map(|file| progress::Progress::start(file, n_targets));
     let began = Utc::now();
-    let results = super::run_all(targets, &context, super::ttx_diff_runner::run_ttx_diff)?
-        .into_iter()
-        .collect();
+    let results = super::run_all(targets, &context, |cx, target| {
+        let result = super::ttx_diff_runner::run_ttx_diff(cx, target);
+        if let Some(progress) = &progress {
+            progress.target_finished();
+        }
+        result
+    })?
+    .into_iter()
+    .collect();
     let finished = Utc::now();
 
     let elapsed = finished.signed_duration_since(began);
     let elapsed = elapsed.to_std().unwrap_or_default();
     let elapsed = super::human_readable_duration(elapsed);
 
+    let reused_unchanged_results = context
+        .reused_unchanged_results
+        .load(std::sync::atomic::Ordering::Relaxed);
     let reused_cached_results = context
         .reused_cached_results
         .load(std::sync::atomic::Ordering::Relaxed);
@@ -227,10 +240,14 @@ fn run_crater_and_save_results(args: &CiArgs) -> Result<(), Error> {
         .reused_fontmake_failures
         .load(std::sync::atomic::Ordering::Relaxed);
     log::info!(
-        "completed {n_targets} targets in {elapsed} ({reused_cached_results}/{n_targets} results reused from cache, {reused_fontmake_failures} fontmake failures reused)"
+        "completed {n_targets} targets in {elapsed} ({reused_unchanged_results}/{n_targets} reused without running ttx_diff, {reused_cached_results}/{n_targets} reused after building fontc, {reused_fontmake_failures} fontmake failures reused)"
     );
 
-    let summary = super::ttx_diff_runner::Summary::new(&results);
+    let summary = super::ttx_diff_runner::Summary::new(&results, &accepted);
+    let n_surprises = accepted.surprises(&results).len();
+    if n_surprises > 0 {
+        log::warn!("{n_surprises} accepted failures have changed");
+    }
     // if nothing has changed we still want to report it, but we don't need to
     // write a new big results file; we can reuse the previous one
     let (results_file, reuse_last_result) = match prev_runs.last() {
@@ -252,8 +269,8 @@ fn run_crater_and_save_results(args: &CiArgs) -> Result<(), Error> {
         results_file,
         input_file_sha,
         flavor: args.flavor,
-        instance: args.instance.clone(),
         stats: summary,
+        reused_unchanged_results,
         reused_cached_results,
         reused_fontmake_failures,
     };
@@ -324,7 +341,7 @@ impl ResolvedTargets {
         let mut seen = HashSet::new();
         let empty = Path::new("");
         self.targets.retain(|targ| {
-            targ.build != BuildType::Default || seen.insert(targ.source_path(empty))
+            targ.build() != BuildType::Default || seen.insert(targ.source_path(empty))
         });
     }
 }
@@ -333,6 +350,8 @@ fn make_targets(cache_dir: &Path, repos: &[FontSource]) -> ResolvedTargets {
     // first instantiate every repo in parallel:
     preflight_all_repos(cache_dir, repos);
     let mut result = ResolvedTargets::default();
+    // gftools targets that may build several statics, and so need splitting
+    let mut to_split = Vec::new();
     for repo in repos {
         let config_path = match repo.config_path(cache_dir) {
             Ok(config) => config,
@@ -353,6 +372,8 @@ fn make_targets(cache_dir: &Path, repos: &[FontSource]) -> ResolvedTargets {
                 continue;
             }
         };
+        let raw_config = load_raw_config(&config_path);
+        let has_instances = raw_config.as_ref().is_some_and(config_has_instances);
         let repo_dir = repo.repo_path(Path::new(""));
         // we store a map of repo_dir -> repo URL in sources.json
         result
@@ -386,21 +407,151 @@ fn make_targets(cache_dir: &Path, repos: &[FontSource]) -> ResolvedTargets {
                 continue;
             }
             let default = Target::new(
-                &repo_dir,
+                Path::new(repo.repo_org()).join(repo.repo_name()),
                 repo.git_rev(),
                 config_path,
                 repo.config_is_external(),
                 source,
             );
-            let gftools = should_build_in_gftools_mode(&src_path, &config)
-                .then(|| default.to_gftools_target());
+            if should_build_in_gftools_mode(&src_path, &config) {
+                let gftools = default.to_gftools_target();
+                if has_instances {
+                    result.targets.push(gftools);
+                } else {
+                    to_split.push((gftools, src_path, config.build_variable, raw_config.clone()));
+                }
+            }
             result.targets.push(default);
-            result.targets.extend(gftools);
         }
     }
 
+    let split = to_split
+        .into_par_iter()
+        .flat_map_iter(|(target, src_path, build_variable, raw_config)| {
+            split_static_instances(target, &src_path, build_variable)
+                .into_iter()
+                .map(move |target| (target, raw_config.clone()))
+        })
+        .collect::<Vec<_>>();
+    result.targets.extend(dedupe_static_instances(split));
     result.remove_duplicate_default_targets();
     result
+}
+
+/// The config as YAML, for the keys [`Config`] doesn't have.
+fn load_raw_config(config_path: &Path) -> Option<serde_yaml::Value> {
+    let text = std::fs::read_to_string(config_path).ok()?;
+    serde_yaml::from_str(&text).ok()
+}
+
+/// Whether the config lists `instances:` to cut from its variable fonts.
+///
+/// gftools then builds those instead of the source's own, and can't build
+/// just one of them.
+fn config_has_instances(config: &serde_yaml::Value) -> bool {
+    config.get("instances").is_some()
+}
+
+/// Drop the static instance targets that build the same font as another.
+///
+/// gftools only uses a config's `familyName` to name variable fonts, so
+/// configs that differ only there build the same statics (e.g. Barlow, Barlow
+/// Condensed and Barlow Semi Condensed, which all build every instance of
+/// `Barlow.glyphs`). We keep the first in sorted order, so the choice doesn't
+/// depend on the order of the inputs.
+fn dedupe_static_instances(mut targets: Vec<(Target, Option<serde_yaml::Value>)>) -> Vec<Target> {
+    targets.sort_by(|(a, _), (b, _)| a.cmp(b));
+    let mut seen = HashSet::new();
+    targets
+        .into_iter()
+        .filter_map(|(target, config)| {
+            let key = target.instance().zip(config).map(|(instance, mut config)| {
+                if let Some(config) = config.as_mapping_mut() {
+                    config.remove("familyName");
+                }
+                (
+                    target.source_path(Path::new("")),
+                    instance.to_owned(),
+                    config,
+                )
+            });
+            key.is_none_or(|key| seen.insert(key)).then_some(target)
+        })
+        .collect()
+}
+
+/// If a gftools target builds multiple static instances, split them into separate targets.
+///
+/// ttx_diff compares a single font, so these fail with "gftools produced
+/// multiple outputs" otherwise. A source with one instance keeps its target.
+fn split_static_instances(target: Target, src_path: &Path, build_variable: bool) -> Vec<Target> {
+    // in ttx_diff a fontc panic is just a failure; here it would end the run
+    let instances = std::panic::catch_unwind(|| static_instances(src_path, build_variable))
+        .unwrap_or_else(|_| {
+            log::warn!("panicked reading {}", src_path.display());
+            Vec::new()
+        });
+    if instances.len() > 1 {
+        instances
+            .into_iter()
+            .map(|instance| target.with_instance(instance))
+            .collect()
+    } else {
+        vec![target]
+    }
+}
+
+/// The names of the static fonts gftools builds from this source.
+///
+/// Empty if it builds a variable font, or if we can't tell.
+fn static_instances(src_path: &Path, build_variable: bool) -> Vec<String> {
+    // fontc can't build an unrecognized source either
+    let Ok(input) = fontc::Input::new(src_path) else {
+        return Vec::new();
+    };
+    if build_variable && is_variable(src_path) {
+        return Vec::new();
+    }
+    input.instances().unwrap_or_else(|e| {
+        log::warn!("failed to list instances of {}: '{e}'", src_path.display());
+        Vec::new()
+    })
+}
+
+/// Whether gftools would build a variable font from this source.
+///
+/// This matches gftools' `File.is_variable`. If we can't tell, we say it is.
+fn is_variable(src_path: &Path) -> bool {
+    let result = match src_path.extension().and_then(OsStr::to_str) {
+        Some("designspace") => DesignSpaceDocument::load(src_path)
+            .map(|doc| doc.sources.len() > 1)
+            .map_err(|e| e.to_string()),
+        Some("glyphs") => glyphs_is_variable(src_path),
+        Some("glyphspackage") => glyphs_is_variable(&src_path.join("fontinfo.plist")),
+        // a UFO is a single master
+        _ => Ok(false),
+    };
+    result.unwrap_or_else(|e| {
+        log::warn!("can't tell if {} is variable: '{e}'", src_path.display());
+        true
+    })
+}
+
+// like gftools, read the raw plist: we only need the masters
+fn glyphs_is_variable(fontinfo_path: &Path) -> Result<bool, String> {
+    let text = std::fs::read_to_string(fontinfo_path).map_err(|e| e.to_string())?;
+    let fontinfo = Plist::parse(&text).map_err(|e| e.to_string())?;
+    let n_masters = fontinfo
+        .get("fontMaster")
+        .and_then(Plist::as_array)
+        .map_or(0, <[_]>::len);
+    let has_virtual_master = fontinfo
+        .get("customParameters")
+        .and_then(Plist::as_array)
+        .unwrap_or_default()
+        .iter()
+        .any(|param| param.get("name").and_then(Plist::as_str) == Some("Virtual Master"));
+    Ok(n_masters > 1 || has_virtual_master)
 }
 
 // make sure all repos are fetched and up to date; do this in parallel
@@ -463,9 +614,10 @@ fn copy_file_into_dir(file_path: &Path, dir_path: &Path) -> PathBuf {
 fn compile_crate_or_die(name: &str) -> PathBuf {
     let status = Command::new("cargo")
         .args(["build", "-p", name, "--release"])
-        // prevent fontc from including a git sha in its version in the name table
-        // this lets us skip work when two fontc builds produce identical output
+        // keep the git sha out of fontc's name table and `--vv`, so that
+        // commits that don't change fontc build the same binary
         .env("VERGEN_GIT_DESCRIBE", "VERGEN_IDEMPOTENT_OUTPUT")
+        .env("VERGEN_GIT_SHA", "VERGEN_IDEMPOTENT_OUTPUT")
         .status()
         .expect("failed to run cargo build");
     if !status.success() {
@@ -561,5 +713,57 @@ mod tests {
             }
         }));
         assert!(!same_outcomes(&fontc_failure("oh no"), &fontmake_failure));
+    }
+
+    #[test]
+    fn configs_differing_in_family_name_share_static_instances() {
+        let target = |config: &str, instance: Option<&str>| {
+            let target = Target::new(
+                "org/barlow",
+                "deadbeef",
+                format!("ofl/{config}/config.yaml"),
+                true,
+                "sources/Barlow.glyphs",
+            )
+            .to_gftools_target();
+            match instance {
+                Some(instance) => target.with_instance(instance),
+                None => target,
+            }
+        };
+        let config = |yaml: &str| Some(serde_yaml::from_str(yaml).unwrap());
+        let barlow = "familyName: Barlow\nsources: [sources/Barlow.glyphs]\nbuildVariable: false";
+        let condensed =
+            "buildVariable: false\nsources: [sources/Barlow.glyphs]\nfamilyName: Barlow Condensed";
+        let otf = "sources: [sources/Barlow.glyphs]\nbuildVariable: false\nbuildOTF: true";
+        let targets = vec![
+            (
+                target("barlowcondensed", Some("Barlow Bold")),
+                config(condensed),
+            ),
+            (
+                target("barlowcondensed", Some("Barlow Condensed Bold")),
+                config(condensed),
+            ),
+            (target("barlow", Some("Barlow Bold")), config(barlow)),
+            (target("barlowotf", Some("Barlow Bold")), config(otf)),
+            (target("barlowcondensed", None), config(condensed)),
+            (target("barlow", None), config(barlow)),
+        ];
+
+        let kept = dedupe_static_instances(targets)
+            .iter()
+            .map(|target| target.to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            kept,
+            [
+                "org/barlow/$VIRTUAL/ofl/barlow/config.yaml sources/Barlow.glyphs?deadbeef (gftools)",
+                "org/barlow/$VIRTUAL/ofl/barlow/config.yaml sources/Barlow.glyphs?deadbeef (gftools: Barlow Bold)",
+                "org/barlow/$VIRTUAL/ofl/barlowcondensed/config.yaml sources/Barlow.glyphs?deadbeef (gftools)",
+                "org/barlow/$VIRTUAL/ofl/barlowcondensed/config.yaml sources/Barlow.glyphs?deadbeef (gftools: Barlow Condensed Bold)",
+                "org/barlow/$VIRTUAL/ofl/barlowotf/config.yaml sources/Barlow.glyphs?deadbeef (gftools: Barlow Bold)",
+            ]
+        );
     }
 }

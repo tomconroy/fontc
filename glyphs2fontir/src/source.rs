@@ -1,7 +1,7 @@
 use std::{
     borrow::Cow,
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
-    path::Path,
+    path::{Path, PathBuf},
     sync::Arc,
 };
 
@@ -31,7 +31,7 @@ use fontir::{
 };
 use glyphs_reader::{
     Font, FontMaster, Instance, InstanceType, Layer, Plist,
-    glyphdata::{Category, Subcategory},
+    glyphdata::{Category, GlyphData, Subcategory},
 };
 use indexmap::IndexMap;
 use kurbo::Affine;
@@ -49,8 +49,8 @@ use write_fonts::{
 
 use crate::stat::to_stat_axes;
 use crate::toir::{
-    FontInfo, design_location, to_ir_color, to_ir_contours_and_components, to_ir_features,
-    to_ir_paint,
+    FontInfo, design_location, instance_family_name, instance_full_name, static_instances,
+    to_ir_color, to_ir_contours_and_components, to_ir_features, to_ir_paint,
 };
 
 const UFO2FT_FILTERS: &str = "com.github.googlei18n.ufo2ft.filters";
@@ -75,22 +75,62 @@ impl GlyphsIrSource {
     }
 }
 
-impl Source for GlyphsIrSource {
-    fn new(glyphs_file: &Path) -> Result<Self, Error> {
+impl GlyphsIrSource {
+    /// Load a .glyphs file or .glyphspackage.
+    ///
+    /// Builds the static instance with the given full name, if any, and
+    /// applies the user-provided GlyphData files in `glyph_data` on top of the
+    /// bundled data, later ones taking precedence.
+    ///
+    /// The full name is the instance's family name (else the font's) and its
+    /// name, joined by a space, as glyphsLib names the instances fontmake `-i`
+    /// matches. It must equal exactly one active static instance.
+    ///
+    /// If the source would build a variable font, the instance must be at the
+    /// location of one of its masters, and only that master is built: fontc
+    /// doesn't interpolate static instances. That also builds the static
+    /// fonts of sources whose masters aren't compatible ("bag of statics",
+    /// <https://github.com/googlefonts/fontc/issues/1288>).
+    pub fn new(
+        glyphs_file: &Path,
+        instance: Option<&str>,
+        glyph_data: &[PathBuf],
+    ) -> Result<Self, Error> {
+        let glyph_data = if glyph_data.is_empty() {
+            GlyphData::default()
+        } else {
+            GlyphData::with_override_files(glyph_data).map_err(|e| {
+                BadSource::custom(
+                    glyphs_file.to_path_buf(),
+                    format!("Unable to load glyph data from {glyph_data:?}: {e}"),
+                )
+            })?
+        };
         // We have to read the glyphs file then shred it to figure out if anything changed
-        let font_info = FontInfo::try_from(Font::load(glyphs_file).map_err(|e| {
-            BadSource::custom(
-                glyphs_file.to_path_buf(),
-                format!("Unable to read glyphs file: {e}"),
-            )
-        })?)?;
+        let font_info = FontInfo::new(
+            Font::load_with_glyph_data(glyphs_file, &glyph_data).map_err(|e| {
+                BadSource::custom(
+                    glyphs_file.to_path_buf(),
+                    format!("Unable to read glyphs file: {e}"),
+                )
+            })?,
+            instance,
+        )
+        // FontInfo doesn't know the path; put it on the --instance errors,
+        // keeping their kind (and so the error chain)
+        .map_err(|error| match error {
+            Error::BadSource(error) => BadSource::new(glyphs_file, error.kind).into(),
+            other => other,
+        })?;
 
         Ok(Self {
             font_info: Arc::new(font_info),
             source_path: Some(glyphs_file.into()),
         })
     }
+}
 
+impl Source for GlyphsIrSource {
     fn create_static_metadata_work(&self) -> Result<Box<IrWork>, Error> {
         Ok(Box::new(StaticMetadataWork(self.clone())))
     }
@@ -200,10 +240,31 @@ impl Source for GlyphsIrSource {
         }
         flags
     }
+
+    /// The full names (`"{family} {name}"`) of the active static instances.
+    fn instances(&self) -> Vec<String> {
+        static_instances(&self.font_info.font)
+            .into_iter()
+            .map(|(_, name)| name)
+            .collect()
+    }
+
+    /// The style names of the same instances: an instance's own `name`.
+    fn instance_style_names(&self) -> Vec<String> {
+        let font = &self.font_info.font;
+        static_instances(font)
+            .into_iter()
+            .map(|(index, _)| font.instances[index].name.clone())
+            .collect()
+    }
 }
 
 impl GlyphsIrSource {
-    pub fn new_from_memory(data: &str) -> Result<Self, Error> {
+    /// Load a Glyphs source from memory.
+    ///
+    /// Builds the static instance with the given full name, if any; see
+    /// [`Self::new`] for how it is chosen.
+    pub fn new_from_memory(data: &str, instance: Option<&str>) -> Result<Self, Error> {
         let font = Font::load_from_string(data).map_err(|e| {
             BadSource::custom(
                 "<memory>".to_string(),
@@ -211,7 +272,7 @@ impl GlyphsIrSource {
             )
         })?;
         Ok(Self {
-            font_info: Arc::new(FontInfo::try_from(font)?),
+            font_info: Arc::new(FontInfo::new(font, instance)?),
             source_path: None,
         })
     }
@@ -224,7 +285,7 @@ fn try_name_id(name: &str) -> Option<NameId> {
         "uniqueID" => Some(NameId::UNIQUE_ID),
         // Python appears to *only* use this for CFF topDict construction, not name
         // "postscriptFullName" => Some(NameId::FULL_NAME),
-        "version" => Some(NameId::VERSION_STRING),
+        "versionString" => Some(NameId::VERSION_STRING),
         "postscriptFontName" => Some(NameId::POSTSCRIPT_NAME),
         "trademarks" => Some(NameId::TRADEMARK),
         "manufacturers" => Some(NameId::MANUFACTURER),
@@ -237,11 +298,15 @@ fn try_name_id(name: &str) -> Option<NameId> {
         // ttx_diff suggests python doesn't care about this one
         //"compatibleFullNames" => Some(NameId::COMPATIBLE_FULL_NAME),
         "sampleTexts" => Some(NameId::SAMPLE_TEXT),
+        "WWSSubfamilyName" => Some(NameId::WWS_SUBFAMILY_NAME),
         "WWSFamilyName" => Some(NameId::WWS_FAMILY_NAME),
         "preferredFamilyNames" => Some(NameId::TYPOGRAPHIC_FAMILY_NAME),
         "preferredSubfamilyNames" => Some(NameId::TYPOGRAPHIC_SUBFAMILY_NAME),
         "variationsPostScriptNamePrefix" => Some(NameId::VARIATIONS_POSTSCRIPT_NAME_PREFIX),
         "vendorID" => None, // handled separately
+        // instance style names: styleMapFamilyNames is read by names() for
+        // ID 1 alone, the others have no name record of their own
+        "styleNames" | "styleMapFamilyNames" | "styleMapStyleNames" => None,
         _ => {
             warn!("Unknown 'name' entry {name}");
             None
@@ -257,16 +322,79 @@ fn try_language_id(lang: &str) -> Option<u16> {
     lang_id
 }
 
-fn names(font: &Font, flags: SelectionFlags) -> HashMap<NameKey, String> {
+/// The static export's style, and how it links to a family in ID 1.
+///
+/// Without an export, the default master's name stands in for the instance
+/// name in IDs 1 and 17, as in glyphsLib.
+struct ExportStyle<'a> {
+    /// The instance name: ID 17's fallback and the source of ID 1's suffix
+    style_name: &'a str,
+    /// The export's linkStyle, ID 1's suffix
+    link_style: Option<&'a str>,
+}
+
+impl<'a> ExportStyle<'a> {
+    fn new(font: &'a Font, export: Option<&'a glyphs_reader::Instance>) -> Self {
+        Self {
+            style_name: export.map_or(font.default_master().name.as_str(), |instance| {
+                instance.name.as_str()
+            }),
+            link_style: export
+                .and_then(|instance| instance.link_style.as_deref())
+                .filter(|name| !name.is_empty() && *name != "Regular"),
+        }
+    }
+
+    /// ID 1 for a family name: the family with the link style, else with
+    /// what the flags leave of the style name.
+    fn style_linked_family(&self, family: &str, flags: SelectionFlags) -> String {
+        match self.link_style {
+            Some(link) => format!("{family} {link}"),
+            None => NameBuilder::style_map_family_name(family, self.style_name, flags),
+        }
+    }
+}
+
+/// The name table: the font's default-language names, with those of the
+/// static export (if any) on top, then the localized names of both.
+// TODO(anthrotype): accept the Variable Font Settings being built too.
+fn names(
+    font: &Font,
+    export: Option<&glyphs_reader::Instance>,
+    flags: SelectionFlags,
+) -> HashMap<NameKey, String> {
     let mut builder = NameBuilder::default();
     builder.set_version(font.version_major, font.version_minor);
 
-    for (name, value) in font.default_names() {
+    let export_names = export
+        .into_iter()
+        .flat_map(|instance| instance.default_names());
+    for (name, value) in font.default_names().chain(export_names) {
         if let Some(name_id) = try_name_id(name) {
             builder.add(name_id, value.to_string());
         }
     }
 
+    // An export's property replaces the font's property of the same key in
+    // every language, as in Glyphs 3.5.
+    let localized: Vec<_> = font
+        .localized_names()
+        .filter(|(key, _, _)| !export.is_some_and(|instance| instance.has_property(key)))
+        .chain(
+            export
+                .into_iter()
+                .flat_map(|instance| instance.localized_names()),
+        )
+        .filter(|(_, _, value)| !value.is_empty())
+        .collect();
+    let has_localized = |key: &str| localized.iter().any(|(k, _, _)| *k == key);
+    // Preferred names stand in for the family and style names in IDs 16/17
+    let has_preferred_family = builder.get(NameId::TYPOGRAPHIC_FAMILY_NAME).is_some()
+        || has_localized("preferredFamilyNames");
+    let has_preferred_subfamily = builder.get(NameId::TYPOGRAPHIC_SUBFAMILY_NAME).is_some()
+        || has_localized("preferredSubfamilyNames");
+
+    // ID 2 from the flags, which the export's isBold/isItalic already set
     let subfamily = if flags.contains(SelectionFlags::BOLD | SelectionFlags::ITALIC) {
         "Bold Italic"
     } else if flags.contains(SelectionFlags::BOLD) {
@@ -277,62 +405,121 @@ fn names(font: &Font, flags: SelectionFlags) -> HashMap<NameKey, String> {
         "Regular"
     };
     builder.add(NameId::SUBFAMILY_NAME, subfamily.to_string());
-
+    let export_style = ExportStyle::new(font, export);
+    // The export's styleMapFamilyName parameter (property in Glyphs 3) is the
+    // style-linked family as written, ahead of the one its linkStyle builds:
+    // glyphsLib applies the parameter after build_stylemap_names, and Glyphs
+    // 3.5 agrees.
+    let style_map_family = export
+        .and_then(|instance| instance.get_default_name("styleMapFamilyNames"))
+        .filter(|name| !name.is_empty());
     let original_family = builder
         .get(NameId::FAMILY_NAME)
         .map(|s| s.to_string())
         .unwrap_or_default();
-    let family =
-        NameBuilder::style_map_family_name(&original_family, &font.default_master().name, flags);
-    builder.add(NameId::FAMILY_NAME, family.clone());
-
-    if let Some(typographic_family) = &builder
-        .get(NameId::TYPOGRAPHIC_FAMILY_NAME)
-        .or(Some(&original_family))
-    {
-        builder.add(
-            NameId::TYPOGRAPHIC_FAMILY_NAME,
-            typographic_family.to_string(),
-        );
+    builder.add(
+        NameId::FAMILY_NAME,
+        style_map_family.map_or_else(
+            || export_style.style_linked_family(&original_family, flags),
+            str::to_string,
+        ),
+    );
+    // IDs 4, 6, 16 and 17 keep the family and style names
+    if builder.get(NameId::TYPOGRAPHIC_FAMILY_NAME).is_none() {
+        builder.add(NameId::TYPOGRAPHIC_FAMILY_NAME, original_family);
     }
-
-    if let Some(typographic_subfamily) = &builder
-        .get(NameId::TYPOGRAPHIC_SUBFAMILY_NAME)
-        .or(Some(&font.default_master().name))
-    {
+    if builder.get(NameId::TYPOGRAPHIC_SUBFAMILY_NAME).is_none() {
         builder.add(
             NameId::TYPOGRAPHIC_SUBFAMILY_NAME,
-            typographic_subfamily.to_string(),
+            export_style.style_name.to_string(),
         );
     }
 
-    let vendor = font.vendor_id().unwrap_or(DEFAULT_VENDOR_ID);
-    let mut names = builder.build(vendor);
+    if let Some(instance) = export {
+        if let Some(ps) = instance.postscript_name() {
+            builder.add(NameId::POSTSCRIPT_NAME, ps.to_string());
+        }
+        if instance.get_default_name("versionString").is_none()
+            && let Some(version) = &instance.custom_parameters.version_string
+        {
+            builder.add(NameId::VERSION_STRING, version.clone());
+        }
+    }
 
-    for (key, lang, value) in font.localized_names() {
-        let Some(name_id) = try_name_id(key) else {
-            continue;
-        };
+    let vendor = export
+        .and_then(|instance| instance.custom_parameters.vendor_id.as_deref())
+        .or(font.vendor_id())
+        .unwrap_or(DEFAULT_VENDOR_ID);
 
+    // The builder drops the typographic pair when it matches IDs 1 and 2
+    let keep_typographic = builder.get(NameId::FAMILY_NAME)
+        != builder.get(NameId::TYPOGRAPHIC_FAMILY_NAME)
+        || builder.get(NameId::SUBFAMILY_NAME) != builder.get(NameId::TYPOGRAPHIC_SUBFAMILY_NAME);
+
+    // For an export, family and style names feed IDs 1, 16 and 17 per language
+    // as above: ID 1 takes the style map family, else the family with the
+    // default-language style suffix (Glyphs 3.5 does the same); 16 and 17
+    // take the family and style names unless preferred names stand in for
+    // them, or the typographic pair is dropped (Glyphs keeps the pair whatever
+    // its value). The other keys feed their own name ID. Glyphs also copies
+    // the default-language value of IDs 2 and 4 under each family language;
+    // that is left out.
+    for (key, lang, value) in localized {
         let Some(lang_id) = try_language_id(lang) else {
             continue;
         };
-
-        let name_key = NameKey::new_with_lang(name_id, value, lang_id);
-        names.insert(name_key, value.to_string());
+        let record = match (key, export.is_some()) {
+            ("familyNames", true) => {
+                // A style map family, in any language, stands in for the
+                // family in ID 1
+                if style_map_family.is_none() {
+                    builder.add_record(
+                        NameKey::new_with_lang(NameId::FAMILY_NAME, lang_id),
+                        export_style.style_linked_family(value, flags),
+                    );
+                }
+                (keep_typographic && !has_preferred_family)
+                    .then_some(NameId::TYPOGRAPHIC_FAMILY_NAME)
+            }
+            ("styleNames", true) => (keep_typographic && !has_preferred_subfamily)
+                .then_some(NameId::TYPOGRAPHIC_SUBFAMILY_NAME),
+            ("styleMapFamilyNames", true) => Some(NameId::FAMILY_NAME),
+            (key, _) => try_name_id(key),
+        };
+        if let Some(name_id) = record {
+            builder.add_record(NameKey::new_with_lang(name_id, lang_id), value.to_string());
+        }
     }
 
-    for entry in &font.custom_parameters.name_table_entries {
+    add_name_table_entries(&mut builder, font, export);
+
+    builder.build(vendor)
+}
+
+/// The font's `Name Table Entry` parameters, then the export's, last so
+/// they win over the derived records.
+fn add_name_table_entries(
+    builder: &mut NameBuilder,
+    font: &Font,
+    export: Option<&glyphs_reader::Instance>,
+) {
+    let export_entries = export
+        .into_iter()
+        .flat_map(|instance| &instance.custom_parameters.name_table_entries);
+    for entry in font
+        .custom_parameters
+        .name_table_entries
+        .iter()
+        .chain(export_entries)
+    {
         let key = NameKey {
             name_id: NameId::new(entry.name_id),
             platform_id: entry.platform_id,
             encoding_id: entry.encoding_id,
             lang_id: entry.lang_id,
         };
-        names.insert(key, entry.value.clone());
+        builder.add_record(key, entry.value.clone());
     }
-
-    names
 }
 
 /// A `panose` custom parameter's ten digits, zero-padded and truncated.
@@ -365,9 +552,11 @@ fn to_ir_panose(raw: &[i64]) -> Panose {
 ///
 /// `Replace Feature`/`Prefix` stay on that list *for instances only*: a
 /// master's copies are honored, but only the default master's, because those
-/// rewrite the one feature file fontc compiles (see `FeatureReplacements` in
-/// glyphs-reader). Honoring an instance's would mean rewriting features at the
-/// pin, which needs the same merge machinery we lack for the other masters.
+/// rewrite the one feature file fontc compiles (see
+/// `Font::apply_default_master_feature_replacements` in glyphs-reader). An
+/// instance's are applied only when it is built from the master at its
+/// location (`Font::apply_instance_parameters`), like `Rename`/`Reencode
+/// Glyphs`; at an interpolated pin they are not.
 ///
 /// <https://github.com/googlefonts/glyphsLib/blob/main/Lib/glyphsLib/builder/custom_params.py#L314-L448>
 fn instance_overrides(inst: &Instance) -> InstanceOverrides {
@@ -428,15 +617,25 @@ fn instance_overrides(inst: &Instance) -> InstanceOverrides {
     for (name_id, value) in [
         (
             NameId::TYPOGRAPHIC_FAMILY_NAME,
-            inst.preferred_family_name(),
+            inst.get_default_name("preferredFamilyNames"),
         ),
         (
             NameId::TYPOGRAPHIC_SUBFAMILY_NAME,
-            inst.preferred_subfamily_name(),
+            inst.get_default_name("preferredSubfamilyNames"),
         ),
-        (NameId::COMPATIBLE_FULL_NAME, inst.compatible_full_name()),
-        (NameId::WWS_FAMILY_NAME, inst.wws_family_name()),
-        (NameId::WWS_SUBFAMILY_NAME, inst.wws_subfamily_name()),
+        // parameter only: glyphsLib registers no Glyphs 3 property for it
+        (
+            NameId::COMPATIBLE_FULL_NAME,
+            params.compatible_full_name.as_deref(),
+        ),
+        (
+            NameId::WWS_FAMILY_NAME,
+            inst.get_default_name("WWSFamilyName"),
+        ),
+        (
+            NameId::WWS_SUBFAMILY_NAME,
+            inst.get_default_name("WWSSubfamilyName"),
+        ),
     ] {
         if let Some(value) = value {
             names.insert(name_id, value.to_string());
@@ -481,7 +680,9 @@ fn instance_overrides(inst: &Instance) -> InstanceOverrides {
         metrics,
         names,
         name_records,
-        postscript_full_name: inst.postscript_full_name().map(str::to_string),
+        postscript_full_name: inst
+            .get_default_name("postscriptFullName")
+            .map(str::to_string),
         // these depend on the font's axes; see `Os2ClassesFromInstances`
         us_weight_class: None,
         us_width_class: None,
@@ -613,14 +814,15 @@ struct Os2ClassesFromInstances {
 }
 
 impl Os2ClassesFromInstances {
-    fn new(font: &Font, axes: &Axes) -> Self {
+    fn new(axes: &Axes) -> Self {
+        // A Glyphs 2 source's classes are its user locations when they map
+        // the axis; one whose mapping couldn't be used is in design units too.
         let in_design_units = |tag: &[u8; 4]| {
-            !font.is_glyphs2()
-                && axes.get(&Tag::new(tag)).is_some_and(|axis| {
-                    axis.converter
-                        .iter()
-                        .all(|(user, design, _)| user.to_f64() == design.to_f64())
-                })
+            axes.get(&Tag::new(tag)).is_some_and(|axis| {
+                axis.converter
+                    .iter()
+                    .all(|(user, design, _)| user.to_f64() == design.to_f64())
+            })
         };
         Self {
             weight: in_design_units(b"wght"),
@@ -631,10 +833,27 @@ impl Os2ClassesFromInstances {
     /// The classes for one instance, to replace those read off its location.
     fn of(self, inst: &Instance) -> (Option<u16>, Option<u16>) {
         (
-            self.weight.then(|| inst.os2_weight_class.unwrap_or(400)),
-            self.width.then(|| inst.os2_width_class.unwrap_or(5)),
+            self.weight.then(|| inst.weight_class.unwrap_or(400)),
+            self.width.then(|| inst.width_class.unwrap_or(5)),
         )
     }
+}
+
+/// The OS/2 `achVendID` for a vendorID, keeping at most its first four bytes.
+///
+/// Glyphs.app and fontmake truncate a longer ID the same way. Name ID 3 is
+/// built from the untruncated string.
+fn vendor_id_tag(vendor_id: &str) -> Result<Tag, Error> {
+    let bytes = vendor_id.as_bytes();
+    let tag =
+        Tag::new_checked(&bytes[..bytes.len().min(4)]).map_err(|cause| Error::InvalidTag {
+            raw_tag: vendor_id.to_owned(),
+            cause,
+        })?;
+    if bytes.len() > 4 {
+        warn!("vendorID '{vendor_id}' is longer than four bytes, truncating to '{tag}'");
+    }
+    Ok(tag)
 }
 
 #[derive(Debug)]
@@ -661,8 +880,9 @@ impl Work<Context, WorkId, Error> for StaticMetadataWork {
             font.get_default_name("familyNames")
                 .unwrap_or("<nameless family>")
         );
+        let export = font_info.export();
         let axes = font_info.axes.clone();
-        let os2_classes = Os2ClassesFromInstances::new(font, &axes);
+        let os2_classes = Os2ClassesFromInstances::new(&axes);
         let named_instances = font
             .instances
             .iter()
@@ -670,16 +890,35 @@ impl Work<Context, WorkId, Error> for StaticMetadataWork {
                 if inst.type_ != InstanceType::Single || !inst.active {
                     return None;
                 }
+                // An instance outside the axes stays here, so that --instance
+                // can still build it; like fontmake, the variable font leaves
+                // it out, see `StaticMetadata::fvar_instances`.
                 let mut overrides = instance_overrides(inst);
                 (overrides.us_weight_class, overrides.us_width_class) = os2_classes.of(inst);
                 // What `--instance` needs and fvar doesn't: what glyphsLib
                 // would call the instance UFO it generated here. Style linking
                 // is flag-driven, never name-driven.
                 // https://github.com/googlefonts/glyphsLib/blob/main/Lib/glyphsLib/builder/instances.py#L114-L152
-                let family_name = inst
-                    .family_name()
-                    .or_else(|| font.get_default_name("familyNames"))
-                    .unwrap_or_default();
+                let family_name = instance_family_name(font, inst);
+                let mut link_flags = SelectionFlags::empty();
+                if inst.is_bold {
+                    link_flags.insert(SelectionFlags::BOLD);
+                }
+                if inst.is_italic {
+                    link_flags.insert(SelectionFlags::ITALIC);
+                }
+                // as for a static export's name ID 1: the styleMapFamilyName
+                // as written, else the family with its style link
+                let style_map_family_name = inst
+                    .get_default_name("styleMapFamilyNames")
+                    .filter(|name| !name.is_empty())
+                    .map_or_else(
+                        || {
+                            ExportStyle::new(font, Some(inst))
+                                .style_linked_family(family_name, link_flags)
+                        },
+                        str::to_string,
+                    );
                 Some(NamedInstance {
                     name: inst.name.clone(),
                     postscript_name: inst.postscript_name().map(str::to_string),
@@ -689,14 +928,14 @@ impl Work<Context, WorkId, Error> for StaticMetadataWork {
                         .map(|nc| nc.to_user(&axes).unwrap())
                         .unwrap(),
                     family_name: Some(family_name.to_string()),
-                    style_map_family_name: Some(inst.style_map_family_name(family_name)),
-                    // an explicit `styleMapStyleName` parameter beats the
-                    // style-linking flags: glyphsLib replays it over the
-                    // descriptor's value after interpolation
+                    // the name `Source::instances` lists it under
+                    full_name: Some(instance_full_name(font, inst)),
+                    style_map_family_name: Some(style_map_family_name),
+                    // an explicit `styleMapStyleName` beats the style-linking
+                    // flags: glyphsLib replays it over the descriptor's value
+                    // after interpolation
                     style_map_style_name: Some(
-                        inst.custom_parameters
-                            .style_map_style_name
-                            .as_deref()
+                        inst.get_default_name("styleMapStyleNames")
                             .map(str::to_string)
                             .unwrap_or_else(|| {
                                 StyleMapStyle::from_flags(inst.is_bold, inst.is_italic)
@@ -751,6 +990,29 @@ impl Work<Context, WorkId, Error> for StaticMetadataWork {
             "Bold" | "Bold Italic" | "Bold Oblique" => SelectionFlags::BOLD,
             _ => SelectionFlags::empty(),
         };
+        if let Some(instance) = export {
+            selection_flags.remove(SelectionFlags::ITALIC | SelectionFlags::BOLD);
+            if instance.is_bold {
+                selection_flags.insert(SelectionFlags::BOLD);
+            }
+            if instance.is_italic {
+                selection_flags.insert(SelectionFlags::ITALIC);
+            }
+            if let Some(value) = instance.custom_parameters.use_typo_metrics {
+                if value {
+                    selection_flags.insert(SelectionFlags::USE_TYPO_METRICS);
+                } else {
+                    selection_flags.remove(SelectionFlags::USE_TYPO_METRICS);
+                }
+            }
+            if let Some(value) = instance.custom_parameters.has_wws_names {
+                if value {
+                    selection_flags.insert(SelectionFlags::WWS);
+                } else {
+                    selection_flags.remove(SelectionFlags::WWS);
+                }
+            }
+        }
         if selection_flags.intersection(SelectionFlags::ITALIC | SelectionFlags::BOLD)
             == SelectionFlags::empty()
         {
@@ -783,11 +1045,13 @@ impl Work<Context, WorkId, Error> for StaticMetadataWork {
             .values()
             .flat_map(|glyph| glyph.layers.iter())
             .any(|layer| layer.vert_width.is_some() || layer.vert_origin.is_some());
-        let build_vertical = has_vhea_params || has_glyph_vertical_attrs;
+        let build_vertical = has_vhea_params
+            || has_glyph_vertical_attrs
+            || export.is_some_and(|instance| has_all_vhea_params(&instance.custom_parameters));
 
-        let dont_use_prod_names = font
-            .custom_parameters
-            .dont_use_production_names
+        let dont_use_prod_names = export
+            .and_then(|instance| instance.custom_parameters.dont_use_production_names)
+            .or(font.custom_parameters.dont_use_production_names)
             .unwrap_or(false);
 
         let postscript_names =
@@ -817,7 +1081,7 @@ impl Work<Context, WorkId, Error> for StaticMetadataWork {
         let variations = make_feature_variations(font_info);
         let mut static_metadata = StaticMetadata::new(
             font.units_per_em,
-            names(font, selection_flags),
+            names(font, export, selection_flags),
             axes.into_inner(),
             named_instances,
             global_locations,
@@ -865,11 +1129,7 @@ impl Work<Context, WorkId, Error> for StaticMetadataWork {
         // treat  empty string or all spaces as equivalent to no value; it means
         // 'null', per the spec
         if let Some(vendor_id) = font.vendor_id().filter(|id| !id.trim().is_empty()) {
-            static_metadata.misc.vendor_id =
-                vendor_id.parse().map_err(|cause| Error::InvalidTag {
-                    raw_tag: vendor_id.to_owned(),
-                    cause,
-                })?;
+            static_metadata.misc.vendor_id = vendor_id_tag(vendor_id)?;
         }
 
         // Default per <https://github.com/googlefonts/glyphsLib/blob/cb8a4a914b0a33431f0a77f474bf57eec2f19bcc/Lib/glyphsLib/builder/custom_params.py#L1117-L1119>
@@ -889,8 +1149,10 @@ impl Work<Context, WorkId, Error> for StaticMetadataWork {
             .map(|bits| bits.iter().copied().collect());
 
         let default_master = font.default_master();
-        let default_instance = font.variable_export_settings(default_master);
-        if let Some(raw_panose) = default_instance
+        // PANOSE and meta also come from the Variable Font Settings named like
+        // the default master, if there's no static export.
+        let export_settings = export.or_else(|| font.variable_export_settings(default_master));
+        if let Some(raw_panose) = export_settings
             .and_then(|di| di.custom_parameters.panose.as_ref())
             .or(default_master.custom_parameters.panose.as_ref())
             .or(font.custom_parameters.panose.as_ref())
@@ -958,7 +1220,7 @@ impl Work<Context, WorkId, Error> for StaticMetadataWork {
             })
             .or(static_metadata.misc.created);
 
-        if let Some(meta_table) = default_instance
+        if let Some(meta_table) = export_settings
             .and_then(|di| di.custom_parameters.meta_table.as_ref())
             .or(default_master.custom_parameters.meta_table.as_ref())
             .or(font.custom_parameters.meta_table.as_ref())
@@ -985,7 +1247,10 @@ impl Work<Context, WorkId, Error> for StaticMetadataWork {
             })
             .collect();
 
-        if let Some(gasp) = &font.custom_parameters.gasp_table {
+        if let Some(gasp) = export
+            .and_then(|instance| instance.custom_parameters.gasp_table.as_ref())
+            .or(font.custom_parameters.gasp_table.as_ref())
+        {
             for (max_ppem, behavior) in gasp.iter() {
                 let Ok(range_max_ppem) = (*max_ppem).try_into() else {
                     warn!(
@@ -1004,6 +1269,41 @@ impl Work<Context, WorkId, Error> for StaticMetadataWork {
                     range_max_ppem,
                     range_gasp_behavior,
                 });
+            }
+        }
+
+        if let Some(instance) = export {
+            let cp = &instance.custom_parameters;
+            // Classes remain meaningful after StaticMetadata removes point axes.
+            // Glyphs.app exports the instance's own classes, whatever its
+            // location and the axis mappings; glyphsLib derives them from
+            // the instance's user location.
+            static_metadata.misc.us_weight_class =
+                Some(instance.weight_class.unwrap_or(400).clamp(1, 1000));
+            static_metadata.misc.us_width_class = Some(instance.width_class.unwrap_or(5));
+            static_metadata.misc.fs_type = cp.fs_type.or(static_metadata.misc.fs_type);
+            static_metadata.misc.is_fixed_pitch =
+                cp.is_fixed_pitch.or(static_metadata.misc.is_fixed_pitch);
+            if let Some(bits) = &cp.unicode_range_bits {
+                static_metadata.misc.unicode_range_bits = Some(bits.iter().copied().collect());
+            }
+            if let Some(bits) = &cp.codepage_range_bits {
+                static_metadata.misc.codepage_range_bits = Some(bits.iter().copied().collect());
+            }
+            if let Some(ppem) = cp.lowest_rec_ppem {
+                static_metadata.misc.lowest_rec_ppm = ppem as _;
+            }
+            if let Some(bits) = &cp.head_flags {
+                static_metadata.misc.head_flags = head::Flags::from_bits_truncate(
+                    bits.iter().fold(0u16, |flags, bit| flags | (1 << bit)),
+                );
+            }
+            if let Some(vendor) = cp.vendor_id.as_deref().or(font.vendor_id()) {
+                static_metadata.misc.vendor_id = if vendor.trim().is_empty() {
+                    Tag::new(b"    ")
+                } else {
+                    vendor_id_tag(vendor)?
+                };
             }
         }
 
@@ -1213,12 +1513,10 @@ fn nbox_to_condset(nbox: NBox, axes: &Axes) -> ConditionSet {
     nbox.iter()
         .map(|(tag, (min, max))| {
             let axis = axes.get(&tag).unwrap();
+            let min = min.to_design(&axis.converter);
+            let max = max.to_design(&axis.converter);
 
-            Condition::new(
-                tag,
-                Some(min.to_design(&axis.converter)),
-                Some(max.to_design(&axis.converter)),
-            )
+            Condition::new(tag, Some(min.min(max)), Some(min.max(max)))
         })
         .collect()
 }
@@ -1230,6 +1528,7 @@ fn condset_to_nbox(condset: ConditionSet, axes: &Axes) -> NBox {
             let axis = axes.get(&cond.axis)?;
             let axis_min = axis.min.to_design(&axis.converter);
             let axis_max = axis.max.to_design(&axis.converter);
+            let (axis_min, axis_max) = (axis_min.min(axis_max), axis_min.max(axis_max));
             // we can filter out conditions with no min/max, or when min/max are
             // equal to the axis defaults: these are equivalent and lead to us
             // generating unnecessary conditions (since by default a missing
@@ -1240,17 +1539,9 @@ fn condset_to_nbox(condset: ConditionSet, axes: &Axes) -> NBox {
             if (cond_min, cond_max) == (&axis_min, &axis_max) {
                 return None;
             }
-            Some((
-                cond.axis,
-                (
-                    cond.min
-                        .map(|ds| ds.to_normalized(&axis.converter))
-                        .unwrap_or_else(|| axis.min.to_normalized(&axis.converter)),
-                    cond.max
-                        .map(|ds| ds.to_normalized(&axis.converter))
-                        .unwrap_or_else(|| axis.max.to_normalized(&axis.converter)),
-                ),
-            ))
+            let min = cond_min.to_normalized(&axis.converter);
+            let max = cond_max.to_normalized(&axis.converter);
+            Some((cond.axis, (min.min(max), min.max(max))))
         })
         .collect()
 }
@@ -1300,14 +1591,16 @@ fn get_bracket_info(layer: &Layer, axes: &Axes) -> ConditionSet {
     axes.iter()
         .zip(&layer.attributes.axis_rules)
         .map(|(axis, rule)| {
+            let axis_min = axis.min.to_design(&axis.converter);
+            let axis_max = axis.max.to_design(&axis.converter);
             let min = rule
                 .min
                 .map(DesignCoord::new)
-                .unwrap_or(axis.min.to_design(&axis.converter));
+                .unwrap_or(axis_min.min(axis_max));
             let max = rule
                 .max
                 .map(DesignCoord::new)
-                .unwrap_or(axis.max.to_design(&axis.converter));
+                .unwrap_or(axis_min.max(axis_max));
             Condition::new(axis.tag, min.into(), max.into())
         })
         .collect()
@@ -1451,6 +1744,7 @@ impl Work<Context, WorkId, Error> for GlobalMetricWork {
 
         let static_metadata = context.static_metadata.get();
         let mut metrics = GlobalMetricsBuilder::new();
+        let export_cp = font_info.export().map(|export| &export.custom_parameters);
 
         for master in font.masters.iter() {
             let pos = font_info.locations.get(&master.axes_values).unwrap();
@@ -1469,9 +1763,9 @@ impl Work<Context, WorkId, Error> for GlobalMetricWork {
             metrics.set_if_some(
                 GlobalMetric::Os2WinDescent,
                 pos.clone(),
-                master
-                    .custom_parameters
-                    .win_descent
+                export_cp
+                    .and_then(|cp| cp.win_descent)
+                    .or(master.custom_parameters.win_descent)
                     .or(font.custom_parameters.win_descent)
                     .map(|v| v.abs() as f64),
             );
@@ -1481,9 +1775,9 @@ impl Work<Context, WorkId, Error> for GlobalMetricWork {
                 ($variant:ident, $field_name:ident) => {
                     set_metric!(
                         $variant,
-                        master
-                            .custom_parameters
-                            .$field_name
+                        export_cp
+                            .and_then(|cp| cp.$field_name)
+                            .or(master.custom_parameters.$field_name)
                             .or(font.custom_parameters.$field_name)
                             .map(|v| v as f64)
                     )
@@ -1492,9 +1786,9 @@ impl Work<Context, WorkId, Error> for GlobalMetricWork {
                 ($variant:ident, $field_name:ident, $fallback:literal) => {
                     set_metric!(
                         $variant,
-                        master
-                            .custom_parameters
-                            .$field_name
+                        export_cp
+                            .and_then(|cp| cp.$field_name)
+                            .or(master.custom_parameters.$field_name)
                             .or(font.custom_parameters.$field_name)
                             .or(Some($fallback.into()))
                     )
@@ -1536,9 +1830,9 @@ impl Work<Context, WorkId, Error> for GlobalMetricWork {
             metrics.set(
                 GlobalMetric::VheaAscender,
                 pos.clone(),
-                master
-                    .custom_parameters
-                    .vhea_ascender
+                export_cp
+                    .and_then(|cp| cp.vhea_ascender)
+                    .or(master.custom_parameters.vhea_ascender)
                     .or(font.custom_parameters.vhea_ascender)
                     .map(|v| v as f64)
                     .unwrap_or(font.units_per_em as f64 / 2.0),
@@ -1546,9 +1840,9 @@ impl Work<Context, WorkId, Error> for GlobalMetricWork {
             metrics.set(
                 GlobalMetric::VheaDescender,
                 pos.clone(),
-                master
-                    .custom_parameters
-                    .vhea_descender
+                export_cp
+                    .and_then(|cp| cp.vhea_descender)
+                    .or(master.custom_parameters.vhea_descender)
                     .or(font.custom_parameters.vhea_descender)
                     .map(|v| v as f64)
                     .unwrap_or(-(font.units_per_em as f64 / 2.0)),
@@ -1556,9 +1850,9 @@ impl Work<Context, WorkId, Error> for GlobalMetricWork {
             metrics.set(
                 GlobalMetric::VheaLineGap,
                 pos.clone(),
-                master
-                    .custom_parameters
-                    .vhea_line_gap
+                export_cp
+                    .and_then(|cp| cp.vhea_line_gap)
+                    .or(master.custom_parameters.vhea_line_gap)
                     .or(font.custom_parameters.vhea_line_gap)
                     .map(|v| v as f64)
                     .unwrap_or(font.units_per_em as f64),
@@ -1607,6 +1901,7 @@ impl Work<Context, WorkId, Error> for FeatureWork {
 
         context.features.set(to_ir_features(
             &font.features,
+            self.font_file_path.as_deref().map(Path::to_path_buf),
             self.font_file_path.as_ref().map(|path| {
                 path.canonicalize()
                     .expect("path cannot be canonicalized")
@@ -1708,6 +2003,15 @@ impl Work<Context, WorkId, Error> for KerningLocationsWork {
 }
 
 impl FontInfo {
+    /// The export whose metadata applies on top of the font's: the static
+    /// export, if there is one.
+    // TODO(anthrotype): fall back to the Variable Font Settings being built. Only
+    // PANOSE, meta and the names merged at load time use them so far, and they
+    // pick one in two different ways.
+    fn export(&self) -> Option<&glyphs_reader::Instance> {
+        self.export_index.map(|index| &self.font.instances[index])
+    }
+
     /// The kern-group partition, from the font's per-glyph kern attributes.
     ///
     /// Glyphs kerning groups are per-glyph properties, so unlike UFO sources
@@ -2424,7 +2728,7 @@ fn process_layer(
     let (mut contours, mut components) = match to_ir_contours_and_components(
         glyph.name.clone().into(),
         &instance.shapes,
-        erase_open_corners,
+        erase_open_corners && !instance.open_corners_erased,
     ) {
         Ok(result) => result,
         // fontmake only draws a non-exporting glyph if something uses it as a
@@ -2447,7 +2751,7 @@ fn process_layer(
         }
         for component in components.iter_mut() {
             // left-multiply: apply the component's own transform first, then shift
-            component.transform = shift * component.transform;
+            component.transform = ir::ComponentTransform::Affine(shift * component.affine());
         }
     }
 
@@ -2651,6 +2955,7 @@ impl Work<Context, WorkId, Error> for ColorGlyphsWork {
         }
         let mut graph = ColorGlyphs {
             base_glyphs: IndexMap::with_capacity(self.font_info.color_glyphs.len()),
+            clip_boxes: BTreeMap::new(),
         };
         let palette = self.font_info.font.default_palette();
         for (glyph_name, split_glyph_names) in self.font_info.color_glyphs.iter() {
@@ -2751,7 +3056,7 @@ mod tests {
 
     use ir::{Panose, test_helpers::Round2};
     use kurbo::{Rect, Shape};
-    use write_fonts::types::{NameId, Tag};
+    use write_fonts::types::{Fixed, NameId, Tag};
 
     use crate::source::names;
 
@@ -2802,7 +3107,7 @@ mod tests {
     }
 
     fn context_for(glyphs_file: &Path) -> (impl Source + use<>, Context) {
-        let source = GlyphsIrSource::new(glyphs_file).unwrap();
+        let source = GlyphsIrSource::new(glyphs_file, None, &[]).unwrap();
         (source, Context::new_root(Flags::default()))
     }
 
@@ -2848,6 +3153,22 @@ mod tests {
     }
 
     #[test]
+    fn features_are_named_for_the_glyphs_file() {
+        let glyphs_file = glyphs3_dir().join("WghtVar.glyphs");
+        let (source, context) = context_for(&glyphs_file);
+        let task_context = context.copy_for_work(Access::None, Access::Variant(WorkId::Features));
+        source
+            .create_feature_ir_work()
+            .unwrap()
+            .exec(&task_context)
+            .unwrap();
+        assert_eq!(
+            glyphs_file.display().to_string(),
+            context.features.get().default_source().to_string()
+        );
+    }
+
+    #[test]
     fn static_metadata_ir_multi_axis() {
         // Caused index out of bounds due to transposed master and value indices
         let (source, context) = context_for(&glyphs2_dir().join("BadIndexing.glyphs"));
@@ -2864,6 +3185,298 @@ mod tests {
             .unwrap()
             .exec(&task_context)
             .unwrap();
+    }
+
+    #[test]
+    fn extends_instance_mapping_to_masters() {
+        // The instances' mapping, 400:80 700:200, doesn't reach the master at 30:
+        // its first segment is extended out to it
+        let (_, context) =
+            build_static_metadata(glyphs2_dir().join("InstanceMappingMissesMaster.glyphs"));
+        let static_metadata = context.static_metadata.get();
+        let wght = static_metadata.axes.get(&Tag::new(b"wght")).unwrap();
+        assert_eq!(
+            (wght.min, wght.default, wght.max),
+            (
+                UserCoord::new(275.0),
+                UserCoord::new(400.0),
+                UserCoord::new(700.0)
+            )
+        );
+        assert_eq!(
+            DesignCoord::new(30.0).to_user(&wght.converter),
+            UserCoord::new(275.0)
+        );
+    }
+
+    #[test]
+    fn extends_decreasing_instance_mapping_to_masters() {
+        // The instances' decreasing mapping, 400:80 300:200, doesn't reach the
+        // master at 30: its first segment is extended out to it, and both
+        // instances are kept
+        let (_, context) =
+            build_static_metadata(glyphs2_dir().join("InstanceMappingDecreasing.glyphs"));
+        let static_metadata = context.static_metadata.get();
+        let wght = static_metadata.axes.get(&Tag::new(b"wght")).unwrap();
+        assert_eq!(
+            (wght.min, wght.default, wght.max),
+            (
+                UserCoord::new(300.0),
+                UserCoord::new(400.0),
+                UserCoord::new(441.6666717529297)
+            )
+        );
+        assert_eq!(
+            static_metadata
+                .named_instances
+                .iter()
+                .map(|ni| ni.name.as_str())
+                .collect::<Vec<_>>(),
+            ["Regular", "Light"]
+        );
+    }
+
+    #[test]
+    fn ignores_instance_mapping_not_extendable_to_masters() {
+        // Extending the instances' steep mapping, 400:80 900:100, out to the
+        // master at 200 would go beyond weight 1000, so the axis is unmapped
+        let (_, context) =
+            build_static_metadata(glyphs2_dir().join("InstanceMappingNotExtendable.glyphs"));
+        let static_metadata = context.static_metadata.get();
+        let wght = static_metadata.axes.get(&Tag::new(b"wght")).unwrap();
+        assert_eq!(
+            (wght.min, wght.default, wght.max),
+            (
+                UserCoord::new(80.0),
+                UserCoord::new(80.0),
+                UserCoord::new(200.0)
+            )
+        );
+        // unmapped: the Black instance, at design 100, is at user 100 not 900
+        assert_eq!(
+            DesignCoord::new(100.0).to_user(&wght.converter),
+            UserCoord::new(100.0)
+        );
+    }
+
+    #[test]
+    fn instance_mapping_beyond_masters() {
+        // The instances' mapping, 300:30 400:80 600:150 900:250, goes beyond the
+        // masters at 80 and 200: the axis only spans them, the Bold master gets
+        // the user location it interpolates to, and Light and Black are left out
+        let (_, context) =
+            build_static_metadata(glyphs2_dir().join("InstanceMappingBeyondMasters.glyphs"));
+        let static_metadata = context.static_metadata.get();
+        let wght = static_metadata.axes.get(&Tag::new(b"wght")).unwrap();
+        assert_eq!(
+            (wght.min, wght.default, wght.max),
+            (
+                UserCoord::new(400.0),
+                UserCoord::new(400.0),
+                UserCoord::new(750.0)
+            )
+        );
+        assert_eq!(
+            DesignCoord::new(150.0).to_user(&wght.converter),
+            UserCoord::new(600.0)
+        );
+        assert_eq!(
+            static_metadata
+                // what the variable font keeps; --instance can still build the rest
+                .fvar_instances()
+                .map(|ni| ni.name.as_str())
+                .collect::<Vec<_>>(),
+            ["Regular", "SemiBold"]
+        );
+    }
+
+    #[test]
+    fn axis_location_beyond_masters() {
+        // The Black instance's Axis Location, 900 at design 250, goes beyond the
+        // masters at 400:80 and 700:200: the axis only spans them, and Black is
+        // left out
+        let (_, context) =
+            build_static_metadata(glyphs2_dir().join("AxisLocationBeyondMasters.glyphs"));
+        let static_metadata = context.static_metadata.get();
+        let wght = static_metadata.axes.get(&Tag::new(b"wght")).unwrap();
+        assert_eq!(
+            wght.converter
+                .iter()
+                .map(|(user, design, _)| (user, design))
+                .collect::<Vec<_>>(),
+            [
+                (UserCoord::new(400.0), DesignCoord::new(80.0)),
+                (UserCoord::new(700.0), DesignCoord::new(200.0))
+            ]
+        );
+        assert_eq!(
+            static_metadata
+                // what the variable font keeps; --instance can still build the rest
+                .fvar_instances()
+                .map(|ni| ni.name.as_str())
+                .collect::<Vec<_>>(),
+            ["Regular", "Bold"]
+        );
+    }
+
+    #[test]
+    fn axis_location_overrides_master() {
+        // The Black instance's Axis Location, 700 at design 250, overrides the
+        // Bold master's 700 at 200 and goes beyond the masters: the axis only
+        // spans them, and the Bold master gets the user location it
+        // interpolates to
+        let (_, context) =
+            build_static_metadata(glyphs2_dir().join("AxisLocationOverridesMaster.glyphs"));
+        let static_metadata = context.static_metadata.get();
+        let wght = static_metadata.axes.get(&Tag::new(b"wght")).unwrap();
+        assert_eq!(
+            wght.converter
+                .iter()
+                .map(|(user, design, _)| (user, design))
+                .collect::<Vec<_>>(),
+            [
+                (UserCoord::new(400.0), DesignCoord::new(80.0)),
+                (UserCoord::new(611.7647094726562), DesignCoord::new(200.0))
+            ]
+        );
+        assert_eq!(
+            static_metadata
+                // what the variable font keeps; --instance can still build the rest
+                .fvar_instances()
+                .map(|ni| ni.name.as_str())
+                .collect::<Vec<_>>(),
+            ["Regular", "Bold"]
+        );
+    }
+
+    #[test]
+    fn axis_location_non_monotonic() {
+        // Like Barlow: the Semi Condensed instance's Axis Location, 85 at design
+        // 400, makes the mapping 85:400 300:300 500:500. The axis is 85..500, like
+        // in glyphsLib, and the Condensed instance at design 300 stays on it even
+        // though the axis min maps to design 400
+        let (_, context) =
+            build_static_metadata(glyphs2_dir().join("AxisLocationNonMonotonic.glyphs"));
+        let static_metadata = context.static_metadata.get();
+        let wdth = static_metadata.axes.get(&Tag::new(b"wdth")).unwrap();
+        assert_eq!(
+            (wdth.min, wdth.default, wdth.max),
+            (
+                UserCoord::new(85.0),
+                UserCoord::new(300.0),
+                UserCoord::new(500.0)
+            )
+        );
+        assert_eq!(
+            static_metadata
+                .named_instances
+                .iter()
+                .map(|ni| ni.name.as_str())
+                .collect::<Vec<_>>(),
+            ["Condensed", "Semi Condensed", "Normal"]
+        );
+    }
+
+    #[test]
+    fn axis_location_ignores_instances_without_it() {
+        // The masters have Axis Location, opsz 16 at design 1 and 36 at 2: the
+        // Display instance at design 2, without one, doesn't add a 2:2 point
+        // that would stretch the axis down to 2
+        let (_, context) =
+            build_static_metadata(glyphs2_dir().join("AxisLocationInstanceWithout.glyphs"));
+        let static_metadata = context.static_metadata.get();
+        let opsz = static_metadata.axes.get(&Tag::new(b"opsz")).unwrap();
+        assert_eq!(
+            opsz.converter
+                .iter()
+                .map(|(user, design, _)| (user, design))
+                .collect::<Vec<_>>(),
+            [
+                (UserCoord::new(16.0), DesignCoord::new(1.0)),
+                (UserCoord::new(36.0), DesignCoord::new(2.0))
+            ]
+        );
+        assert_eq!(
+            (opsz.min, opsz.max),
+            (UserCoord::new(16.0), UserCoord::new(36.0))
+        );
+    }
+
+    #[test]
+    fn axis_mappings_beyond_masters() {
+        // An explicit Axis Mappings, 300:30 400:80 700:200 900:250, defines the
+        // axis beyond the masters at 80 and 200: Light and Black are kept
+        let (_, context) =
+            build_static_metadata(glyphs2_dir().join("AxisMappingsBeyondMasters.glyphs"));
+        let static_metadata = context.static_metadata.get();
+        let wght = static_metadata.axes.get(&Tag::new(b"wght")).unwrap();
+        assert_eq!(
+            (wght.min, wght.default, wght.max),
+            (
+                UserCoord::new(300.0),
+                UserCoord::new(400.0),
+                UserCoord::new(900.0)
+            )
+        );
+        assert_eq!(
+            static_metadata
+                .named_instances
+                .iter()
+                .map(|ni| ni.name.as_str())
+                .collect::<Vec<_>>(),
+            ["Light", "Regular", "Bold", "Black"]
+        );
+    }
+
+    #[test]
+    fn interpolates_default_master_between_instances() {
+        // No instance is at the default master, at 80 between Book (400:70) and
+        // Medium (500:100): it maps to the interpolated user location
+        let (_, context) = build_static_metadata(
+            glyphs2_dir().join("InstanceMappingDefaultBetweenInstances.glyphs"),
+        );
+        let static_metadata = context.static_metadata.get();
+        let wght = static_metadata.axes.get(&Tag::new(b"wght")).unwrap();
+        let default = Fixed::from_f64(400.0 + 100.0 / 3.0).to_f64();
+        assert_eq!(
+            (wght.min, wght.default, wght.max),
+            (
+                UserCoord::new(300.0),
+                UserCoord::new(default),
+                UserCoord::new(700.0)
+            )
+        );
+        assert_eq!(
+            DesignCoord::new(80.0).to_user(&wght.converter),
+            UserCoord::new(default)
+        );
+    }
+
+    #[test]
+    fn default_master_overrides_stray_instance_mapping() {
+        // A stray last Regular instance at 200 redefines user 400 from 400 to
+        // 200; the default master at 400 interpolates to user 400 between Light
+        // (300:300) and ExtraBold (800:800), and takes it back like glyphsLib,
+        // so the axis is unmapped
+        let (_, context) =
+            build_static_metadata(glyphs2_dir().join("InstanceMappingStrayDefault.glyphs"));
+        let static_metadata = context.static_metadata.get();
+        let wght = static_metadata.axes.get(&Tag::new(b"wght")).unwrap();
+        assert_eq!(
+            (wght.min, wght.default, wght.max),
+            (
+                UserCoord::new(200.0),
+                UserCoord::new(400.0),
+                UserCoord::new(800.0)
+            )
+        );
+        assert_eq!(
+            wght.converter
+                .iter()
+                .map(|(user, design, _)| (user, design))
+                .collect::<Vec<_>>(),
+            [200.0, 400.0, 800.0].map(|v| (UserCoord::new(v), DesignCoord::new(v)))
+        );
     }
 
     #[test]
@@ -2974,8 +3587,12 @@ mod tests {
     }
 
     fn build_static_metadata(glyphs_file: PathBuf) -> (impl Source, Context) {
-        let _ = tracing_subscriber::fmt().with_test_writer().try_init();
         let (source, context) = context_for(&glyphs_file);
+        build_static_metadata_from(source, context)
+    }
+
+    fn build_static_metadata_from<S: Source>(source: S, context: Context) -> (S, Context) {
+        let _ = tracing_subscriber::fmt().with_test_writer().try_init();
         let task_context = context.copy_for_work(
             Access::None,
             AccessBuilder::new()
@@ -2994,6 +3611,10 @@ mod tests {
 
     fn build_global_metrics(glyphs_file: PathBuf) -> (impl Source, Context) {
         let (source, context) = build_static_metadata(glyphs_file);
+        build_global_metrics_from(source, context)
+    }
+
+    fn build_global_metrics_from<S: Source>(source: S, context: Context) -> (S, Context) {
         let task_context = context.copy_for_work(
             Access::Variant(WorkId::StaticMetadata),
             Access::Variant(WorkId::GlobalMetrics),
@@ -3045,6 +3666,15 @@ mod tests {
         }
 
         (source, context)
+    }
+
+    /// Build the glyph IR of `source`, with what it needs.
+    fn build_glyphs_from(source: GlyphsIrSource) -> Context {
+        let (source, context) =
+            build_static_metadata_from(source, Context::new_root(Flags::default()));
+        let (source, context) = build_global_metrics_from(source, context);
+        build_glyphs(&source, &context).unwrap();
+        context
     }
 
     fn build_glyphs(source: &impl Source, context: &Context) -> Result<(), Error> {
@@ -3316,71 +3946,68 @@ mod tests {
     fn the_best_names() -> Vec<(NameKey, String)> {
         vec![
             (
-                NameKey::new_bmp_only(NameId::COPYRIGHT_NOTICE),
+                NameKey::new(NameId::COPYRIGHT_NOTICE),
                 String::from("Copy!"),
             ),
             (
-                NameKey::new_bmp_only(NameId::FAMILY_NAME),
+                NameKey::new(NameId::FAMILY_NAME),
                 String::from("FamilyName"),
             ),
+            (NameKey::new(NameId::SUBFAMILY_NAME), String::from("Bold")),
             (
-                NameKey::new_bmp_only(NameId::SUBFAMILY_NAME),
-                String::from("Bold"),
-            ),
-            (
-                NameKey::new_bmp_only(NameId::UNIQUE_ID),
+                NameKey::new(NameId::UNIQUE_ID),
                 String::from("We are all unique"),
             ),
             (
-                NameKey::new_bmp_only(NameId::FULL_NAME),
+                NameKey::new(NameId::FULL_NAME),
                 String::from("FamilyName Bold"),
             ),
             (
-                NameKey::new_bmp_only(NameId::VERSION_STRING),
+                NameKey::new(NameId::VERSION_STRING),
                 String::from("New Value"),
             ),
             (
-                NameKey::new_bmp_only(NameId::POSTSCRIPT_NAME),
+                NameKey::new(NameId::POSTSCRIPT_NAME),
                 String::from("Postscript Name"),
             ),
             (
-                NameKey::new_bmp_only(NameId::TRADEMARK),
+                NameKey::new(NameId::TRADEMARK),
                 String::from("A trade in marks"),
             ),
             (
-                NameKey::new_bmp_only(NameId::MANUFACTURER),
+                NameKey::new(NameId::MANUFACTURER),
                 String::from("Who made you?!"),
             ),
             (
-                NameKey::new_bmp_only(NameId::DESIGNER),
+                NameKey::new(NameId::DESIGNER),
                 String::from("Designed by me!"),
             ),
             (
-                NameKey::new_bmp_only(NameId::DESCRIPTION),
+                NameKey::new(NameId::DESCRIPTION),
                 String::from("The greatest weight var"),
             ),
             (
-                NameKey::new_bmp_only(NameId::VENDOR_URL),
+                NameKey::new(NameId::VENDOR_URL),
                 String::from("https://example.com/manufacturer"),
             ),
             (
-                NameKey::new_bmp_only(NameId::DESIGNER_URL),
+                NameKey::new(NameId::DESIGNER_URL),
                 String::from("https://example.com/designer"),
             ),
             (
-                NameKey::new_bmp_only(NameId::LICENSE_DESCRIPTION),
+                NameKey::new(NameId::LICENSE_DESCRIPTION),
                 String::from("Licensed to thrill"),
             ),
             (
-                NameKey::new_bmp_only(NameId::LICENSE_URL),
+                NameKey::new(NameId::LICENSE_URL),
                 String::from("https://example.com/my/font/license"),
             ),
             (
-                NameKey::new_bmp_only(NameId::SAMPLE_TEXT),
+                NameKey::new(NameId::SAMPLE_TEXT),
                 String::from("Sam pull text"),
             ),
             (
-                NameKey::new_bmp_only(NameId::WWS_FAMILY_NAME),
+                NameKey::new(NameId::WWS_FAMILY_NAME),
                 String::from("We Will Slant you"),
             ),
         ]
@@ -3395,7 +4022,9 @@ mod tests {
     #[test]
     fn name_table() {
         let font = Font::load(&glyphs3_dir().join("TheBestNames.glyphs")).unwrap();
-        let mut names: Vec<_> = names(&font, SelectionFlags::BOLD).into_iter().collect();
+        let mut names: Vec<_> = names(&font, None, SelectionFlags::BOLD)
+            .into_iter()
+            .collect();
         names.sort_by_key(|(id, v)| (id.name_id, v.clone()));
         // typographic family name == family name and should NOT be present
         assert_eq!(the_best_names(), names);
@@ -3404,42 +4033,44 @@ mod tests {
     #[test]
     fn name_table_with_basic_names_light_origin() {
         let font = Font::load(&glyphs3_dir().join("LightOriginNames.glyphs")).unwrap();
-        let mut names: Vec<_> = names(&font, SelectionFlags::REGULAR).into_iter().collect();
+        let mut names: Vec<_> = names(&font, None, SelectionFlags::REGULAR)
+            .into_iter()
+            .collect();
         names.sort_by_key(|(id, v)| (id.name_id, v.clone()));
 
         // Expected taken from fontmake output
         assert_eq!(
             vec![
                 (
-                    NameKey::new_bmp_only(NameId::FAMILY_NAME),
+                    NameKey::new(NameId::FAMILY_NAME),
                     String::from("FamilyName Light"),
                 ),
                 (
-                    NameKey::new_bmp_only(NameId::SUBFAMILY_NAME),
+                    NameKey::new(NameId::SUBFAMILY_NAME),
                     String::from("Regular"),
                 ),
                 (
-                    NameKey::new_bmp_only(NameId::UNIQUE_ID),
-                    String::from("42.042;NONE;FamilyName-Light"),
+                    NameKey::new(NameId::UNIQUE_ID),
+                    String::from("42.042;    ;FamilyName-Light"),
                 ),
                 (
-                    NameKey::new_bmp_only(NameId::FULL_NAME),
+                    NameKey::new(NameId::FULL_NAME),
                     String::from("FamilyName Light"),
                 ),
                 (
-                    NameKey::new_bmp_only(NameId::VERSION_STRING),
+                    NameKey::new(NameId::VERSION_STRING),
                     String::from("Version 42.042"),
                 ),
                 (
-                    NameKey::new_bmp_only(NameId::POSTSCRIPT_NAME),
+                    NameKey::new(NameId::POSTSCRIPT_NAME),
                     String::from("FamilyName-Light"),
                 ),
                 (
-                    NameKey::new_bmp_only(NameId::TYPOGRAPHIC_FAMILY_NAME),
+                    NameKey::new(NameId::TYPOGRAPHIC_FAMILY_NAME),
                     String::from("FamilyName"),
                 ),
                 (
-                    NameKey::new_bmp_only(NameId::TYPOGRAPHIC_SUBFAMILY_NAME),
+                    NameKey::new(NameId::TYPOGRAPHIC_SUBFAMILY_NAME),
                     String::from("Light"),
                 ),
             ],
@@ -3450,31 +4081,30 @@ mod tests {
     #[test]
     fn name_table_with_preferred_names() {
         let font = Font::load(&glyphs3_dir().join("PreferableNames.glyphs")).unwrap();
-        let mut names: Vec<_> = names(&font, SelectionFlags::BOLD).into_iter().collect();
+        let mut names: Vec<_> = names(&font, None, SelectionFlags::BOLD)
+            .into_iter()
+            .collect();
         names.sort_by_key(|(id, v)| (id.name_id, v.clone()));
         // typographic family and subfamily should be present now
         let mut expected_names = the_best_names();
         update_expected_names(
             &mut expected_names,
             vec![
+                (NameKey::new(NameId::FAMILY_NAME), "FamilyName".to_string()),
                 (
-                    NameKey::new_bmp_only(NameId::FAMILY_NAME),
-                    "FamilyName".to_string(),
-                ),
-                (
-                    NameKey::new_bmp_only(NameId::FULL_NAME),
+                    NameKey::new(NameId::FULL_NAME),
                     "Pref Family Name Pref Regular".to_string(),
                 ),
                 (
-                    NameKey::new_bmp_only(NameId::TYPOGRAPHIC_FAMILY_NAME),
+                    NameKey::new(NameId::TYPOGRAPHIC_FAMILY_NAME),
                     "Pref Family Name".to_string(),
                 ),
                 (
-                    NameKey::new_bmp_only(NameId::TYPOGRAPHIC_SUBFAMILY_NAME),
+                    NameKey::new(NameId::TYPOGRAPHIC_SUBFAMILY_NAME),
                     "Pref Regular".to_string(),
                 ),
                 (
-                    NameKey::new_bmp_only(NameId::VARIATIONS_POSTSCRIPT_NAME_PREFIX),
+                    NameKey::new(NameId::VARIATIONS_POSTSCRIPT_NAME_PREFIX),
                     "Name 25?!".to_string(),
                 ),
             ],
@@ -3487,8 +4117,8 @@ mod tests {
     fn family_name_keeps_style_parts_the_flags_do_not_account_for() {
         let font = Font::load(&glyphs3_dir().join("StaticBoldItalic.glyphs")).unwrap();
         let family_name = |flags| {
-            names(&font, flags)
-                .remove(&NameKey::new_bmp_only(NameId::FAMILY_NAME))
+            names(&font, None, flags)
+                .remove(&NameKey::new(NameId::FAMILY_NAME))
                 .unwrap()
         };
         assert_eq!(
@@ -3502,223 +4132,263 @@ mod tests {
     #[test]
     fn name_table_with_localized_properties() {
         let font = Font::load(&glyphs3_dir().join("LocalizedNames.glyphs")).unwrap();
-        let names = names(&font, SelectionFlags::REGULAR);
+        let names = names(&font, None, SelectionFlags::REGULAR);
 
         assert_eq!(
             "Copyright Default",
-            names
-                .get(&NameKey::new_bmp_only(NameId::COPYRIGHT_NOTICE))
-                .unwrap()
+            names.get(&NameKey::new(NameId::COPYRIGHT_NOTICE)).unwrap()
         );
         assert_eq!(
             "Droit d'auteur",
             names
-                .get(&NameKey::new_with_lang(
-                    NameId::COPYRIGHT_NOTICE,
-                    "Droit d'auteur",
-                    0x040C
-                ))
+                .get(&NameKey::new_with_lang(NameId::COPYRIGHT_NOTICE, 0x040C))
                 .unwrap()
         );
         assert_eq!(
             "Urheberrecht",
             names
-                .get(&NameKey::new_with_lang(
-                    NameId::COPYRIGHT_NOTICE,
-                    "Urheberrecht",
-                    0x0407
-                ))
+                .get(&NameKey::new_with_lang(NameId::COPYRIGHT_NOTICE, 0x0407))
                 .unwrap()
         );
 
         assert_eq!(
             "Designer Name",
-            names.get(&NameKey::new_bmp_only(NameId::DESIGNER)).unwrap()
+            names.get(&NameKey::new(NameId::DESIGNER)).unwrap()
         );
         assert_eq!(
             "デザイナー名",
             names
-                .get(&NameKey::new_with_lang(
-                    NameId::DESIGNER,
-                    "デザイナー名",
-                    0x0411
-                ))
+                .get(&NameKey::new_with_lang(NameId::DESIGNER, 0x0411))
                 .unwrap()
         );
 
         // Test manufacturers with duplicate FRA entries - should pick the last occurrence
         assert_eq!(
             "Manufacturer Name",
-            names
-                .get(&NameKey::new_bmp_only(NameId::MANUFACTURER))
-                .unwrap()
+            names.get(&NameKey::new(NameId::MANUFACTURER)).unwrap()
         );
         // Verify that the SECOND FRA value wins (last occurrence after dedup)
         // Note: NameKey doesn't include the value, so we can only verify the correct value exists
         assert_eq!(
             "Fabricant",
             names
-                .get(&NameKey::new_with_lang(
-                    NameId::MANUFACTURER,
-                    "Fabricant",
-                    0x040C
-                ))
+                .get(&NameKey::new_with_lang(NameId::MANUFACTURER, 0x040C))
                 .unwrap()
         );
         assert_eq!(
             "Hersteller",
             names
-                .get(&NameKey::new_with_lang(
-                    NameId::MANUFACTURER,
-                    "Hersteller",
-                    0x0407
-                ))
+                .get(&NameKey::new_with_lang(NameId::MANUFACTURER, 0x0407))
                 .unwrap()
         );
 
         assert_eq!(
             "A test font with localized properties",
-            names
-                .get(&NameKey::new_bmp_only(NameId::DESCRIPTION))
-                .unwrap()
+            names.get(&NameKey::new(NameId::DESCRIPTION)).unwrap()
         );
         assert_eq!(
             "Une police de test avec des propriétés localisées",
             names
-                .get(&NameKey::new_with_lang(
-                    NameId::DESCRIPTION,
-                    "Une police de test avec des propriétés localisées",
-                    0x040C
-                ))
+                .get(&NameKey::new_with_lang(NameId::DESCRIPTION, 0x040C))
                 .unwrap()
         );
         assert_eq!(
             "ローカライズされたプロパティを持つテストフォント",
             names
-                .get(&NameKey::new_with_lang(
-                    NameId::DESCRIPTION,
-                    "ローカライズされたプロパティを持つテストフォント",
-                    0x0411
-                ))
+                .get(&NameKey::new_with_lang(NameId::DESCRIPTION, 0x0411))
                 .unwrap()
         );
 
         assert_eq!(
             "Licensed under the SIL Open Font License",
             names
-                .get(&NameKey::new_bmp_only(NameId::LICENSE_DESCRIPTION))
+                .get(&NameKey::new(NameId::LICENSE_DESCRIPTION))
                 .unwrap()
         );
         assert_eq!(
             "Sous licence SIL Open Font License",
             names
-                .get(&NameKey::new_with_lang(
-                    NameId::LICENSE_DESCRIPTION,
-                    "Sous licence SIL Open Font License",
-                    0x040C
-                ))
+                .get(&NameKey::new_with_lang(NameId::LICENSE_DESCRIPTION, 0x040C))
                 .unwrap()
         );
         assert_eq!(
             "Lizenziert unter der SIL Open Font License",
             names
-                .get(&NameKey::new_with_lang(
-                    NameId::LICENSE_DESCRIPTION,
-                    "Lizenziert unter der SIL Open Font License",
-                    0x0407
-                ))
+                .get(&NameKey::new_with_lang(NameId::LICENSE_DESCRIPTION, 0x0407))
                 .unwrap()
         );
 
         assert_eq!(
             "LocalizedFont is a trademark",
-            names
-                .get(&NameKey::new_bmp_only(NameId::TRADEMARK))
-                .unwrap()
+            names.get(&NameKey::new(NameId::TRADEMARK)).unwrap()
         );
         assert_eq!(
             "LocalizedFont est une marque déposée",
             names
-                .get(&NameKey::new_with_lang(
-                    NameId::TRADEMARK,
-                    "LocalizedFont est une marque déposée",
-                    0x040C
-                ))
+                .get(&NameKey::new_with_lang(NameId::TRADEMARK, 0x040C))
                 .unwrap()
         );
 
         assert_eq!(
             "The quick brown fox",
-            names
-                .get(&NameKey::new_bmp_only(NameId::SAMPLE_TEXT))
-                .unwrap()
+            names.get(&NameKey::new(NameId::SAMPLE_TEXT)).unwrap()
         );
         assert_eq!(
             "Portez ce vieux whisky",
             names
-                .get(&NameKey::new_with_lang(
-                    NameId::SAMPLE_TEXT,
-                    "Portez ce vieux whisky",
-                    0x040C
-                ))
+                .get(&NameKey::new_with_lang(NameId::SAMPLE_TEXT, 0x040C))
                 .unwrap()
         );
         assert_eq!(
             "Zwölf Boxkämpfer",
             names
-                .get(&NameKey::new_with_lang(
-                    NameId::SAMPLE_TEXT,
-                    "Zwölf Boxkämpfer",
-                    0x0407
-                ))
+                .get(&NameKey::new_with_lang(NameId::SAMPLE_TEXT, 0x0407))
                 .unwrap()
         );
         assert_eq!(
             "いろはにほへと",
             names
-                .get(&NameKey::new_with_lang(
-                    NameId::SAMPLE_TEXT,
-                    "いろはにほへと",
-                    0x0411
-                ))
+                .get(&NameKey::new_with_lang(NameId::SAMPLE_TEXT, 0x0411))
                 .unwrap()
         );
 
         assert_eq!(
             "LocalizedFont",
-            names
-                .get(&NameKey::new_bmp_only(NameId::FAMILY_NAME))
-                .unwrap()
+            names.get(&NameKey::new(NameId::FAMILY_NAME)).unwrap()
         );
         assert_eq!(
             "PoliceLocalisée",
             names
-                .get(&NameKey::new_with_lang(
-                    NameId::FAMILY_NAME,
-                    "PoliceLocalisée",
-                    0x040C
-                ))
+                .get(&NameKey::new_with_lang(NameId::FAMILY_NAME, 0x040C))
                 .unwrap()
         );
         assert_eq!(
             "LokalisierteSchrift",
             names
-                .get(&NameKey::new_with_lang(
-                    NameId::FAMILY_NAME,
-                    "LokalisierteSchrift",
-                    0x0407
-                ))
+                .get(&NameKey::new_with_lang(NameId::FAMILY_NAME, 0x0407))
                 .unwrap()
         );
         assert_eq!(
             "ローカライズフォント",
             names
-                .get(&NameKey::new_with_lang(
-                    NameId::FAMILY_NAME,
-                    "ローカライズフォント",
-                    0x0411
-                ))
+                .get(&NameKey::new_with_lang(NameId::FAMILY_NAME, 0x0411))
                 .unwrap()
+        );
+    }
+
+    // A static export's localized names, checked against Glyphs 3.5: an
+    // export property replaces the font's property of the same key in every
+    // language, family and style names feed IDs 1, 16 and 17 per language
+    // (ID 1 keeps the default-language style suffix), the other keys feed
+    // their own name ID, and a language missing from a key gets no record.
+    #[test]
+    fn static_export_localized_names() {
+        let font = Font::load(&glyphs3_dir().join("StaticExportLocalizedNames.glyphs")).unwrap();
+        let export = font
+            .instances
+            .iter()
+            .find(|instance| instance.name == "Display")
+            .unwrap();
+        let names = names(&font, Some(export), SelectionFlags::REGULAR);
+        let name = |id: NameId, lang: u16| {
+            names
+                .get(&NameKey::new_with_lang(id, lang))
+                .map(|s| s.as_str())
+        };
+        let (en, de, fr, it, ja) = (0x0409, 0x0407, 0x040C, 0x0410, 0x0411);
+        assert_eq!(
+            [
+                name(NameId::FAMILY_NAME, en),
+                name(NameId::FAMILY_NAME, de),
+                name(NameId::FAMILY_NAME, ja),
+                name(NameId::TYPOGRAPHIC_FAMILY_NAME, en),
+                name(NameId::TYPOGRAPHIC_FAMILY_NAME, de),
+                name(NameId::TYPOGRAPHIC_FAMILY_NAME, ja),
+                name(NameId::TYPOGRAPHIC_SUBFAMILY_NAME, en),
+                name(NameId::TYPOGRAPHIC_SUBFAMILY_NAME, de),
+                name(NameId::TYPOGRAPHIC_SUBFAMILY_NAME, ja),
+                name(NameId::DESIGNER, en),
+                name(NameId::DESIGNER, fr),
+                name(NameId::COPYRIGHT_NOTICE, en),
+                name(NameId::COPYRIGHT_NOTICE, it),
+                name(NameId::LICENSE_DESCRIPTION, en),
+                name(NameId::LICENSE_DESCRIPTION, de),
+                name(NameId::SUBFAMILY_NAME, de),
+                name(NameId::FULL_NAME, de),
+            ],
+            [
+                Some("Export Family Display"),
+                Some("Export Familie Display"),
+                Some("エクスポート Display"),
+                Some("Export Family"),
+                Some("Export Familie"),
+                Some("エクスポート"),
+                Some("Display"),
+                Some("Anzeige"),
+                None,
+                Some("Export Designer"),
+                Some("Export Designeur"),
+                Some("Export Copyright"),
+                Some("Copyright esportazione"),
+                Some("License"),
+                Some("Lizenz"),
+                None,
+                None,
+            ]
+        );
+
+        // The Regular instance inherits the font's localized names; its RIBBI
+        // name drops the typographic pair, so only ID 1 is localized
+        let regular = font
+            .instances
+            .iter()
+            .find(|instance| instance.name == "Regular")
+            .unwrap();
+        let regular_names = super::names(&font, Some(regular), SelectionFlags::REGULAR);
+        let name = |id: NameId, lang: u16| {
+            regular_names
+                .get(&NameKey::new_with_lang(id, lang))
+                .map(|s| s.as_str())
+        };
+        assert_eq!(
+            [
+                name(NameId::FAMILY_NAME, en),
+                name(NameId::FAMILY_NAME, de),
+                name(NameId::TYPOGRAPHIC_FAMILY_NAME, en),
+                name(NameId::TYPOGRAPHIC_FAMILY_NAME, de),
+                name(NameId::TYPOGRAPHIC_SUBFAMILY_NAME, de),
+                name(NameId::DESIGNER, fr),
+                name(NameId::LICENSE_DESCRIPTION, de),
+            ],
+            [
+                Some("Master Family"),
+                Some("Master Familie"),
+                None,
+                None,
+                None,
+                Some("Designeur"),
+                Some("Lizenz"),
+            ]
+        );
+    }
+
+    // glyphsLib writes localized names as Windows Unicode BMP records whatever
+    // their content, and so does Glyphs.app; a supplementary-plane character
+    // must not move the record to encoding 10.
+    // https://github.com/googlefonts/glyphsLib/blob/d4939d02/Lib/glyphsLib/builder/font.py#L113-L122
+    #[test]
+    fn localized_name_outside_bmp_keeps_windows_bmp_encoding() {
+        let font = Font::load(&glyphs3_dir().join("LocalizedNames.glyphs")).unwrap();
+        let names = names(&font, None, SelectionFlags::REGULAR);
+        let key = NameKey {
+            name_id: NameId::FAMILY_NAME,
+            platform_id: 3,
+            encoding_id: 1,
+            lang_id: 0x0412,
+        };
+        assert_eq!(
+            Some(&"로컬라이즈드\u{20000}폰트".to_string()),
+            names.get(&key)
         );
     }
 
@@ -3727,8 +4397,8 @@ mod tests {
         let font = Font::load(&glyphs3_dir().join("TheBestNames.glyphs")).unwrap();
         assert_eq!(
             "New Value",
-            names(&font, SelectionFlags::empty())
-                .get(&NameKey::new_bmp_only(NameId::VERSION_STRING))
+            names(&font, None, SelectionFlags::empty())
+                .get(&NameKey::new(NameId::VERSION_STRING))
                 .unwrap()
         );
     }
@@ -3738,8 +4408,8 @@ mod tests {
         let font = Font::load(&glyphs3_dir().join("VersionMajorMinor.glyphs")).unwrap();
         assert_eq!(
             "Version 42.043",
-            names(&font, SelectionFlags::empty())
-                .get(&NameKey::new_bmp_only(NameId::VERSION_STRING))
+            names(&font, None, SelectionFlags::empty())
+                .get(&NameKey::new(NameId::VERSION_STRING))
                 .unwrap()
         );
     }
@@ -3754,8 +4424,8 @@ mod tests {
         let font = Font::load(&glyphs3_dir().join("infinity.glyphs")).unwrap();
         assert_eq!(
             "Version 1.000",
-            names(&font, SelectionFlags::empty())
-                .get(&NameKey::new_bmp_only(NameId::VERSION_STRING))
+            names(&font, None, SelectionFlags::empty())
+                .get(&NameKey::new(NameId::VERSION_STRING))
                 .unwrap()
         );
     }
@@ -3764,15 +4434,15 @@ mod tests {
     fn ignore_empty_name() {
         let font = Font::load(&glyphs3_dir().join("EmptyName.glyphs")).unwrap();
 
-        let names = names(&font, SelectionFlags::empty());
-        assert!(!names.contains_key(&NameKey::new_bmp_only(NameId::TRADEMARK)));
+        let names = names(&font, None, SelectionFlags::empty());
+        assert!(!names.contains_key(&NameKey::new(NameId::TRADEMARK)));
     }
 
     #[test]
     fn reads_name_table_entry_custom_param() {
         let font = Font::load(&glyphs3_dir().join("NameTableEntry.glyphs")).unwrap();
 
-        let names = names(&font, SelectionFlags::empty());
+        let names = names(&font, None, SelectionFlags::empty());
         let key_ch_tw = NameKey {
             name_id: NameId::new(16),
             platform_id: 3,
@@ -4433,7 +5103,7 @@ mod tests {
         let name = |id: NameId| {
             static_metadata
                 .names
-                .get(&NameKey::new_bmp_only(id))
+                .get(&NameKey::new(id))
                 .map(|s| s.as_str())
                 .unwrap_or_default()
         };
@@ -4454,7 +5124,7 @@ mod tests {
             (
                 "An Light",
                 "Italic",
-                "1.000;NONE;An-LightItalic",
+                "1.000;    ;An-LightItalic",
                 "An Light Italic",
                 "An-LightItalic",
                 "An",
@@ -4472,7 +5142,7 @@ mod tests {
         let name = |id: NameId| {
             static_metadata
                 .names
-                .get(&NameKey::new_bmp_only(id))
+                .get(&NameKey::new(id))
                 .map(|s| s.as_str())
                 .unwrap_or_default()
         };
@@ -4494,7 +5164,7 @@ mod tests {
         let name = |id: NameId| {
             static_metadata
                 .names
-                .get(&NameKey::new_bmp_only(id))
+                .get(&NameKey::new(id))
                 .map(|s| s.as_str())
                 .unwrap_or_default()
         };
@@ -4521,7 +5191,7 @@ mod tests {
         let name = |id: NameId| {
             static_metadata
                 .names
-                .get(&NameKey::new_bmp_only(id))
+                .get(&NameKey::new(id))
                 .map(|s| s.as_str())
                 .unwrap_or_default()
         };
@@ -4578,7 +5248,56 @@ mod tests {
     fn invalid_vendor_id_no_crashy() {
         let (_, context) = build_static_metadata(glyphs3_dir().join("InvalidVendorID.glyphs"));
         let static_metadata = context.static_metadata.get();
-        assert_eq!(Tag::new(b"NONE"), static_metadata.misc.vendor_id);
+        assert_eq!(Tag::new(b"    "), static_metadata.misc.vendor_id);
+    }
+
+    #[test]
+    fn vendor_id_tag_truncates_to_four_bytes() {
+        assert_eq!(vendor_id_tag("XMIND").unwrap(), Tag::new(b"XMIN"));
+        assert_eq!(vendor_id_tag("XMINDY").unwrap(), Tag::new(b"XMIN"));
+        assert_eq!(vendor_id_tag("XMI").unwrap(), Tag::new(b"XMI "));
+        assert!(vendor_id_tag(" ABCD").is_err());
+        assert!(vendor_id_tag("XMÏND").is_err());
+    }
+
+    fn vendor_id_and_unique_id(data: &str, instance: Option<&str>) -> (Tag, String) {
+        let source = GlyphsIrSource::new_from_memory(data, instance).unwrap();
+        let (_, context) = build_static_metadata_from(source, Context::new_root(Flags::default()));
+        let static_metadata = context.static_metadata.get();
+        (
+            static_metadata.misc.vendor_id,
+            static_metadata.names[&NameKey::new(NameId::UNIQUE_ID)].clone(),
+        )
+    }
+
+    #[test]
+    fn long_font_vendor_id_truncated() {
+        let data = r#"{
+.formatVersion = 3;
+familyName = Example;
+fontMaster = ({ id = m01; });
+properties = ({ key = vendorID; value = XMIND; });
+unitsPerEm = 1000;
+}"#;
+        assert_eq!(
+            vendor_id_and_unique_id(data, None),
+            (Tag::new(b"XMIN"), "1.000;XMIND;Example-Regular".to_string())
+        );
+    }
+
+    #[test]
+    fn long_instance_vendor_id_truncated() {
+        let data = r#"{
+.formatVersion = 3;
+familyName = Example;
+fontMaster = ({ id = m01; });
+instances = ({ name = Regular; customParameters = ({ name = vendorID; value = XMIND; }); });
+unitsPerEm = 1000;
+}"#;
+        assert_eq!(
+            vendor_id_and_unique_id(data, Some("Example Regular")),
+            (Tag::new(b"XMIN"), "1.000;XMIND;Example-Regular".to_string())
+        );
     }
 
     #[test]
@@ -4953,6 +5672,65 @@ mod tests {
         )
     }
 
+    // A static font is built at one location, where each alternate layer either
+    // applies or doesn't: the one that applies replaces the master layer, and no
+    // bracket glyphs or feature variations are built.
+    #[test]
+    fn static_source_applies_alternate_layers() {
+        // with one master the outlines are the same wherever the instance sits, but
+        // the alternate layer rules are checked at its location: the alternate
+        // applies at the instance (300), not at the master (400)
+        for (instance, width) in [("", 610.0), ("exports = 0;", 500.0)] {
+            let data = format!(
+                r#"{{
+.formatVersion = 3;
+familyName = Example;
+axes = ({{ name = Weight; tag = wght; }});
+fontMaster = ({{ id = m01; axesValues = (400); }});
+glyphs = ({{ glyphname = a; layers = (
+{{ layerId = m01; width = 500; }},
+{{ associatedMasterId = m01; attr = {{ axisRules = ({{ max = 350; }}); }}; layerId = alt; width = 610; }}
+); }});
+instances = ({{ name = Light; axesValues = (300); {instance} }});
+unitsPerEm = 1000;
+}}"#
+            );
+            let source = GlyphsIrSource::new_from_memory(&data, None).unwrap();
+            let glyph = &source.font_info.font.glyphs["a"];
+            assert!(glyph.bracket_layers.is_empty(), "{instance}");
+            assert_eq!(glyph.layers[0].width, width, "{instance}");
+        }
+    }
+
+    // 'b' has 'a' as a component and an alternate of its own. At wght 400 both
+    // a's alternate (min 350) and b's (min 380) apply: Glyphs 3.5 exports 'b'
+    // from its own alternate.
+    #[test]
+    fn static_source_composite_uses_its_own_alternate_layer() {
+        let data = r#"{
+.formatVersion = 3;
+familyName = Example;
+axes = ({ name = Weight; tag = wght; });
+fontMaster = ({ id = m01; axesValues = (400); });
+glyphs = (
+{ glyphname = a; layers = (
+{ layerId = m01; width = 500; },
+{ associatedMasterId = m01; attr = { axisRules = ({ min = 350; }); }; layerId = a1; width = 600; }
+); },
+{ glyphname = b; layers = (
+{ layerId = m01; width = 500; shapes = ({ ref = a; }); },
+{ associatedMasterId = m01; attr = { axisRules = ({ min = 380; }); }; layerId = b1; width = 700; }
+); }
+);
+instances = ({ name = Regular; axesValues = (400); });
+unitsPerEm = 1000;
+}"#;
+        let source = GlyphsIrSource::new_from_memory(data, None).unwrap();
+        let glyphs = &source.font_info.font.glyphs;
+        assert_eq!(glyphs["a"].layers[0].width, 600.0);
+        assert_eq!(glyphs["b"].layers[0].width, 700.0);
+    }
+
     #[test]
     fn glyphs2_delete_default_point_axes() {
         // in old glyphs sources, if the Axes custom parameter is not used, we
@@ -5263,6 +6041,7 @@ name = decomposeTransformedComponents;
 );
 unitsPerEm = 1000;
 }"#,
+            None,
         )
         .unwrap();
         assert!(
@@ -5276,7 +6055,7 @@ unitsPerEm = 1000;
     #[test]
     fn propagate_anchors_governed_by_custom_param_not_filters() {
         let flags = |file: &str| {
-            GlyphsIrSource::new(&glyphs3_dir().join(file))
+            GlyphsIrSource::new(&glyphs3_dir().join(file), None, &[])
                 .unwrap()
                 .compilation_flags()
         };
@@ -5287,8 +6066,9 @@ unitsPerEm = 1000;
     }
 
     fn decompose_components_scope(filter: &str) -> Option<FilterScope> {
-        let source = GlyphsIrSource::new_from_memory(&format!(
-            r#"{{
+        let source = GlyphsIrSource::new_from_memory(
+            &format!(
+                r#"{{
 .appVersion = "3227";
 .formatVersion = 3;
 fontMaster = (
@@ -5308,7 +6088,9 @@ name = flattenComponents;
 );
 unitsPerEm = 1000;
 }}"#
-        ))
+            ),
+            None,
+        )
         .unwrap();
         decompose_components_from_user_data(&source.font_info.font.default_master().user_data)
     }
@@ -5374,6 +6156,750 @@ unitsPerEm = 1000;
     }
 
     #[test]
+    fn static_export_counts_active_single_instances_of_static_sources() {
+        // The export each shape of source picks, if any.
+        for (case, parameters, instances, expected) in [
+            // Nothing to pick: the master is built as before
+            ("no_instances", "", "", None),
+            // Several to pick from: the master is built as before
+            (
+                "several_static_instances",
+                "",
+                "{ name = Regular; axesValues = (100); }, { name = Bold; axesValues = (100); }",
+                None,
+            ),
+            // Disabled instances and Variable Font Settings don't count
+            (
+                "inactive_and_variable_ignored",
+                "",
+                "{ name = Disabled; active = 0; axesValues = (100); }, { name = VF; type = variable; axesValues = (100); }, { name = Regular; axesValues = (100); }",
+                Some(2),
+            ),
+            // A Virtual Master widens the axis derived from the masters, so the
+            // source is variable and its two instances aren't ambiguous
+            (
+                "virtual_master_keeps_it_variable",
+                "customParameters = ({ name = \"Virtual Master\"; value = ({ Axis = Weight; Location = 200; }); });",
+                "{ name = Regular; axesValues = (100); }, { name = Bold; axesValues = (200); }",
+                None,
+            ),
+        ] {
+            let data = format!(
+                "{{ .formatVersion = 3; familyName = Example; axes = ({{ name = Weight; tag = wght; }}); fontMaster = ({{ id = m01; axesValues = (100); }}); unitsPerEm = 1000; {parameters} instances = ({instances}); }}"
+            );
+            let source = GlyphsIrSource::new_from_memory(&data, None)
+                .unwrap_or_else(|error| panic!("{case}: {error}"));
+            assert_eq!(source.font_info.export_index, expected, "{case}");
+        }
+    }
+
+    const MULTIPLE_STATIC_INSTANCES: &str = r#"{
+.formatVersion = 3;
+familyName = Example;
+fontMaster = ({ id = m01; });
+unitsPerEm = 1000;
+instances = (
+{ name = Regular; },
+{ name = Bold; },
+{ name = Regular; properties = ({ key = familyNames; values = ({ language = dflt; value = "Example B1"; }); }); },
+{ name = Black; active = 0; },
+{ name = Light; type = variable; }
+);
+}"#;
+
+    fn select_instance(data: &str, instance: &str) -> Result<GlyphsIrSource, Error> {
+        GlyphsIrSource::new_from_memory(data, Some(instance))
+    }
+
+    fn selected_index(data: &str, instance: &str) -> Option<usize> {
+        select_instance(data, instance)
+            .unwrap_or_else(|error| panic!("{instance}: {error}"))
+            .font_info
+            .export_index
+    }
+
+    #[test]
+    fn instance_selected_by_full_name() {
+        // The family is the instance's familyNames property (a Glyphs 2
+        // familyName parameter becomes one), else the font's.
+        for (name, index) in [
+            ("Example Regular", 0),
+            ("Example Bold", 1),
+            ("Example B1 Regular", 2),
+        ] {
+            assert_eq!(
+                selected_index(MULTIPLE_STATIC_INSTANCES, name),
+                Some(index),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn instances_are_the_active_static_instances() {
+        let expected = ["Example Regular", "Example Bold", "Example B1 Regular"];
+        let source = GlyphsIrSource::new_from_memory(MULTIPLE_STATIC_INSTANCES, None).unwrap();
+        assert_eq!(source.instances(), expected);
+        // selecting one doesn't change what's available
+        assert_eq!(
+            select_instance(MULTIPLE_STATIC_INSTANCES, "Example Bold")
+                .unwrap()
+                .instances(),
+            expected
+        );
+    }
+
+    #[test]
+    fn instance_selection_is_exact() {
+        for name in [
+            "Regular",
+            "Bold",
+            "example bold",
+            "Example Bold ",
+            "Example.*",
+        ] {
+            let message = select_instance(MULTIPLE_STATIC_INSTANCES, name)
+                .err()
+                .unwrap_or_else(|| panic!("{name:?} must not match"))
+                .to_string();
+            // the error lists what could have been selected
+            for candidate in ["Example Regular", "Example Bold", "Example B1 Regular"] {
+                assert!(message.contains(candidate), "{message}");
+            }
+        }
+    }
+
+    #[test]
+    fn instance_selection_skips_inactive_and_variable_instances() {
+        for (name, reason) in [("Example Black", "inactive"), ("Example Light", "variable")] {
+            let message = select_instance(MULTIPLE_STATIC_INSTANCES, name)
+                .err()
+                .unwrap_or_else(|| panic!("{name:?} must not match"))
+                .to_string();
+            assert!(
+                message.contains(name)
+                    && message.contains(reason)
+                    && message.contains("available: \"Example Regular\""),
+                "{message}"
+            );
+        }
+        // an inactive duplicate does not make the active one ambiguous
+        let data = r#"{
+.formatVersion = 3;
+familyName = Example;
+fontMaster = ({ id = m01; });
+unitsPerEm = 1000;
+instances = ({ name = Regular; active = 0; }, { name = Regular; });
+}"#;
+        assert_eq!(selected_index(data, "Example Regular"), Some(1));
+    }
+
+    #[test]
+    fn instance_selection_rejects_duplicate_full_names() {
+        // Two instances can share a full name when one names its family
+        // explicitly; there would be no way to pick either.
+        let data = r#"{
+.formatVersion = 3;
+familyName = Example;
+fontMaster = ({ id = m01; });
+unitsPerEm = 1000;
+instances = (
+{ name = Regular; },
+{ name = Regular; properties = ({ key = familyNames; values = ({ language = dflt; value = Example; }); }); },
+{ name = Bold; }
+);
+}"#;
+        let message = select_instance(data, "Example Regular")
+            .expect_err("duplicate full names must not silently select one")
+            .to_string();
+        assert!(message.contains("Example Regular"), "{message}");
+        // the other instance can still be selected
+        assert_eq!(selected_index(data, "Example Bold"), Some(2));
+    }
+
+    #[test]
+    fn instance_selection_with_one_static_instance() {
+        let data = r#"{
+.formatVersion = 3;
+familyName = Example;
+fontMaster = ({ id = m01; });
+unitsPerEm = 1000;
+instances = ({ name = Bold; });
+}"#;
+        assert_eq!(selected_index(data, "Example Bold"), Some(0));
+        assert!(select_instance(data, "Example Regular").is_err());
+        // no static instances at all
+        let data = data.replace("instances = ({ name = Bold; });", "");
+        assert!(select_instance(&data, "Example Bold").is_err());
+    }
+
+    // As Glyphs documents the parameter, a codepoint moves from any glyph that
+    // has it, an entry can list several and an empty value clears them. As in
+    // Glyphs 3.5 and 4.1.1, a glyph the font doesn't have is skipped and the
+    // first entry for a glyph wins.
+    #[test]
+    fn instance_applies_reencode_glyphs() {
+        let data = r#"{
+.formatVersion = 3;
+familyName = Example;
+fontMaster = ({ id = m01; });
+glyphs = (
+{ glyphname = a; layers = ({ layerId = m01; width = 500; }); unicode = 97; },
+{ glyphname = b; layers = ({ layerId = m01; width = 500; }); unicode = 98; },
+{ glyphname = c; layers = ({ layerId = m01; width = 500; }); unicode = 99; },
+{ glyphname = d; layers = ({ layerId = m01; width = 500; }); unicode = 100; },
+{ glyphname = e; layers = ({ layerId = m01; width = 500; }); unicode = 101; }
+);
+unitsPerEm = 1000;
+instances = (
+{ name = Regular; customParameters = ({ name = "Reencode Glyphs"; value = (
+"a=0062", "c=", "d=E004", "d=E005", "e=E002,E003", "zzz=E001"
+); }); },
+{ name = Bold; }
+);
+}"#;
+        let codepoints = |instance| {
+            let font = &select_instance(data, instance).unwrap().font_info.font;
+            ["a", "b", "c", "d", "e"].map(|name| font.glyphs[name].unicode.clone())
+        };
+        assert_eq!(
+            codepoints("Example Regular"),
+            [
+                vec![0x62],
+                vec![],
+                vec![],
+                vec![0xE004],
+                vec![0xE002, 0xE003]
+            ]
+        );
+        assert_eq!(
+            codepoints("Example Bold"),
+            [vec![97], vec![98], vec![99], vec![100], vec![101]]
+        );
+    }
+
+    // Glyphs swaps the drawings and categories, and keeps the names,
+    // codepoints, export flags and production names. Like glyphsLib, we skip
+    // an entry for a missing glyph and apply the entries in turn, so "c=a"
+    // swaps with the drawing "a" has by then.
+    #[test]
+    fn instance_applies_rename_glyphs() {
+        let data = r#"{
+.formatVersion = 3;
+familyName = Example;
+fontMaster = ({ id = m01; });
+glyphs = (
+{ glyphname = a; layers = ({ layerId = m01; width = 100; anchors = ({ name = top; pos = (50,500); }); }); unicode = 97; },
+{ glyphname = b; export = 0; category = Mark; production = bmark; layers = ({ layerId = m01; width = 200; }); unicode = 98; },
+{ glyphname = c; layers = ({ layerId = m01; width = 300; }); unicode = 99; }
+);
+unitsPerEm = 1000;
+instances = (
+{ name = Regular; customParameters = ({ name = "Rename Glyphs"; value = ("a=b", "c=a", "b=zzz"); }); },
+{ name = Bold; }
+);
+}"#;
+        let glyphs = |instance| {
+            let font = select_instance(data, instance)
+                .unwrap()
+                .font_info
+                .font
+                .clone();
+            ["a", "b", "c"].map(|name| {
+                let glyph = &font.glyphs[name];
+                let layer = &glyph.layers[0];
+                let anchors: Vec<_> = layer.anchors.iter().map(|a| a.name.clone()).collect();
+                let is_mark = glyph.category == Some(Category::Mark);
+                let production_name = glyph.production_name.clone();
+                (
+                    layer.width.0,
+                    anchors,
+                    is_mark,
+                    glyph.unicode.clone(),
+                    glyph.export,
+                    production_name,
+                )
+            })
+        };
+        let top = || vec![SmolStr::new("top")];
+        let bmark = || Some(SmolStr::new("bmark"));
+        assert_eq!(
+            glyphs("Example Regular"),
+            [
+                (300.0, vec![], false, vec![97], true, None),
+                (100.0, top(), false, vec![98], false, bmark()),
+                (200.0, vec![], true, vec![99], true, None),
+            ]
+        );
+        assert_eq!(
+            glyphs("Example Bold"),
+            [
+                (100.0, top(), false, vec![97], true, None),
+                (200.0, vec![], true, vec![98], false, bmark()),
+                (300.0, vec![], false, vec![99], true, None),
+            ]
+        );
+    }
+
+    // The swapped glyphs' components are renamed with them, and other glyphs
+    // keep theirs, as in Glyphs.
+    #[test]
+    fn instance_rename_glyphs_components() {
+        let data = r#"{
+.formatVersion = 3;
+familyName = Example;
+fontMaster = ({ id = m01; });
+glyphs = (
+{ glyphname = a; layers = ({ layerId = m01; width = 500; shapes = ({ closed = 1; nodes = ((0,0,l),(0,100,l),(100,100,l)); }); }); },
+{ glyphname = a.sc; layers = ({ layerId = m01; width = 500; shapes = ({ ref = a; pos = (0,-130); }); }); },
+{ glyphname = x; layers = ({ layerId = m01; width = 500; shapes = ({ ref = a; }); }); },
+{ glyphname = b; layers = ({ layerId = m01; width = 500; }); },
+{ glyphname = b.ss01; layers = ({ layerId = m01; width = 500; }); },
+{ glyphname = bb; layers = ({ layerId = m01; width = 500; shapes = ({ ref = b; }); }); },
+{ glyphname = c; layers = ({ layerId = m01; width = 500; }); }
+);
+unitsPerEm = 1000;
+instances = (
+{ name = Regular; customParameters = ({ name = "Rename Glyphs"; value = ("a.sc=a", "bb=c", "b=b.ss01"); }); }
+);
+}"#;
+        let font = select_instance(data, "Example Regular")
+            .unwrap()
+            .font_info
+            .font
+            .clone();
+        let shapes = |name: &str| {
+            font.glyphs[name].layers[0]
+                .shapes
+                .iter()
+                .map(|shape| match shape {
+                    glyphs_reader::Shape::Path(_) => ("path".into(), Affine::IDENTITY),
+                    glyphs_reader::Shape::Component(c) => (c.name.clone(), c.transform),
+                })
+                .collect::<Vec<(SmolStr, _)>>()
+        };
+        let path = || vec![("path".into(), Affine::IDENTITY)];
+        // "a" has the drawing of "a.sc", whose component follows the swap to
+        // "a.sc", which has the outline: no cycle
+        assert_eq!(
+            shapes("a"),
+            [("a.sc".into(), Affine::translate((0.0, -130.0)))]
+        );
+        assert_eq!(shapes("a.sc"), path());
+        // "x" isn't swapped: it keeps "a", and so shows the drawing from "a.sc"
+        assert_eq!(shapes("x"), [("a".into(), Affine::IDENTITY)]);
+        // "c" has the drawing of "bb", whose component goes through the other swap
+        assert_eq!(shapes("c"), [("b.ss01".into(), Affine::IDENTITY)]);
+        assert_eq!(shapes("bb"), []);
+    }
+
+    // Glyphs moves the kerning groups and kerning exceptions with the drawing.
+    #[test]
+    fn instance_rename_glyphs_kerning() {
+        let data = r#"{
+.formatVersion = 3;
+familyName = Example;
+fontMaster = ({ id = m01; });
+glyphs = (
+{ glyphname = T; kernRight = T; layers = ({ layerId = m01; width = 500; }); },
+{ glyphname = V; layers = ({ layerId = m01; width = 500; }); },
+{ glyphname = a; kernLeft = a; kernRight = a; layers = ({ layerId = m01; width = 500; }); },
+{ glyphname = a.ss01; kernLeft = aalt; kernRight = aalt; layers = ({ layerId = m01; width = 500; }); }
+);
+kerningLTR = { m01 = {
+"@MMK_L_T" = { "@MMK_R_a" = -80; "@MMK_R_aalt" = -20; a = -33; };
+T = { a.ss01 = -55; };
+a.ss01 = { V = -44; };
+}; };
+unitsPerEm = 1000;
+instances = (
+{ name = Regular; customParameters = ({ name = "Rename Glyphs"; value = ("a=a.ss01"); }); }
+);
+}"#;
+        let font = select_instance(data, "Example Regular")
+            .unwrap()
+            .font_info
+            .font
+            .clone();
+        let groups = |name: &str| {
+            let glyph = &font.glyphs[name];
+            (glyph.left_kern.clone(), glyph.right_kern.clone())
+        };
+        assert_eq!(groups("a"), (Some("aalt".into()), Some("aalt".into())));
+        assert_eq!(groups("a.ss01"), (Some("a".into()), Some("a".into())));
+        assert_eq!(groups("T"), (None, Some("T".into())));
+        let expected: BTreeMap<_, _> = [
+            ("@MMK_L_T", "@MMK_R_a", -80.0),
+            ("@MMK_L_T", "@MMK_R_aalt", -20.0),
+            ("@MMK_L_T", "a.ss01", -33.0),
+            ("T", "a", -55.0),
+            ("a", "V", -44.0),
+        ]
+        .into_iter()
+        .map(|(left, right, value)| ((left.into(), right.into()), OrderedFloat(value)))
+        .collect();
+        assert_eq!(font.kerning_ltr.get("m01"), Some(&expected));
+    }
+
+    // Only the first feature with the tag gets the new code, every prefix
+    // with the name does, and a tag or name the font doesn't have is ignored.
+    #[test]
+    fn instance_applies_replace_feature_and_prefix() {
+        let data = r#"{
+.formatVersion = 3;
+familyName = Example;
+fontMaster = ({ id = m01; });
+featurePrefixes = (
+{ name = Lookups; code = "lookup A { sub a by b; } A;"; },
+{ name = Lookups; code = "lookup B { sub b by c; } B;"; }
+);
+features = (
+{ automatic = 1; tag = liga; code = "sub f i by f_i;"; },
+{ tag = liga; code = "sub f l by f_l;"; },
+{ tag = smcp; code = "sub a by a.sc;"; }
+);
+unitsPerEm = 1000;
+instances = (
+{ name = Regular; customParameters = (
+{ name = "Replace Feature"; value = "liga ; sub f f by f_f;"; },
+{ name = "Replace Feature"; value = "smcp;\012sub b by b.sc;\012"; },
+{ name = "Replace Feature"; value = "c2sc; sub B by b.sc;"; },
+{ name = "Replace Prefix"; value = "Lookups; lookup C { sub c by d; } C;"; },
+{ name = "Replace Prefix"; value = "Other; lookup D { sub d by e; } D;"; }
+); },
+{ name = Bold; }
+);
+}"#;
+        let features = |instance| {
+            let font = &select_instance(data, instance).unwrap().font_info.font;
+            font.features
+                .iter()
+                .map(|f| f.content.clone())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            features("Example Regular"),
+            [
+                "# Prefix: Lookups\nlookup C { sub c by d; } C;",
+                "# Prefix: Lookups\nlookup C { sub c by d; } C;",
+                "feature liga {\nsub f f by f_f;\n} liga;",
+                "feature liga {\nsub f l by f_l;\n} liga;",
+                "feature smcp {\nsub b by b.sc;\n} smcp;",
+            ]
+        );
+        assert_eq!(
+            features("Example Bold"),
+            [
+                "# Prefix: Lookups\nlookup A { sub a by b; } A;",
+                "# Prefix: Lookups\nlookup B { sub b by c; } B;",
+                "feature liga {\n# automatic\nsub f i by f_i;\n} liga;",
+                "feature liga {\nsub f l by f_l;\n} liga;",
+                "feature smcp {\nsub a by a.sc;\n} smcp;",
+            ]
+        );
+    }
+
+    #[test]
+    fn instance_selection_on_a_variable_source_builds_its_master() {
+        // fontc can't tell a variable source from a "bag of statics" (#1288):
+        // gftools' buildVariable isn't in the source. An instance on a master
+        // builds that master as a static font; one between masters would need
+        // interpolation.
+        let data = r#"{
+.formatVersion = 3;
+familyName = Example;
+axes = ({ name = Weight; tag = wght; });
+fontMaster = ({ id = m01; axesValues = (400); }, { id = m02; axesValues = (700); });
+unitsPerEm = 1000;
+instances = (
+{ name = Regular; axesValues = (400); },
+{ name = Medium; axesValues = (550); },
+{ name = Bold; axesValues = (700); }
+);
+}"#;
+        let source = select_instance(data, "Example Bold").unwrap();
+        let font_info = &source.font_info;
+        assert_eq!(font_info.export_index, Some(2));
+        assert_eq!(
+            font_info
+                .font
+                .masters
+                .iter()
+                .map(|m| m.id.as_str())
+                .collect::<Vec<_>>(),
+            ["m02"]
+        );
+        assert!(font_info.axes.iter().all(|axis| axis.is_point()));
+
+        let message = select_instance(data, "Example Medium")
+            .expect_err("an instance between masters can't be built from one")
+            .to_string();
+        assert!(message.contains("Example Medium"), "{message}");
+        // without --instance it still builds a variable font
+        let source = GlyphsIrSource::new_from_memory(data, None).unwrap();
+        assert_eq!(source.font_info.export_index, None);
+        assert_eq!(source.font_info.font.masters.len(), 2);
+    }
+
+    fn bag_of_statics(instance: &str) -> Result<GlyphsIrSource, Error> {
+        GlyphsIrSource::new(
+            &glyphs3_dir().join("BagOfStatics.glyphs"),
+            Some(instance),
+            &[],
+        )
+    }
+
+    #[test]
+    fn bag_of_statics_keeps_only_the_instance_master() {
+        // what the reduction keeps is tested with Font::retain_master; here,
+        // that the instance's master is the one kept and the font is static
+        for (instance, index, kept, x_height) in [
+            ("Bag Of Statics Regular", 0, "m01", 500.0),
+            ("Bag Of Statics Bold", 1, "m02", 540.0),
+        ] {
+            let font_info = bag_of_statics(instance)
+                .unwrap_or_else(|error| panic!("{instance}: {error}"))
+                .font_info;
+            let font = &font_info.font;
+            assert_eq!(font_info.export_index, Some(index), "{instance}");
+            assert!(
+                font_info.axes.iter().all(|axis| axis.is_point()),
+                "{instance}"
+            );
+            assert_eq!(
+                font.masters
+                    .iter()
+                    .map(|m| m.id.as_str())
+                    .collect::<Vec<_>>(),
+                [kept],
+                "{instance}"
+            );
+            assert_eq!(font.masters[0].x_height(), Some(x_height), "{instance}");
+        }
+    }
+
+    #[test]
+    fn bag_of_statics_instance_between_masters_is_an_error() {
+        let message = bag_of_statics("Bag Of Statics Medium")
+            .expect_err("incompatible masters can't be interpolated")
+            .to_string();
+        for expected in ["Bag Of Statics Medium", "550", "Regular", "Bold"] {
+            assert!(message.contains(expected), "{expected}: {message}");
+        }
+    }
+
+    #[test]
+    fn bag_of_statics_axis_without_variation_matches_any_instance_location() {
+        // Fuzzy Bubbles: both masters are at width 5, the Regular instance at
+        // 100. Along an axis where the masters don't vary there is nothing to
+        // interpolate, so the instance is built from the master at its weight.
+        // (fontmake builds nothing for such an instance, glyphsLib #1197
+        // notwithstanding.)
+        let font_info = bag_of_statics("Bag Of Statics Regular").unwrap().font_info;
+        assert_eq!(font_info.font.masters[0].id, "m01");
+        // the instance keeps its own location
+        assert_eq!(
+            font_info.font.instances[0].axes_values,
+            [OrderedFloat(400.0), OrderedFloat(100.0)]
+        );
+        // but an axis along which the masters do vary must match exactly
+        let data = r#"{
+.formatVersion = 3;
+familyName = Example;
+axes = ({ name = Weight; tag = wght; }, { name = Width; tag = wdth; });
+fontMaster = ({ id = m01; axesValues = (400, 5); }, { id = m02; axesValues = (700, 10); });
+unitsPerEm = 1000;
+instances = ({ name = Regular; axesValues = (400, 100); }, { name = Bold; axesValues = (700, 10); });
+}"#;
+        assert!(select_instance(data, "Example Regular").is_err());
+        assert_eq!(
+            select_instance(data, "Example Bold")
+                .unwrap()
+                .font_info
+                .font
+                .masters[0]
+                .id,
+            "m02"
+        );
+    }
+
+    #[test]
+    fn bag_of_statics_applies_the_master_alternate_layers() {
+        let data = r#"{
+.formatVersion = 3;
+familyName = Example;
+axes = ({ name = Weight; tag = wght; });
+fontMaster = ({ id = m01; axesValues = (400); }, { id = m02; axesValues = (700); });
+glyphs = ({ glyphname = a; layers = (
+{ layerId = m01; width = 500; },
+{ layerId = m02; width = 600; },
+{ associatedMasterId = m01; attr = { axisRules = ({ min = 300; }); }; layerId = alt01; width = 510; },
+{ associatedMasterId = m02; attr = { axisRules = ({ min = 300; }); }; layerId = alt02; width = 610; }
+); });
+unitsPerEm = 1000;
+instances = ({ name = Regular; axesValues = (400); }, { name = Bold; axesValues = (700); });
+}"#;
+        // each instance gets the alternate layer of its own master
+        for (instance, width) in [("Example Regular", 510.0), ("Example Bold", 610.0)] {
+            let glyph = &select_instance(data, instance)
+                .unwrap()
+                .font_info
+                .font
+                .glyphs["a"];
+            assert!(glyph.bracket_layers.is_empty(), "{instance}");
+            assert_eq!(glyph.layers.len(), 1, "{instance}");
+            assert_eq!(glyph.layers[0].width, width, "{instance}");
+        }
+    }
+
+    // An alternate layer sits at its master's location: at Bold, where the rule
+    // applies, Glyphs 3.5 exports Bold's master layer, not Regular's alternate.
+    #[test]
+    fn bag_of_statics_ignores_the_alternate_layers_of_other_masters() {
+        let data = r#"{
+.formatVersion = 3;
+familyName = Example;
+axes = ({ name = Weight; tag = wght; });
+fontMaster = ({ id = m01; axesValues = (400); }, { id = m02; axesValues = (700); });
+glyphs = ({ glyphname = a; layers = (
+{ layerId = m01; width = 500; },
+{ layerId = m02; width = 600; },
+{ associatedMasterId = m01; attr = { axisRules = ({ min = 600; }); }; layerId = alt01; width = 511; }
+); });
+unitsPerEm = 1000;
+instances = ({ name = Regular; axesValues = (400); }, { name = Bold; axesValues = (700); });
+}"#;
+        let glyph = &select_instance(data, "Example Bold")
+            .unwrap()
+            .font_info
+            .font
+            .glyphs["a"];
+        assert!(glyph.bracket_layers.is_empty());
+        assert_eq!(glyph.layers.len(), 1);
+        assert_eq!(glyph.layers[0].width, 600.0);
+    }
+
+    // Alternate layers apply at the instance's own location, also on an axis
+    // the masters don't vary along: Glyphs 3.5 exports Regular (width 100,
+    // masters at 5) with the alternate for width 50 and up.
+    #[test]
+    fn bag_of_statics_alternate_layers_apply_at_the_instance_location() {
+        let data = r#"{
+.formatVersion = 3;
+familyName = Example;
+axes = ({ name = Weight; tag = wght; }, { name = Width; tag = wdth; });
+fontMaster = ({ id = m01; axesValues = (400, 5); }, { id = m02; axesValues = (700, 5); });
+glyphs = ({ glyphname = a; layers = (
+{ layerId = m01; width = 500; },
+{ layerId = m02; width = 600; },
+{ associatedMasterId = m01; attr = { axisRules = ({}, { min = 50; }); }; layerId = alt01; width = 777; }
+); });
+unitsPerEm = 1000;
+instances = ({ name = Regular; axesValues = (400, 100); }, { name = Bold; axesValues = (700, 5); });
+}"#;
+        let glyph = &select_instance(data, "Example Regular")
+            .unwrap()
+            .font_info
+            .font
+            .glyphs["a"];
+        assert_eq!(glyph.layers[0].width, 777.0);
+    }
+
+    #[test]
+    fn bag_of_statics_drops_virtual_masters() {
+        let data = r#"{
+.formatVersion = 3;
+familyName = Example;
+axes = ({ name = Weight; tag = wght; }, { name = Optical; tag = opsz; });
+customParameters = ({ name = "Virtual Master"; value = ({ Axis = Weight; Location = 400; }, { Axis = Optical; Location = 72; }); });
+fontMaster = ({ id = m01; axesValues = (400, 12); }, { id = m02; axesValues = (700, 12); });
+unitsPerEm = 1000;
+instances = ({ name = Regular; axesValues = (400, 12); }, { name = Display; axesValues = (400, 72); });
+}"#;
+        let font_info = select_instance(data, "Example Regular").unwrap().font_info;
+        assert!(font_info.font.virtual_masters.is_empty());
+        assert!(font_info.axes.iter().all(|axis| axis.is_point()));
+        // the virtual master makes Optical vary, so it must match exactly
+        assert!(select_instance(data, "Example Display").is_err());
+    }
+
+    // An instance on the only master needs no interpolation, even when a
+    // virtual master's location has no axis mapping (DM Serif Display Italic).
+    #[test]
+    fn instance_on_master_ignores_unmapped_virtual_master() {
+        let data = r#"{
+.formatVersion = 3;
+familyName = Example;
+axes = ({ name = Weight; tag = wght; });
+customParameters = (
+{ name = "Axis Mappings"; value = { wght = { 400 = 723; }; }; },
+{ name = "Virtual Master"; value = ({ Axis = Weight; Location = 150; }); }
+);
+fontMaster = ({ id = m01; axesValues = (723); });
+unitsPerEm = 1000;
+instances = ({ name = Regular; axesValues = (723); });
+}"#;
+        let font_info = select_instance(data, "Example Regular").unwrap().font_info;
+        assert!(font_info.font.virtual_masters.is_empty());
+        assert!(font_info.axes.iter().all(|axis| axis.is_point()));
+    }
+
+    #[test]
+    fn bag_of_statics_keeps_linked_metrics() {
+        // "Link Metrics With Master" takes the widths and kerning from another
+        // master, which must survive even though that master is dropped.
+        let data = r#"{
+.formatVersion = 3;
+familyName = Example;
+axes = ({ name = Weight; tag = wght; });
+fontMaster = (
+{ id = m01; name = Regular; axesValues = (400); },
+{ id = m02; name = Bold; axesValues = (700); customParameters = ({ name = "Link Metrics With Master"; value = m01; }); }
+);
+glyphs = ({ glyphname = a; layers = ({ layerId = m01; width = 500; }, { layerId = m02; width = 600; }); });
+kerningLTR = { m01 = { a = { a = -10; }; }; };
+unitsPerEm = 1000;
+instances = ({ name = Regular; axesValues = (400); }, { name = Bold; axesValues = (700); });
+}"#;
+        let source = select_instance(data, "Example Bold").unwrap();
+        let font = &source.font_info.font;
+        assert_eq!(
+            font.kerning_ltr
+                .get(font.kerning_source_id("m02"))
+                .and_then(|kerns| kerns.get(&("a".into(), "a".into()))),
+            Some(&OrderedFloat(-10.0))
+        );
+        let context = build_glyphs_from(source);
+        let glyph = context.get_glyph("a");
+        let widths: Vec<_> = glyph.sources().values().map(|i| i.width).collect();
+        assert_eq!(widths, [500.0]);
+    }
+
+    #[test]
+    fn bag_of_statics_glyph_without_a_layer_for_the_master_is_an_error() {
+        let data = r#"{
+.formatVersion = 3;
+familyName = Example;
+axes = ({ name = Weight; tag = wght; });
+fontMaster = ({ id = m01; name = Regular; axesValues = (400); }, { id = m02; name = Bold; axesValues = (700); });
+glyphs = (
+{ glyphname = a; layers = ({ layerId = m01; width = 500; }, { layerId = m02; width = 600; }); },
+{ glyphname = b; layers = ({ layerId = m01; width = 520; }); }
+);
+unitsPerEm = 1000;
+instances = ({ name = Regular; axesValues = (400); }, { name = Bold; axesValues = (700); });
+}"#;
+        assert!(select_instance(data, "Example Regular").is_ok());
+        let message = select_instance(data, "Example Bold")
+            .expect_err("'b' has nothing to build Bold from")
+            .to_string();
+        for expected in ["Example Bold", "\"Bold\"", "'b'"] {
+            assert!(message.contains(expected), "{expected}: {message}");
+        }
+        assert!(!message.contains("'a'"), "{message}");
+    }
+
+    #[test]
     fn reads_feature_writers_from_font_user_data() {
         let _ = tracing_subscriber::fmt().with_test_writer().try_init();
         // NotoMusic-shaped config: curs+kern appended, mark skipped, no Gdef writer.
@@ -5409,6 +6935,7 @@ mode = skip;
 );
 };
 }"#,
+            None,
         )
         .unwrap();
         let context = Context::new_root(Flags::default());
@@ -5436,7 +6963,7 @@ mode = skip;
     }
 
     fn stat_labels_from_glyphs_source(glyphs_file: &Path) -> Vec<fontir::ir::StatAxis> {
-        let source = GlyphsIrSource::new(glyphs_file).unwrap();
+        let source = GlyphsIrSource::new(glyphs_file, None, &[]).unwrap();
         let context = Context::new_root(Flags::default());
         let task_context = context.copy_for_work(
             Access::None,
@@ -5486,7 +7013,7 @@ mode = skip;
 
     fn feature_writers_error_from_glyphs_source(source: &str) -> Error {
         let _ = tracing_subscriber::fmt().with_test_writer().try_init();
-        let source = GlyphsIrSource::new_from_memory(source).unwrap();
+        let source = GlyphsIrSource::new_from_memory(source, None).unwrap();
         let context = Context::new_root(Flags::default());
         context.try_create_static_metadata(&source).unwrap_err()
     }
@@ -5517,7 +7044,7 @@ ignoreMarks = 0;
 
     fn feature_writers_from_glyphs_source(source: &str) -> Option<Vec<FeatureWriterSpec>> {
         let _ = tracing_subscriber::fmt().with_test_writer().try_init();
-        let source = GlyphsIrSource::new_from_memory(source).unwrap();
+        let source = GlyphsIrSource::new_from_memory(source, None).unwrap();
         let context = Context::new_root(Flags::default());
         context
             .create_static_metadata(&source)
@@ -5681,6 +7208,7 @@ width = 200;
 );
 unitsPerEm = 1000;
 }"#,
+            None,
         )
         .unwrap();
 
@@ -5709,7 +7237,8 @@ unitsPerEm = 1000;
         let expected = shift * base_transform;
         let component = instance.components.first().unwrap();
         assert_eq!(
-            component.transform, expected,
+            component.affine(),
+            expected,
             "component transform must be shift * transform (left-multiply), not the reverse"
         );
     }

@@ -5,7 +5,7 @@ use std::{
     env::temp_dir,
     fmt::{Debug, Display, Write},
     path::{Path, PathBuf},
-    process::{Command, Stdio},
+    process::Command,
     time::SystemTime,
 };
 
@@ -38,18 +38,17 @@ static IGNORED_TESTS: &[&str] = &[
     //
     // includes syntax that is (i think) useless, and should at least be a warning
     "GSUB_8.fea",
-    // ## new in fonttools 4.62.1, not yet supported or compare failures ##
+    // ## new in fonttools 4.62.1, not yet supported ##
     // inline alternate subst in contextual rules (see #1925)
     "contextual_merge_alternate.fea",
-    // compare failures to investigate
-    "identical_feature_lookups.fea",
-    "spec8a_2.fea",
 ];
 
 /// An environment variable that can be set to specify where to write generated files.
 ///
 /// This can be set during debugging if you want to inspect the generated files.
 static TEMP_DIR_ENV: &str = "TTX_TEMP_DIR";
+
+static WARNINGS_EXTENSION: &str = "WARN";
 
 /// The combined results of this set of tests
 #[derive(Default, Serialize, Deserialize)]
@@ -110,6 +109,9 @@ pub enum TestResult {
     /// the actual diff.
     #[allow(missing_docs)]
     ExpectedDiffFail { expected: String, result: String },
+    /// Compilation succeeded, but the warnings did not match the expectation
+    #[allow(missing_docs)]
+    WarningsFail { expected: String, result: String },
 }
 
 struct ReasonPrinter<'a> {
@@ -117,17 +119,43 @@ struct ReasonPrinter<'a> {
     reason: &'a TestResult,
 }
 
-/// Assert that we can find the `ttx` executable
+/// The requirements file used by CI to install the pinned version of fonttools.
+static FEA_CI_REQUIREMENTS: &str = "../resources/scripts/fea_ci_requirements.txt";
+
+/// Assert that we can find the `ttx` executable, and warn if its version differs from CI's.
 pub fn assert_has_ttx_executable() {
-    assert!(
-        Command::new("ttx")
-            .arg("--version")
-            .stdout(Stdio::null())
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false),
-        "\nmissing `ttx` executable. Install it with `pip install fonttools`."
-    )
+    let output = Command::new("ttx").arg("--version").output();
+    let Some(output) = output.ok().filter(|o| o.status.success()) else {
+        panic!("\nmissing `ttx` executable. Install it with `pip install fonttools`.");
+    };
+    let installed = String::from_utf8_lossy(&output.stdout);
+    let installed = installed.trim();
+    match pinned_fonttools_version() {
+        // only warn: one may test against a different fonttools on purpose, and
+        // libtest prints captured stderr only when the test fails.
+        Some(pinned) if pinned != installed => eprintln!(
+            "warning: `ttx` version mismatch: found {installed}, but CI pins fonttools=={pinned}. \
+            Outputs from other versions may differ. Fix with \
+            `pip install -r resources/scripts/fea_ci_requirements.txt` \
+            (or `uv tool install --force fonttools=={pinned}`)."
+        ),
+        Some(_) => (),
+        None => eprintln!("warning: could not determine pinned fonttools version"),
+    }
+}
+
+/// The fonttools version pinned in the CI requirements file, if we can find it.
+fn pinned_fonttools_version() -> Option<String> {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join(FEA_CI_REQUIREMENTS);
+    let requirements = std::fs::read_to_string(path).ok()?;
+    requirements.lines().find_map(|line| {
+        let line = line.trim().strip_prefix("fonttools")?;
+        // skip extras, e.g. `fonttools[unicode]==4.68.0`
+        let line = line.split_once(']').map_or(line, |(_, rest)| rest);
+        let version = line.trim().strip_prefix("==")?;
+        let version = version.split([';', '#', ' ']).next()?;
+        (!version.is_empty()).then(|| version.to_owned())
+    })
 }
 
 /// Selectively filter which files to run.
@@ -289,7 +317,10 @@ pub(crate) fn run_test(
             compiler = compiler.with_feature_writer(&TestFeatureProvider)
         }
 
-        match compiler.compile_binary() {
+        let result = compiler
+            .compile_with_warnings()
+            .and_then(|(compilation, warnings)| Ok((compilation.to_binary(glyph_map)?, warnings)));
+        match result {
             // this means we have a test case that doesn't exist or something weird
             Err(CompilerError::SourceLoad(err)) => panic!("{err}"),
             Err(CompilerError::WriteFail(err)) => panic!("{err}"),
@@ -297,7 +328,9 @@ pub(crate) fn run_test(
             Err(CompilerError::ValidationFail(errs) | CompilerError::CompilationFail(errs)) => {
                 Err(TestResult::CompileFail(errs.to_string(true)))
             }
-            Ok(result) => compare_ttx(&result, &path),
+            Ok((font_data, warnings)) => {
+                compare_ttx(&font_data, &path).and_then(|_| compare_warnings(warnings, &path))
+            }
         }
     });
 
@@ -404,6 +437,31 @@ fn compare_ttx(font_data: &[u8], fea_path: &Path) -> Result<(), TestResult> {
         result,
         diff_percent,
     })
+}
+
+/// Compare the warnings from compiling `fea_path` to its `.WARN` file.
+///
+/// A test without a `.WARN` file is expected to compile without warnings.
+/// Paths are written relative to the test data directory, so that the output
+/// doesn't depend on where the tests are run from.
+fn compare_warnings(mut warnings: DiagnosticSet, fea_path: &Path) -> Result<(), TestResult> {
+    warnings.set_max_to_print(usize::MAX);
+    let data_dir = format!("{}/", test_data_dir().display());
+    let result = warnings.to_string(false).replace(&data_dir, "");
+    let warn_path = fea_path.with_extension(WARNINGS_EXTENSION);
+    let expected = std::fs::read_to_string(&warn_path).unwrap_or_default();
+    if expected == result {
+        return Ok(());
+    }
+
+    if std::env::var(super::WRITE_RESULTS_VAR).is_ok() {
+        if result.is_empty() {
+            std::fs::remove_file(&warn_path).unwrap();
+        } else {
+            std::fs::write(&warn_path, &result).unwrap();
+        }
+    }
+    Err(TestResult::WarningsFail { expected, result })
 }
 
 // we want to be able to add a comment when we save an 'expected diff', so that
@@ -660,7 +718,8 @@ impl Report {
                 TestResult::CompileFail(_) => summary.compile += 1,
                 TestResult::UnexpectedSuccess
                 | TestResult::TtxFail { .. }
-                | TestResult::ExpectedDiffFail { .. } => summary.other += 1,
+                | TestResult::ExpectedDiffFail { .. }
+                | TestResult::WarningsFail { .. } => summary.other += 1,
                 TestResult::CompareFail { diff_percent, .. } => {
                     summary.compare += 1;
                     summary.sum_compare_perc += diff_percent;
@@ -681,6 +740,7 @@ impl TestResult {
             Self::UnexpectedSuccess => 6,
             Self::TtxFail { .. } => 10,
             Self::ExpectedDiffFail { .. } => 15,
+            Self::WarningsFail { .. } => 20,
             Self::CompareFail { .. } => 50,
         }
     }
@@ -849,6 +909,14 @@ impl Display for ReasonPrinter<'_> {
                     super::write_line_diff(f, expected, result)
                 } else {
                     write!(f, "{}", Color::Yellow.paint("expected diff fail"))
+                }
+            }
+            TestResult::WarningsFail { expected, result } => {
+                if self.verbose {
+                    writeln!(f, "warnings mismatch")?;
+                    super::write_line_diff(f, expected, result)
+                } else {
+                    write!(f, "{}", Color::Yellow.paint("warnings mismatch"))
                 }
             }
             TestResult::CompareFail {

@@ -1,0 +1,5 @@
+warning: duplicate language statement: this is handled differently by different tools, and is probably a mistake
+in compile-tests/mini-latin/good/language_stmt_exclude_dflt_removes_defaults.fea at 23:8
+   | 
+23 |         language TRK exclude_dflt;
+   |         ^^^^^^^^^^^^^^^^^^^^^^^^^^
